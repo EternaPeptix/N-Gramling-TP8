@@ -3,6 +3,19 @@
 Serving [thinkingmachines/Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)
 on **4× NVIDIA DGX Spark (GB10)**, TP=4 across the switchless RoCE ring.
 
+> **STATUS 2026-11-14: blocked on a vendor kernel gap.** All plumbing works
+> (weights staged, ring routed, NCCL up, quant config resolved, model builds
+> through 48 layers) — then the TRT-LLM batched expert GEMM fails:
+> `cubin manifest contains no kernels runnable on sm121; ships cubins for
+> sm100, sm103 and sm107`. GB10 is sm121. Both official runtimes (this vLLM
+> image and SGLang's `dev-inkling-2-small`) target datacenter Blackwell
+> (GB200/GB300/B200/B300, SM100/103/107) + Hopper only; neither lists
+> consumer Blackwell (SM120/121). The expert MoE path is the only
+> unsupported piece — attention and everything else initializes fine.
+> Fixes would be: Thinking Machines shipping sm121 cubins, or a B12X-class
+> NVFP4 MoE kernel for sm121 (the dsv41 lane's stack family). Everything
+> below the line is the working state; the boot dies at expert GEMM init.
+
 594B total / 17B active MoE (384 routed experts, top-8), multimodal (23-layer
 ViT), bundled DSpark speculator (7 tokens/step), relative-bias hybrid
 attention: 40 sliding-window layers (1024) + 8 full-attention layers.

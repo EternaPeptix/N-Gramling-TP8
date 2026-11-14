@@ -27,6 +27,9 @@ PORT="${VLLM_PORT:-8000}"
 ARGS=(
   "$MODEL"
   --served-model-name "$SERVED"
+  # config.json advertises modelopt/NVFP4, but the model class asserts on
+  # the inkling2 per-tensor metadata in hf_quant_config.json — force it.
+  --quantization "${QUANT:-inkling2}"
   --tensor-parallel-size 4
   --nnodes 4
   --node-rank "$RANK"

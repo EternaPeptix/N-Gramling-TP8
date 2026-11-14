@@ -85,8 +85,14 @@ echo "[rank $RANK] $SERVED <- $IMAGE  maxlen=$MAXLEN seqs=$SEQS gmu=$GMU kv=$KV_
 # -d: daemonize at docker. Remote ssh+nohup launches stall on the inherited
 # session; `docker logs -f inkling2-tp4-rank$RANK` follows the boot.
 # no --rm: a crashed rank must keep its docker logs for diagnosis
+MOUNTS=(-v "${HF_CACHE:?set in .env}:/root/.cache/huggingface")
+# SM121 (GB10) patches: the stock image's trtllm_bmm JIT only admits sm100.
+if [ -f "$ROOT/patches/trtllm_bmm.py" ]; then
+  MOUNTS+=(-v "$ROOT/patches/trtllm_bmm.py:/usr/local/lib/python3.12/dist-packages/vllm/models/inkling2/ops/trtllm_bmm.py:ro")
+fi
+
 exec docker run -d --name "inkling2-tp4-rank$RANK" \
   --gpus all --privileged --ipc=host --network host \
   "${ENV_PAIRS[@]}" \
-  -v "${HF_CACHE:?set in .env}:/root/.cache/huggingface" \
+  "${MOUNTS[@]}" \
   "$IMAGE" "${ARGS[@]}"

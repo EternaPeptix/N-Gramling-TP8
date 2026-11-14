@@ -81,7 +81,8 @@ fi
 echo "[rank $RANK] $SERVED <- $IMAGE  maxlen=$MAXLEN seqs=$SEQS gmu=$GMU kv=$KV_DTYPE"
 # -d: daemonize at docker. Remote ssh+nohup launches stall on the inherited
 # session; `docker logs -f inkling2-tp4-rank$RANK` follows the boot.
-exec docker run --rm -d --name "inkling2-tp4-rank$RANK" \
+# no --rm: a crashed rank must keep its docker logs for diagnosis
+exec docker run -d --name "inkling2-tp4-rank$RANK" \
   --gpus all --privileged --ipc=host --network host \
   "${ENV_PAIRS[@]}" \
   -v "${HF_CACHE:?set in .env}:/root/.cache/huggingface" \

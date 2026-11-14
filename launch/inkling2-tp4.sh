@@ -70,7 +70,9 @@ ENV_PAIRS=(
 [ -n "${NCCL_EXTRA:-}" ] && ENV_PAIRS+=($NCCL_EXTRA)
 
 echo "[rank $RANK] $SERVED <- $IMAGE  maxlen=$MAXLEN seqs=$SEQS gmu=$GMU kv=$KV_DTYPE"
-exec docker run --rm --name "inkling2-tp4-rank$RANK" \
+# -d: daemonize at docker. Remote ssh+nohup launches stall on the inherited
+# session; `docker logs -f inkling2-tp4-rank$RANK` follows the boot.
+exec docker run --rm -d --name "inkling2-tp4-rank$RANK" \
   --gpus all --privileged --ipc=host --network host \
   "${ENV_PAIRS[@]}" \
   -v "${HF_CACHE:?set in .env}:/root/.cache/huggingface" \

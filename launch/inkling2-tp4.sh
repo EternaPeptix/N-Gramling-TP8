@@ -54,18 +54,27 @@ fi
 [ -n "${VLLM_EXTRA:-}" ] && ARGS+=($VLLM_EXTRA)
 
 ENV_PAIRS=(
-  -e "NCCL_IB_HCA=${NCCL_IB_HCA:?set in .env}"
   -e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:?set in .env}"
   # The executor's gloo control-plane derives the rank's advertise address
   # from the default interface; each node's hostname maps to 127.0.0.1 in
   # /etc/hosts, so without this the full-mesh connect dies on localhost.
   -e "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-wlP9s9}"
-  -e "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3}"
-  -e "NCCL_IB_AUTO_DETECT=0"
   -e "NCCL_DEBUG=${NCCL_DEBUG:-WARN}"
   -e "VLLM_HOST_IP=${VLLM_HOST_IP:?set per-node in .env}"
   -e "HF_HUB_OFFLINE=0"
 )
+if [ "${NCCL_IB_DISABLE:-0}" = "1" ]; then
+  # Socket collectives (TCP over the routed fabric). On this switchless ring,
+  # RoCE full-mesh for EP all-to-all needs cross-subnet QPs, which stall in
+  # verbs; sockets through the routed fabric work everywhere.
+  ENV_PAIRS+=(-e "NCCL_IB_DISABLE=1")
+else
+  ENV_PAIRS+=(
+    -e "NCCL_IB_HCA=${NCCL_IB_HCA:?set in .env}"
+    -e "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3}"
+    -e "NCCL_IB_AUTO_DETECT=0"
+  )
+fi
 # shellcheck disable=SC2206
 [ -n "${NCCL_EXTRA:-}" ] && ENV_PAIRS+=($NCCL_EXTRA)
 

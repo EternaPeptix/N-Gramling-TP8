@@ -65,8 +65,16 @@ fi
 # shellcheck disable=SC2206
 [ -n "${VLLM_EXTRA:-}" ] && ARGS+=($VLLM_EXTRA)
 
+# The fabric netdev names flap between enp1s0* and rocep1s0* on this ring
+# (driver re-enumeration); resolve by the 10.100.x address, not by name.
+FABRIC_IF="${NCCL_SOCKET_IFNAME:-}"
+if [ ! -d "/sys/class/net/$FABRIC_IF" ]; then
+  FABRIC_IF=$(ip -br addr show | awk '/10\.100\./{print $1; exit}')
+fi
+[ -n "$FABRIC_IF" ] || { echo "no 10.100.x fabric interface found" >&2; exit 1; }
+
 ENV_PAIRS=(
-  -e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:?set in .env}"
+  -e "NCCL_SOCKET_IFNAME=$FABRIC_IF"
   # The executor's gloo control-plane derives the rank's advertise address
   # from the default interface; each node's hostname maps to 127.0.0.1 in
   # /etc/hosts, so without this the full-mesh connect dies on localhost.

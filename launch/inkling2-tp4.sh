@@ -36,6 +36,10 @@ ARGS=(
   --master-addr "$MASTER_ADDR"
   --master-port "$MASTER_PORT"
   --distributed-executor-backend mp
+  # The post-load rendezvous uses torch gloo (30-min default): with a ~2h
+  # first load on the head, every other rank times out and dies first.
+  --distributed-timeout-seconds "${DIST_TIMEOUT:-21600}"
+  --cpu-distributed-timeout-seconds "${DIST_TIMEOUT:-21600}"
   --gpu-memory-utilization "$GMU"
   --max-model-len "$MAXLEN"
   --max-num-seqs "$SEQS"

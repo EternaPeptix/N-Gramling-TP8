@@ -184,6 +184,23 @@ def k_group_partials(
     out_dtype: torch.dtype = torch.float32,
     launch_dependents: bool = False,
 ) -> torch.Tensor:
+    """sm121: the Triton k-group and TMA kernels both exceed the 99 KB
+    shared-memory limit of GB10. Compute the same fp32 partials (G=1,
+    fully summed) with a tensor-core matmul: bf16 inputs accumulate in
+    fp32, matching the reference's precision up to summation order."""
+    return (
+        torch.matmul(x, weight.t())
+        .to(out_dtype)
+        .unsqueeze(0)
+    )
+
+
+def _k_group_partials_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype = torch.float32,
+    launch_dependents: bool = False,
+) -> torch.Tensor:
     """fp32 partials [G, T, N] of ``x @ weight.T`` whose in-order sum over G is
     the reference ``linear``. G is 1 (already summed, in ``out_dtype``) when
     there are enough rows to fill the GPU without splitting K. With

@@ -53,6 +53,11 @@ ARGS=(
   --port "$PORT"
 )
 [ "${REASONING:-1}" = "1" ] && ARGS+=(--reasoning-parser inkling)
+# Followers are worker-only: a full `vllm serve` on every node makes each
+# follower's engine core run init collectives (get_kv_cache_specs, encoder
+# measurement) that only the driver's executor may call -> assert. The dsv41
+# lane's worker containers run --headless for the same reason.
+[ "$RANK" != "0" ] && ARGS+=(--headless)
 [ "${TOOLS:-0}" = "1" ] && ARGS+=(--tool-call-parser inkling --enable-auto-tool-choice)
 if [ "${DSPARK:-1}" = "1" ]; then
   ARGS+=(--speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}')

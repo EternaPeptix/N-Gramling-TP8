@@ -90,9 +90,11 @@ echo "[rank $RANK] $SERVED <- $IMAGE  maxlen=$MAXLEN seqs=$SEQS gmu=$GMU kv=$KV_
 # session; `docker logs -f inkling2-tp4-rank$RANK` follows the boot.
 # no --rm: a crashed rank must keep its docker logs for diagnosis
 MOUNTS=(-v "${HF_CACHE:?set in .env}:/root/.cache/huggingface")
-# SM121 (GB10) patches: the stock image's trtllm_bmm JIT only admits sm100.
-if [ -f "$ROOT/patches/trtllm_bmm.py" ]; then
-  MOUNTS+=(-v "$ROOT/patches/trtllm_bmm.py:/usr/local/lib/python3.12/dist-packages/vllm/models/inkling2/ops/trtllm_bmm.py:ro")
+# SM121 (GB10) patches over the stock image: each entry is host:container.
+if [ -f "$ROOT/patches/MANIFEST" ]; then
+  while read -r host_file dest; do
+    [ -f "$ROOT/patches/$host_file" ] && MOUNTS+=(-v "$ROOT/patches/$host_file:$dest:ro")
+  done < "$ROOT/patches/MANIFEST"
 fi
 
 exec docker run -d --name "inkling2-tp4-rank$RANK" \

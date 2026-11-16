@@ -83,6 +83,9 @@ ENV_PAIRS=(
   -e "VLLM_HOST_IP=${VLLM_HOST_IP:?set per-node in .env}"
   -e "HF_HUB_OFFLINE=0"
 )
+# Optional torch allocator knob (workaround for driver livelock on GB10 at
+# high occupancy: expandable segments' VA remapping spins forever there).
+[ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && ENV_PAIRS+=(-e "PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF")
 if [ "${NCCL_IB_DISABLE:-0}" = "1" ]; then
   # Socket collectives (TCP over the routed fabric). On this switchless ring,
   # RoCE full-mesh for EP all-to-all needs cross-subnet QPs, which stall in

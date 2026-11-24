@@ -41,6 +41,17 @@ from vllm.triton_utils import tl, triton
 
 _TILES = ((8, 8), (128, 16), (384, 32), (768, 64), (4096, 128), (1 << 31, 256))
 
+# Opt-in C=32 v4 TILE=32 overrides for M <= 128 (0 = OFF, preserving stock _TILES):
+#   - INKLING_C32_MX7_T32_MIN_M=96   : MX7 L40..47 TILE=32 (exact same BF16 MMA order -> literal nd == 0!)
+#   - INKLING_C32_NVFP4_T32_MIN_M=96 : NVFP4 L0..39 TILE=32 (requires v4 t32_bk256 + w2_bk32 -> literal nd == 0!)
+_C32_MX7_T32_MIN_M = int(os.environ.get("INKLING_C32_MX7_T32_MIN_M", "0") or 0)
+_C32_NVFP4_T32_MIN_M = int(os.environ.get("INKLING_C32_NVFP4_T32_MIN_M", "0") or 0)
+# Opt-in Wave-V7 C=4..8 TILE=8 override for 17 <= M <= 64 (default OFF -> 100% stock _TILES):
+_C48_MOE_TILE8 = os.environ.get("INKLING_C48_MOE_TILE8", "0").strip().lower() not in (
+    "0", "", "off", "false", "no",
+)
+_C48_MOE_MAX_M = max(17, min(64, int(os.environ.get("INKLING_C48_MOE_MAX_M", "64") or 64)))
+
 
 @dataclass(frozen=True)
 class ExpertPlan:
@@ -64,6 +75,28 @@ def expert_plan(
 ) -> ExpertPlan:
     if tile is None:
         tile = next(t for max_tokens, t in _TILES if tokens <= max_tokens)
+        if tile == 16 and topk == 8 and num_experts == 384 and tokens <= 128:
+            if _C48_MOE_TILE8 and 17 <= tokens <= _C48_MOE_MAX_M:
+                try:
+                    from . import moe_c32_runtime as _c32
+                    if _c32.supports_c48_tile8(nvfp4=nvfp4):
+                        tile = 8
+                except Exception:
+                    pass
+            elif (not nvfp4) and _C32_MX7_T32_MIN_M > 0 and tokens >= _C32_MX7_T32_MIN_M:
+                try:
+                    from . import moe_c32_runtime as _c32
+                    if _c32.C32_MASTER and (_c32.C32_MX7_TILE32 or _MX6_ENABLED):
+                        tile = 32
+                except Exception:
+                    pass
+            elif nvfp4 and _C32_NVFP4_T32_MIN_M > 0 and tokens >= _C32_NVFP4_T32_MIN_M:
+                try:
+                    from . import moe_c32_runtime as _c32
+                    if _c32.supports_nvfp4_t32_bk256():
+                        tile = 32
+                except Exception:
+                    pass
     rows = tokens * topk
     max_ctas = min(num_experts, rows) + (rows - min(num_experts, rows)) // tile
     return ExpertPlan(tile, max_ctas, (0, 0))
@@ -918,6 +951,401 @@ _PANEL_PREFILL = os.environ.get("INKLING_EXPERT_PANEL_PREFILL", "1") == "1"
 _EXPERT_PDL = os.environ.get("INKLING_EXPERT_PDL", "1") == "1"
 _WS6 = os.environ.get("INKLING_WS6", "1") == "1"
 _NVFP4_WS5 = os.environ.get("INKLING_NVFP4_WS5", "0").strip().lower()
+_MX6_ENABLED = os.environ.get("INKLING_MX6_EXACT", "0").strip().lower() not in ("0", "", "off", "false", "no")
+_MX6_FREE_RAW = os.environ.get("INKLING_MX6_FREE_RAW", "0").strip().lower() not in ("0", "", "off", "false", "no")
+_MX6_LIB_PATH = os.environ.get("INKLING_MX6_LIB", "").strip()
+_MX6_DEFAULT_PATHS = (
+    "/rdma/libmxfp8_mx6_v12.so",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "libmxfp8_mx6_v12.so"),
+    "/rdma/libmxfp8_mx6_v10.so",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "libmxfp8_mx6_v10.so"),
+)
+_MX6_LIB = None
+_MX6_LIB_TRIED = False
+
+
+def _get_mx6_lib():
+    global _MX6_LIB, _MX6_LIB_TRIED
+    if not _MX6_LIB_TRIED:
+        _MX6_LIB_TRIED = True
+        chosen_path = _MX6_LIB_PATH
+        if not chosen_path or not os.path.exists(chosen_path):
+            for cand in _MX6_DEFAULT_PATHS:
+                if os.path.exists(cand):
+                    chosen_path = cand
+                    break
+        if _MX6_ENABLED and chosen_path and os.path.exists(chosen_path):
+            try:
+                lib = ctypes.CDLL(chosen_path)
+                lib.mx6_v10_version.argtypes = []
+                lib.mx6_v10_version.restype = ctypes.c_int
+                lib.mx6_v10_min_cta.argtypes = []
+                lib.mx6_v10_min_cta.restype = ctypes.c_int
+                lib.mx6_v10_build_huff7_table.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ]
+                lib.mx6_v10_build_huff7_table.restype = ctypes.c_int
+                lib.mx6_v10_hist_exp.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_uint64,
+                ]
+                lib.mx6_v10_hist_exp.restype = ctypes.c_int
+                lib.mx6_measure_v10.argtypes = (
+                    [ctypes.c_void_p] * 4 + [ctypes.c_int] * 7 + [ctypes.c_uint64]
+                )
+                lib.mx6_measure_v10.restype = ctypes.c_int
+                lib.mx6_pack_v10.argtypes = (
+                    [ctypes.c_void_p] * 9
+                    + [ctypes.c_int] * 4
+                    + [ctypes.c_uint32]
+                    + [ctypes.c_int] * 3
+                    + [ctypes.c_uint64]
+                )
+                lib.mx6_pack_v10.restype = ctypes.c_int
+                lib.mx6_unpack_expert_batch_v10_fwd.argtypes = (
+                    [ctypes.c_void_p] * 8
+                    + [ctypes.c_int] * 4
+                    + [ctypes.c_uint32]
+                    + [ctypes.c_int] * 3
+                    + [ctypes.c_uint64]
+                )
+                lib.mx6_unpack_expert_batch_v10_fwd.restype = ctypes.c_int
+                lib.mx6_w13_c1_v10_fwd.argtypes = (
+                    [ctypes.c_void_p] * 14
+                    + [ctypes.c_int] * 4
+                    + [ctypes.c_uint32]
+                    + [ctypes.c_int] * 6
+                    + [ctypes.c_uint64]
+                )
+                lib.mx6_w13_c1_v10_fwd.restype = ctypes.c_int
+                lib.mx6_w2_c1_v10_fwd.argtypes = (
+                    [ctypes.c_void_p] * 16
+                    + [ctypes.c_int] * 5
+                    + [ctypes.c_uint32]
+                    + [ctypes.c_int] * 7
+                    + [ctypes.c_uint64]
+                )
+                lib.mx6_w2_c1_v10_fwd.restype = ctypes.c_int
+                lib.mx6_w13_c48_v10_fwd.argtypes = (
+                    [ctypes.c_void_p] * 14
+                    + [ctypes.c_int] * 4
+                    + [ctypes.c_uint32]
+                    + [ctypes.c_int] * 6
+                    + [ctypes.c_uint64]
+                )
+                lib.mx6_w13_c48_v10_fwd.restype = ctypes.c_int
+                lib.mx6_w2_c48_v10_fwd.argtypes = (
+                    [ctypes.c_void_p] * 17
+                    + [ctypes.c_int] * 5
+                    + [ctypes.c_uint32]
+                    + [ctypes.c_int] * 7
+                    + [ctypes.c_uint64]
+                )
+                lib.mx6_w2_c48_v10_fwd.restype = ctypes.c_int
+                lib.mx6_combine_c48_v10_fwd.argtypes = (
+                    [ctypes.c_void_p] * 4 + [ctypes.c_int] * 4 + [ctypes.c_uint64]
+                )
+                lib.mx6_combine_c48_v10_fwd.restype = ctypes.c_int
+                ver = int(lib.mx6_v10_version())
+                lib._inkling_v4 = True
+                lib._inkling_mx6_ver = ver
+                _MX6_LIB = lib
+                print(
+                    f"[inkling-mx6-v10] loaded 0-ULP lossless MX6-Huff7 CUDA engine v{ver}: "
+                    f"{chosen_path} (free_raw={int(_MX6_FREE_RAW)})",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[inkling-mx6-v10] failed to load {chosen_path}: {e!r}", flush=True)
+                _MX6_LIB = None
+    return _MX6_LIB
+
+
+@torch.no_grad()
+def _mx6_get_packed(weight: torch.Tensor, weight_scale: torch.Tensor, projection: int):
+    if not _MX6_ENABLED:
+        return None
+    hit = getattr(weight, "_inkling_mx6", None)
+    if hit is not None:
+        return None if hit is False else hit
+    lib = _get_mx6_lib()
+    if lib is None or torch.cuda.is_current_stream_capturing():
+        return None
+    if weight.data.untyped_storage().size() == 0 or weight_scale.data.untyped_storage().size() == 0:
+        return None
+    e, n, k = int(weight.shape[0]), int(weight.shape[1]), int(weight.shape[2])
+    if k <= 0 or k > 4608:
+        weight._inkling_mx6 = False
+        return None
+    if projection == 0:
+        if (n % 32) != 0 or (k % 128) != 0:
+            weight._inkling_mx6 = False
+            return None
+        bn, warps, n_slabs = 32, 4, k // 128
+    elif projection == 1:
+        if (n % 128) != 0 or (k % 32) != 0:
+            weight._inkling_mx6 = False
+            return None
+        bn, warps, n_slabs = 128, 4, k // 32
+    else:
+        weight._inkling_mx6 = False
+        return None
+    ws_u8 = weight_scale.data.view(torch.uint8)
+    base_ws = int(ws_u8.min().item())
+    max_ws = int(ws_u8.max().item())
+    if base_ws == 0 or max_ws == 255 or (max_ws - base_ws) > 7:
+        weight._inkling_mx6 = False
+        return None
+    w_u8 = weight.data.view(torch.uint8)
+    dev = weight.device
+    stream = int(torch.cuda.current_stream(dev).cuda_stream)
+    total_warps = e * (n // bn) * warps
+    panel_meta = getattr(weight, "_inkling_panel", None)
+    if panel_meta is not None:
+        from_panel = 1
+        src_pb, src_kb = int(panel_meta[0]), int(panel_meta[1])
+    else:
+        from_panel = 0
+        src_pb, src_kb = 0, 0
+
+    # 1. GPU exponent histogram (128 B D2H) -> exact canonical max_len<=7 uint8_t LUT
+    hist_gpu = torch.zeros(16, dtype=torch.int64, device=dev)
+    rc = lib.mx6_v10_hist_exp(w_u8.data_ptr(), hist_gpu.data_ptr(), w_u8.numel(), stream)
+    if rc != 0:
+        weight._inkling_mx6 = False
+        return None
+    hist_cpu = hist_gpu.cpu().contiguous()
+    del hist_gpu
+    huff_lut_cpu = torch.empty(128, dtype=torch.uint8)
+    enc_code_cpu = torch.empty(16, dtype=torch.uint16)
+    enc_len_cpu = torch.empty(16, dtype=torch.uint8)
+    rc = lib.mx6_v10_build_huff7_table(
+        hist_cpu.data_ptr(), huff_lut_cpu.data_ptr(), enc_code_cpu.data_ptr(), enc_len_cpu.data_ptr()
+    )
+    if rc != 0:
+        weight._inkling_mx6 = False
+        return None
+    huff_lut = huff_lut_cpu.to(device=dev, non_blocking=False)
+    enc_code = enc_code_cpu.to(device=dev, non_blocking=False)
+    enc_len = enc_len_cpu.to(device=dev, non_blocking=False)
+
+    # 2. GPU Pass 1: Measure exact WSLR chunks & per-warp metadata
+    warp_chunks = torch.empty(total_warps, dtype=torch.int32, device=dev)
+    warp_meta = torch.empty(total_warps, dtype=torch.uint8, device=dev)
+    rc = lib.mx6_measure_v10(
+        w_u8.data_ptr(), enc_len.data_ptr(),
+        warp_chunks.data_ptr(), warp_meta.data_ptr(),
+        projection, e, n, k, from_panel, src_pb, src_kb, stream,
+    )
+    if rc != 0:
+        weight._inkling_mx6 = False
+        return None
+    exp_off = torch.zeros(total_warps + 1, dtype=torch.int32, device=dev)
+    torch.cumsum(warp_chunks, dim=0, out=exp_off[1:])
+    del warp_chunks
+    total_chunks = int(exp_off[-1].item())
+
+    # 3. GPU Pass 2: Pack SM4 + tight 96-bit WS3 + WSLR EXP_STREAM (+128 u32 guard tail!)
+    sm4 = torch.empty((total_warps * n_slabs * 32, 4), dtype=torch.uint32, device=dev)
+    ws3_pack = torch.empty((total_warps * n_slabs, 3), dtype=torch.uint32, device=dev)
+    exp_stream = torch.empty(max(128, total_chunks * 32 + 128), dtype=torch.uint32, device=dev)
+    rc = lib.mx6_pack_v10(
+        w_u8.data_ptr(), ws_u8.data_ptr(),
+        enc_code.data_ptr(), enc_len.data_ptr(),
+        exp_off.data_ptr(), warp_meta.data_ptr(),
+        sm4.data_ptr(), ws3_pack.data_ptr(), exp_stream.data_ptr(),
+        projection, e, n, k, base_ws, from_panel, src_pb, src_kb, stream,
+    )
+    del enc_code, enc_len
+    if rc != 0:
+        weight._inkling_mx6 = False
+        return None
+
+    entry = (sm4, ws3_pack, exp_stream, exp_off, warp_meta, huff_lut, base_ws)
+    weight._inkling_mx6 = entry
+    if _MX6_FREE_RAW:
+        # Release BOTH raw MXFP8 weight/scale storage AND any MX7 tensors immediately
+        # (+0.66..0.76 GiB/rank net vs MX7 v5; +1.25..1.35 GiB/rank vs Raw MXFP8!).
+        weight.data.untyped_storage().resize_(0)
+        weight_scale.data.untyped_storage().resize_(0)
+        for _attr in ("_inkling_mx7", "_inkling_mx7_v5_compat", "_inkling_mx7_v5_panel"):
+            if hasattr(weight, _attr):
+                try:
+                    delattr(weight, _attr)
+                except Exception:
+                    setattr(weight, _attr, None)
+        torch.cuda.empty_cache()
+    return entry
+
+
+@torch.no_grad()
+def _mx6_unpack_to_panel_tmp(weight: torch.Tensor, projection: int):
+    """Unpack MX6-Huff7 layer weights into transient panel-contiguous (W_tmp, WS_tmp) for 1M prefill.
+    Caller MUST delete (w_tmp, ws_tmp) immediately after kernel launch (0 B persistent VRAM!)."""
+    entry = getattr(weight, "_inkling_mx6", None)
+    if not isinstance(entry, tuple):
+        return None
+    lib = _get_mx6_lib()
+    if lib is None:
+        return None
+    sm4, ws3_pack, exp_stream, exp_off, warp_meta, huff_lut, base_ws = entry
+    e, n, k = int(weight.shape[0]), int(weight.shape[1]), int(weight.shape[2])
+    spec = _PANEL_SPECS.get((False, projection))
+    if spec is None:
+        return None
+    pb, kb = spec[0], spec[1]
+    kbg = kb // 32
+    dev = sm4.device
+    stream = int(torch.cuda.current_stream(dev).cuda_stream)
+    w_tmp = torch.empty((e, n, k), dtype=torch.uint8, device=dev)
+    ws_tmp = torch.empty((e, n, k // 32), dtype=torch.uint8, device=dev)
+    rc = lib.mx6_unpack_expert_batch_v10_fwd(
+        sm4.data_ptr(), ws3_pack.data_ptr(),
+        exp_stream.data_ptr(), exp_off.data_ptr(),
+        warp_meta.data_ptr(), huff_lut.data_ptr(),
+        w_tmp.data_ptr(), ws_tmp.data_ptr(),
+        projection, e, n, k, int(base_ws),
+        1, pb, kb, stream,
+    )
+    if rc != 0:
+        del w_tmp, ws_tmp
+        raise RuntimeError(f"mx6_unpack_expert_batch_v10_fwd failed: cudaError={rc}")
+    w_tmp._inkling_panel = (pb, kb)
+    ws_tmp._inkling_panel = (pb, kbg)
+    return w_tmp, ws_tmp
+
+
+def _mx6_bmm_decode(act, act_scale, weight, weight_scale, ones, tiles, out, plan, projection, pdl_wait, trig_dep) -> bool:
+    if plan.tile not in (8, 16):
+        return False
+    packed = _mx6_get_packed(weight, weight_scale, projection)
+    if packed is None:
+        return False
+    lib = _get_mx6_lib()
+    sm4, ws3_pack, exp_stream, exp_off, warp_meta, huff_lut, base_ws = packed
+    n, k = int(weight.shape[1]), int(weight.shape[2])
+    st = int(torch.cuda.current_stream(act.device).cuda_stream)
+    if projection == 0:
+        rc = lib.mx6_w13_c1_v10_fwd(
+            act.view(torch.uint8).data_ptr(),
+            act_scale.view(torch.uint8).data_ptr(),
+            sm4.data_ptr(), ws3_pack.data_ptr(),
+            exp_stream.data_ptr(), exp_off.data_ptr(),
+            warp_meta.data_ptr(), huff_lut.data_ptr(),
+            ones.data_ptr(), tiles.data_ptr(),
+            0, 0, 0, out.data_ptr(),
+            n, k, int(plan.max_ctas), int(plan.tile), int(base_ws),
+            0, 0, 0, 37, int(pdl_wait), 1 if trig_dep else 0, st,
+        )
+    else:
+        rc = lib.mx6_w2_c1_v10_fwd(
+            act.view(torch.uint8).data_ptr(),
+            act_scale.view(torch.uint8).data_ptr(),
+            sm4.data_ptr(), ws3_pack.data_ptr(),
+            exp_stream.data_ptr(), exp_off.data_ptr(),
+            warp_meta.data_ptr(), huff_lut.data_ptr(),
+            ones.data_ptr(), tiles.data_ptr(), 0,
+            out.data_ptr(), 0, 0, 0, 0,
+            n, k, int(plan.max_ctas), int(plan.tile), 0, int(base_ws),
+            0, 9, 0, 0, 0, int(pdl_wait), 1 if trig_dep else 0, st,
+        )
+    return rc == 0
+
+
+def _mx6_bmm_prefill(
+    act, act_scale, row_scale, weight, weight_scale, ones, tiles, out, plan, projection,
+    row2tok=None, as_row_major: bool = False,
+) -> bool:
+    if plan.tile < 32 or (plan.tile % 32) != 0:
+        return False
+    packed = _mx6_get_packed(weight, weight_scale, projection)
+    if packed is None:
+        return False
+    lib = _get_mx6_lib()
+    sm4, ws3_pack, exp_stream, exp_off, warp_meta, huff_lut, base_ws = packed
+    n, k = int(weight.shape[1]), int(weight.shape[2])
+    st = int(torch.cuda.current_stream(act.device).cuda_stream)
+    if plan.tile == 32:
+        if projection == 0:
+            use_r2t = 1 if row2tok is not None else 0
+            r2t_ptr = int(row2tok.data_ptr()) if use_r2t else 0
+            rc = lib.mx6_w13_c48_v10_fwd(
+                act.view(torch.uint8).data_ptr(),
+                act_scale.view(torch.uint8).data_ptr(),
+                r2t_ptr,
+                sm4.data_ptr(), ws3_pack.data_ptr(),
+                exp_stream.data_ptr(), exp_off.data_ptr(),
+                warp_meta.data_ptr(), huff_lut.data_ptr(),
+                ones.data_ptr(), tiles.data_ptr(),
+                0, 0, out.data_ptr(),
+                n, k, int(plan.max_ctas), 32, int(base_ws),
+                use_r2t, 1 if (use_r2t or as_row_major) else 0, 0,
+                0, 0, 0, st,
+            )
+        else:
+            as_stride = int(act_scale.stride(0)) if (as_row_major and act_scale.ndim >= 2) else 9
+            rc = lib.mx6_w2_c48_v10_fwd(
+                act.view(torch.uint8).data_ptr(),
+                act_scale.view(torch.uint8).data_ptr(),
+                sm4.data_ptr(), ws3_pack.data_ptr(),
+                exp_stream.data_ptr(), exp_off.data_ptr(),
+                warp_meta.data_ptr(), huff_lut.data_ptr(),
+                ones.data_ptr(), tiles.data_ptr(), 0,
+                out.data_ptr(), 0, 0, 0, 0, 0,
+                n, k, int(plan.max_ctas), 32, 0, int(base_ws),
+                1 if as_row_major else 0, as_stride, 0,
+                0, 0, 0, 0, st,
+            )
+        return rc == 0
+
+    # TILE >= 64 fallback when pf_moe_native is inactive: unpack to transient panel -> Triton panel prefill
+    unpacked = _mx6_unpack_to_panel_tmp(weight, projection)
+    if unpacked is None:
+        return False
+    w_tmp, ws_tmp = unpacked
+    try:
+        pb, kb = w_tmp._inkling_panel
+        kbp, kbg = kb, kb // 32
+        use_r2t = row2tok is not None and projection == 0
+        r2t_arg = row2tok if use_r2t else tiles
+        rs_arg = row_scale if row_scale is not None else ones
+        if projection == 0:
+            if plan.tile == 64:
+                bm, bk, nw, ns = 32, 256, 4, 3
+            elif plan.max_ctas <= 520:
+                bm, bk, nw, ns = 64, 128, 4, 3
+            else:
+                bm, bk, nw, ns = 128, 128, 4, 3
+            sub_m = plan.tile // bm
+            _expert_panel_prefill_w13_kernel[((n // pb) * sub_m, plan.max_ctas)](
+                act.view(torch.uint8), act_scale.view(torch.uint8), rs_arg, r2t_arg,
+                w_tmp, ws_tmp, ones, tiles, out,
+                N=n, K=k, MAX_CTAS=plan.max_ctas, TILE=plan.tile, BM=bm,
+                PB=pb, KBP=kbp, KBG=kbg, BK=bk,
+                NVFP4=False, WS6=False, USE_R2T=use_r2t, AS_ROW_MAJOR=as_row_major,
+                num_warps=nw, num_stages=ns,
+            )
+            return True
+        if kbp == 32 and kbg == 1 and pb == 128:
+            if plan.tile <= 64:
+                bm, bn, nw, ns = 32, 128, 4, 3
+            elif plan.max_ctas <= 520:
+                bm, bn, nw, ns = 64, 128, 4, 3
+            else:
+                bm, bn, nw, ns = 128, 128, 4, 3
+            sub_m = plan.tile // bm
+            _expert_panel_mx_w2_kernel[((n // bn) * sub_m, plan.max_ctas)](
+                act.view(torch.uint8), act_scale.view(torch.uint8),
+                w_tmp, ws_tmp, ones, tiles, out,
+                N=n, K=k, MAX_CTAS=plan.max_ctas, TILE=plan.tile, BM=bm, BN=bn,
+                PB=pb, KBP=kbp, KBG=kbg, AS_ROW_MAJOR=as_row_major,
+                num_warps=nw, num_stages=ns,
+            )
+            return True
+        return False
+    finally:
+        del w_tmp, ws_tmp
+
+
 _MX7_ENABLED = os.environ.get("INKLING_MX7_EXACT", "0").strip().lower() not in ("0", "", "off", "false", "no")
 _MX7_FREE_RAW = os.environ.get("INKLING_MX7_FREE_RAW", "1").strip().lower() not in ("0", "", "off", "false", "no")
 _MX7_LIB_PATH = os.environ.get("INKLING_MX7_LIB", "")
@@ -1320,6 +1748,12 @@ def ensure_packed_for_pf_native(
     before `pf_moe_native` runs on prefill chunks (idempotent O(1) check once packed, ensures
     profile_run accounts for all decode weight buffers before vLLM allocates KV cache)."""
     nvfp4 = weight.dtype == torch.uint8
+    if (not nvfp4) and _MX6_ENABLED and _OVERRIDE is None and _DEC_CFG is None:
+        if _get_mx6_lib() is not None:
+            if not torch.cuda.is_current_stream_capturing():
+                _mx6_get_packed(weight, weight_scale, projection)
+            if _MX6_FREE_RAW:
+                return
     if (not nvfp4) and _MX7_ENABLED and _OVERRIDE is None and _DEC_CFG is None:
         _get_mx7_lib()
         if _MX7_FREE_RAW and _MX7_HAS_PREFILL:
@@ -1377,9 +1811,26 @@ def bmm(
 ) -> torch.Tensor:
     nvfp4 = weight.dtype == torch.uint8
 
+    # Wave-V7 C=4..8 TILE=8 (17 <= M <= 64 -> max_ctas in [136, 400] > 64, vs M <= 8 -> max_ctas <= 64).
+    is_c48_t8 = (plan.tile == 8 and plan.max_ctas > 64 and _C48_MOE_TILE8)
+
+    # 0) Decode (TILE=8,16) 0-ULP lossless MX6-Huff7 fast path (strictly opt-in via INKLING_MX6_EXACT=1).
+    if (not nvfp4) and plan.tile <= 16 and (not is_c48_t8) and _MX6_ENABLED and _OVERRIDE is None and _DEC_CFG is None:
+        if _get_mx6_lib() is not None:
+            n = weight.shape[1]
+            out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
+            pdl = _EXPERT_PDL and plan.rows <= 2048
+            pdl_wait = (2 if projection == 1 else 1) if pdl else 0
+            trig_dep = pdl
+            if _mx6_bmm_decode(
+                act, act_scale, weight, weight_scale, ones, tiles, out,
+                plan, projection, pdl_wait, trig_dep,
+            ):
+                return out
+
     # 1) Decode (TILE=8,16) full-lifecycle MX7 fast path (100% byte-identical v3 0-ULP decode).
     # Packs directly from raw [E, N, K] (from_panel=0) and frees raw 11.75 GiB MXFP8 weights immediately!
-    if (not nvfp4) and plan.tile <= 16 and _MX7_ENABLED and _OVERRIDE is None and _DEC_CFG is None:
+    if (not nvfp4) and plan.tile <= 16 and (not is_c48_t8) and _MX7_ENABLED and _OVERRIDE is None and _DEC_CFG is None:
         _get_mx7_lib()
         if _MX7_FREE_RAW and _MX7_HAS_PREFILL:
             n = weight.shape[1]
@@ -1405,8 +1856,12 @@ def bmm(
             if res is not None:
                 return res
 
-    # 2b) C=32 (M=17..256 -> plan.rows > 2048, plan.tile in (16, 32)) opt-in 0-ULP native WS5/MX7 path.
-    if plan.tile in (16, 32) and plan.rows > 2048 and _OVERRIDE is None and _DEC_CFG is None:
+    # 2b) C=4..8 / C=32 (M=17..256 -> TILE=8 with max_ctas>64 or TILE in (16,32) with rows>2048) opt-in 0-ULP WS5/MX7 path.
+    if (
+        ((plan.tile in (16, 32) and plan.rows > 2048) or is_c48_t8)
+        and _OVERRIDE is None
+        and _DEC_CFG is None
+    ):
         try:
             from . import moe_c32_runtime as _c32
         except Exception:
@@ -1418,6 +1873,17 @@ def bmm(
             )
             if res is not None:
                 return res
+
+    # 2c) Short/exact prefill (TILE >= 32) 0-ULP MX6-Huff7 path (TILE=32 direct; TILE>=64 panel unpack).
+    if (not nvfp4) and plan.tile >= 32 and _MX6_ENABLED and _OVERRIDE is None and _DEC_CFG is None:
+        if _get_mx6_lib() is not None:
+            n = weight.shape[1]
+            out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
+            if _mx6_bmm_prefill(
+                act, act_scale, row_scale, weight, weight_scale, ones, tiles, out,
+                plan, projection, row2tok=row2tok, as_row_major=as_row_major,
+            ):
+                return out
 
     # 3) Short/exact prefill (TILE >= 32, or when pf_moe_native is inactive): 0-ULP BF16 MX7 prefill.
     if (not nvfp4) and plan.tile >= 32 and _MX7_ENABLED and _OVERRIDE is None and _DEC_CFG is None:
@@ -1455,6 +1921,13 @@ def bmm(
     n = weight.shape[1]
     k = weight.shape[2] * pack
     out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
+
+    # Safety catch for TILE<=16 MX6 if C48 standalone was bypassed with INKLING_MX6_FREE_RAW=1.
+    if (not nvfp4) and plan.tile <= 16 and _MX6_ENABLED and isinstance(getattr(weight, "_inkling_mx6", None), tuple):
+        pdl = _EXPERT_PDL and plan.rows <= 2048
+        pdl_wait = (2 if projection == 1 else 1) if pdl else 0
+        if _mx6_bmm_decode(act, act_scale, weight, weight_scale, ones, tiles, out, plan, projection, pdl_wait, pdl):
+            return out
 
     # S5-W2 panel-contiguous fast path (used for ALL decode and prefill shapes once packed).
     spec = _PANEL_SPECS.get((nvfp4, projection)) if (_PANEL and _OVERRIDE is None and _DEC_CFG is None and _HWCVT) else None

@@ -27,15 +27,46 @@ Env:
   INKLING_ENGINECORE_CORE=15      Exclusive BIG core for VLLM::EngineCore (default 15)
   INKLING_ENGINECORE_NICE=-5      Nice value for VLLM::EngineCore (default -5)
   INKLING_APISERVER_CORES=16,17,18 Exclusive BIG cores for vllm APIServer (default 16,17,18)
+  INKLING_HOST_PIN_HEADLESS_BIG=0 Opt-in (V10): on headless ranks (1..7, no EngineCore/APIServer),
+                                  add idle Cluster-1 X925 Big cores (15..18) to worker helpers
+                                  for 4-HCA NCCL threads with zero contention on Worker/Proxies.
+  INKLING_HEADLESS_EXTRA_HELPERS=15,16,17,18 Extra helper cores merged on headless ranks 1..7.
 """
 from __future__ import annotations
 
 import gc
 import os
+import sys
 
 _PINNED = False
 _FROZEN = False
 _ENGINE_API_PINNED = False
+
+
+def detect_node_rank(rank: int | None = None) -> int:
+    """Detect node rank (0 = head with EngineCore/APIServer, 1..7 = headless worker).
+    Fail-closed to 0 when uncertain so Rank 0 never collides with EngineCore/APIServer."""
+    if rank is not None:
+        return int(rank)
+    for k in ("INKLING_NODE_RANK", "VLLM_NODE_RANK", "RANK"):
+        raw = os.environ.get(k, "").strip()
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+    try:
+        if "--headless" in sys.argv:
+            return 1
+    except Exception:
+        pass
+    try:
+        raw_cmd = open("/proc/self/cmdline", "rb").read()
+        if b"--headless" in raw_cmd:
+            return 1
+    except Exception:
+        pass
+    return 0
 
 
 def parse_cpuset(spec: str) -> set[int]:
@@ -75,8 +106,16 @@ def compute_worker_pin_plan(
     proxy_core: int | None = None,
     worker_core: int | None = None,
     helper_cores: set[int] | None = None,
+    *,
+    proxy_core2: int | None = None,
+    rank: int | None = None,
+    headless_big: bool | None = None,
+    headless_extra_helpers: set[int] | None = None,
 ) -> tuple[int | None, set[int]]:
-    """Return (main_tid_core, helper_tids_cores), strictly avoiding proxy_core and LITTLE cores."""
+    """Return (main_tid_core, helper_tids_cores), strictly avoiding proxy cores and LITTLE cores.
+    When INKLING_HOST_PIN_HEADLESS_BIG=1 on headless ranks (rank > 0), merges idle Cluster-1
+    X925 Big cores (default 15..18) into helper_cores while preserving zero overlap with Worker
+    and both SCHED_FIFO RDMA proxies."""
     if allowed is None:
         try:
             allowed = set(os.sched_getaffinity(0))
@@ -84,11 +123,24 @@ def compute_worker_pin_plan(
             allowed = set(range(20))
     if proxy_core is None:
         proxy_core = int(os.environ.get("RDMA_AR_PROXY_CORE", "9"))
-    proxy_core2 = int(os.environ.get("RDMA_AR_PROXY_CORE2", "-1"))
+    if proxy_core2 is None:
+        proxy_core2 = int(os.environ.get("RDMA_AR_PROXY_CORE2", "-1"))
     if worker_core is None:
         worker_core = int(os.environ.get("INKLING_WORKER_CORE", "5"))
     if helper_cores is None:
         helper_cores = parse_cpuset(os.environ.get("INKLING_HELPER_CORES", "6,7,8"))
+    else:
+        helper_cores = set(helper_cores)
+    if headless_big is None:
+        headless_big = os.environ.get(
+            "INKLING_HOST_PIN_HEADLESS_BIG", "0"
+        ).strip().lower() in ("1", "on", "true", "yes")
+    if headless_big and detect_node_rank(rank) > 0:
+        if headless_extra_helpers is None:
+            headless_extra_helpers = parse_cpuset(
+                os.environ.get("INKLING_HEADLESS_EXTRA_HELPERS", "15,16,17,18")
+            )
+        helper_cores = helper_cores | set(headless_extra_helpers)
 
     # Never collide with either RDMA proxy core.
     reserved = {c for c in (proxy_core, proxy_core2) if c >= 0}
@@ -149,13 +201,15 @@ def pin_worker(logger=None) -> bool:
                 pass
         if logger is not None:
             logger.info(
-                "INKLING_HOST_PIN: Worker pid=%d pinned main->cpu=%d, %d helpers->cpus=%s, "
-                "RDMA_AR_PROXY_CORE=%d, nice=%d",
+                "INKLING_HOST_PIN: rank=%d Worker pid=%d pinned main->cpu=%d, %d helpers->cpus=%s, "
+                "RDMA_AR_PROXY_CORE=%d, RDMA_AR_PROXY_CORE2=%d, nice=%d",
+                detect_node_rank(),
                 pid,
                 main_core,
                 n_helpers,
                 sorted(helper_cores),
                 proxy_core,
+                proxy_core2,
                 nice_val,
             )
         return True
@@ -277,6 +331,12 @@ def pin_engine_and_api(logger=None) -> bool:
     if os.environ.get("INKLING_HOST_PIN", "0").strip().lower() not in ("1", "on", "true", "yes"):
         return False
     if os.environ.get("INKLING_PIN_ENGINE_API", "0").strip().lower() not in ("1", "on", "true", "yes"):
+        return False
+    if (
+        os.environ.get("INKLING_HOST_PIN_HEADLESS_BIG", "0").strip().lower()
+        in ("1", "on", "true", "yes")
+        and detect_node_rank() > 0
+    ):
         return False
     _ENGINE_API_PINNED = True
     try:

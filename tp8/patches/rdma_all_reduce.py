@@ -180,6 +180,28 @@ def r7_take(x, d):  # r7-comm2
 _ROW_AR = os.environ.get("INKLING_ROW_AR", "").strip().lower() in ("1", "on", "true", "yes")
 _ROW_AR_STATS = os.environ.get("INKLING_ROW_AR_STATS", "").strip().lower() in ("1", "on", "true", "yes")
 _ROW_FULL = int(os.environ.get("INKLING_ROW_AR_ROWS", "8"))
+_ROW_AR_C28 = os.environ.get("INKLING_ROW_AR_C28", "").strip().lower() in ("1", "on", "true", "yes")
+_ROW_C28_MAX = max(_ROW_FULL, int(os.environ.get("INKLING_ROW_AR_C28_MAX", "64") or "64"))
+_ROW_AR_C28_WIRE = os.environ.get("INKLING_ROW_AR_C28_WIRE", "").strip().lower() in ("1", "on", "true", "yes")
+_FUSED_AR_SCONV_C28 = os.environ.get("INKLING_FUSED_AR_SCONV_C28", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_FUSED_AR_SCONV_C28_MIN_T = max(
+    1, min(64, int(os.environ.get("INKLING_FUSED_AR_SCONV_C28_MIN_T", "9") or "9"))
+)
+_FUSED_AR_SCONV_C28_MAX_T = max(
+    _FUSED_AR_SCONV_C28_MIN_T,
+    min(64, int(os.environ.get("INKLING_FUSED_AR_SCONV_C28_MAX_T", "64") or "64")),
+)
+_FUSED_AR_SCONV_C28_NLIVE = os.environ.get("INKLING_FUSED_AR_SCONV_C28_NLIVE", "1").strip().lower() not in (
+    "0", "", "off", "false", "no",
+)
+_FUSED_AR_SCONV_C28_V12 = os.environ.get("INKLING_FUSED_AR_SCONV_C28_V12", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_FUSED_AR_SCONV_C28_MAX_NSTACK = max(
+    1, min(10, int(os.environ.get("INKLING_FUSED_AR_SCONV_C28_MAX_NSTACK", "10") or "10"))
+)
 _ROW_HIDDEN = int(os.environ.get("INKLING_ROW_AR_HIDDEN", "4608"))
 _ROW_STATS_EVERY = int(os.environ.get("INKLING_ROW_AR_STATS_EVERY", "2048"))  # w3 rowar review: log period (calls)
 _ROWAR_FUSED_ENTRY = True
@@ -200,16 +222,25 @@ if _ROW_AR:
         STATS: tl.constexpr,
         HAS_PAD: tl.constexpr = False,
         ZERO_MASK: tl.constexpr = False,
+        INCLUDE_PAD: tl.constexpr = False,
     ):
         i = tl.arange(0, BLOCK)
         in_r = i < N
         m = tl.load(mask_ptr + i, mask=in_r, other=1)  # int8: 1 = masked (or past the end)
-        n = tl.max(tl.where(m == 0, i + 1, 0), 0)
-        n = tl.maximum(n, 1)
-        tl.store(out_ptr, n)
-        if HAS_PAD:
-            p = tl.load(pad_ptr + i, mask=in_r, other=0)
-            tl.store(pad_ptr + i, tl.where((p != 0) | (m != 0), 1, 0).to(tl.int8), mask=in_r)
+        if INCLUDE_PAD and HAS_PAD:
+            p = tl.load(pad_ptr + i, mask=in_r, other=1)
+            eff = (m != 0) | (p != 0)
+            n = tl.max(tl.where(eff == 0, i + 1, 0), 0)
+            n = tl.maximum(n, 1)
+            tl.store(out_ptr, n)
+            tl.store(pad_ptr + i, tl.where(eff, 1, 0).to(tl.int8), mask=in_r)
+        else:
+            n = tl.max(tl.where(m == 0, i + 1, 0), 0)
+            n = tl.maximum(n, 1)
+            tl.store(out_ptr, n)
+            if HAS_PAD:
+                p = tl.load(pad_ptr + i, mask=in_r, other=0)
+                tl.store(pad_ptr + i, tl.where((p != 0) | (m != 0), 1, 0).to(tl.int8), mask=in_r)
         if ZERO_MASK:
             tl.store(mask_ptr + i, tl.zeros((BLOCK,), dtype=tl.int8), mask=in_r)
         if STATS:  # single program: plain read-modify-write is safe
@@ -225,11 +256,13 @@ def rowar_begin(
     zero_mask: bool = False,
 ) -> bool:
     """Called inside the target forward (capture-safe). Arms the row scope for num_tokens == ROWS_FULL
-    forwards and optionally fuses pad.logical_or_(vw_mask) + vw_mask.zero_() into the same 1-CTA launch.
+    (and 1 <= num_tokens <= _ROW_C28_MAX when INKLING_ROW_AR_C28=1) forwards and optionally fuses
+    pad.logical_or_(vw_mask) + vw_mask.zero_() into the same 1-CTA launch.
     Returns True if fused (pad + zero_mask executed inside _n_live_kernel), False otherwise."""
     ROWAR["scope"] = None
     buf = ROWAR["buf"]
-    if buf is None or num_tokens != _ROW_FULL:
+    c28_ok = _ROW_AR_C28 and 1 <= num_tokens <= _ROW_C28_MAX
+    if buf is None or (num_tokens != _ROW_FULL and not c28_ok):
         return False
     if vw_mask.dtype != torch.bool or not vw_mask.is_contiguous():
         return False
@@ -241,6 +274,8 @@ def rowar_begin(
     )
     ROWAR["begins"] += 1
     stats = _ROW_AR_STATS and ROWAR["hist"] is not None
+    blk = max(8, triton.next_power_of_2(num_tokens)) if _ROW_AR_C28 else triton.next_power_of_2(num_tokens)
+    include_pad = bool(_ROW_AR_C28 and has_pad and num_tokens != _ROW_FULL)
     _n_live_kernel[(1,)](
         vw_mask.view(torch.int8),
         buf,
@@ -248,10 +283,11 @@ def rowar_begin(
         ROWAR["hist"] if stats else buf,
         ROWAR["hash"] if stats else buf,
         num_tokens,
-        BLOCK=triton.next_power_of_2(num_tokens),
+        BLOCK=blk,
         STATS=bool(stats),
         HAS_PAD=has_pad,
         ZERO_MASK=bool(zero_mask),
+        INCLUDE_PAD=include_pad,
     )
     ROWAR["scope"] = num_tokens
     ROWAR["last_live"] = (num_tokens, buf)
@@ -423,6 +459,7 @@ class RdmaAllReduce:
         self.h = None
         self._rs_h = None  # optional prefill-only pipelined RDMA RS / RingShift sidecar (RDMA_RS_EXT)
         self.ag_cols = False  # g2 colltrim (a): set below once the extension is up
+        self._c32_fused_sconv_ok = False  # v8 C=2..8 fused AR+SConv+AttnRes readiness (set below)
 
         # rel-2 RDMA_AR_FINGERPRINT=1: refuse to start when ranks differ (exchanged before phase 1)
         if os.environ.get("RDMA_AR_FINGERPRINT", "0") == "1":
@@ -477,28 +514,41 @@ class RdmaAllReduce:
                 if ROWAR["buf"] is None:
                     ROWAR["buf"] = torch.full((16,), _ROW_FULL, dtype=torch.int32, device=device)
                 if _ROW_AR_STATS and ROWAR["hist"] is None:
-                    ROWAR["hist"] = torch.zeros(_ROW_FULL + 2, dtype=torch.int32, device=device)
+                    _hist_max = max(_ROW_FULL, _ROW_C28_MAX) if _ROW_AR_C28 else _ROW_FULL
+                    ROWAR["hist"] = torch.zeros(_hist_max + 2, dtype=torch.int32, device=device)
                     ROWAR["hash"] = torch.zeros(1, dtype=torch.int64, device=device)
                 self.h.set_rows(ROWAR["buf"], _ROW_HIDDEN * 2, _ROW_FULL)
                 # compile all n_live_kernel specializations now (never inside a CUDA-graph capture)
-                _wm = torch.zeros(_ROW_FULL, dtype=torch.bool, device=device)
-                _pm = torch.zeros(_ROW_FULL, dtype=torch.bool, device=device)
-                _blk = triton.next_power_of_2(_ROW_FULL)
-                for _hp in (False, True):
-                    for _zm in (False, True):
-                        _n_live_kernel[(1,)](
-                            _wm.view(torch.int8), ROWAR["buf"],
-                            _pm.view(torch.int8) if _hp else ROWAR["buf"],
-                            ROWAR["buf"], ROWAR["buf"], _ROW_FULL,
-                            BLOCK=_blk, STATS=False, HAS_PAD=_hp, ZERO_MASK=_zm,
-                        )
-                        if _ROW_AR_STATS:
-                            _n_live_kernel[(1,)](
-                                _wm.view(torch.int8), ROWAR["buf"],
-                                _pm.view(torch.int8) if _hp else ROWAR["buf"],
-                                ROWAR["hist"], ROWAR["hash"], _ROW_FULL,
-                                BLOCK=_blk, STATS=True, HAS_PAD=_hp, ZERO_MASK=_zm,
-                            )
+                _max_n = max(_ROW_FULL, _ROW_C28_MAX) if _ROW_AR_C28 else _ROW_FULL
+                _wm = torch.zeros(_max_n, dtype=torch.bool, device=device)
+                _pm = torch.zeros(_max_n, dtype=torch.bool, device=device)
+                _blks = [triton.next_power_of_2(_ROW_FULL)]
+                if _ROW_AR_C28:
+                    _b = 8
+                    _bmax = max(8, triton.next_power_of_2(_ROW_C28_MAX))
+                    while _b <= _bmax:
+                        if _b not in _blks:
+                            _blks.append(_b)
+                        _b *= 2
+                for _blk in _blks:
+                    _n_sample = min(_max_n, _blk)
+                    for _hp in (False, True):
+                        _ip_opts = (False, True) if (_ROW_AR_C28 and _hp) else (False,)
+                        for _ip in _ip_opts:
+                            for _zm in (False, True):
+                                _n_live_kernel[(1,)](
+                                    _wm[:_n_sample].view(torch.int8), ROWAR["buf"],
+                                    _pm[:_n_sample].view(torch.int8) if _hp else ROWAR["buf"],
+                                    ROWAR["buf"], ROWAR["buf"], _n_sample,
+                                    BLOCK=_blk, STATS=False, HAS_PAD=_hp, ZERO_MASK=_zm, INCLUDE_PAD=_ip,
+                                )
+                                if _ROW_AR_STATS:
+                                    _n_live_kernel[(1,)](
+                                        _wm[:_n_sample].view(torch.int8), ROWAR["buf"],
+                                        _pm[:_n_sample].view(torch.int8) if _hp else ROWAR["buf"],
+                                        ROWAR["hist"], ROWAR["hash"], _n_sample,
+                                        BLOCK=_blk, STATS=True, HAS_PAD=_hp, ZERO_MASK=_zm, INCLUDE_PAD=_ip,
+                                    )
                 if _ROW_AR_STATS:
                     ROWAR["hist"].zero_(); ROWAR["hash"].zero_()
             info = self.h.local_info()
@@ -587,6 +637,43 @@ class RdmaAllReduce:
                 int(_SBUF_RING),
                 _DRAFT_AR_C32_MODE,
             )
+        self._c32_fused_sconv_ok = bool(
+            self.world == 8
+            and _R3_TRIM
+            and hasattr(self.h, "all_reduce_c32_sconv_attnres")
+            and hasattr(self.h, "c32_info")
+            and int(self.h.c32_info()[0]) == 1
+            and hasattr(self.h, "variant")
+            and int(self.h.variant()[2]) == 7
+        )
+        self._sbuf_ring_last_shape: dict[int, tuple | None] = {0: None, 1: None}
+        if getattr(_EXT, "V12_C18_RDMA_SCONV_VARIANT", None) is not None and hasattr(self.h, "v12_info"):
+            logger.info(
+                "rdma_ar v12 %s: [rolesplit,adapt_blk,exact_rows,p2_sleep,pace_ns,max_w,d1shot,d_adapt,d_sleep]=%s "
+                "c28_v12=%d max_ns=%d",
+                getattr(_EXT, "V12_C18_RDMA_SCONV_VARIANT", None),
+                list(self.h.v12_info()),
+                int(_FUSED_AR_SCONV_C28_V12),
+                _FUSED_AR_SCONV_C28_MAX_NSTACK,
+            )
+        if getattr(_EXT, "V9_C28_FUSED_SCONV_VARIANT", None) is not None:
+            logger.info(
+                "rdma_ar v9 c28_fused_sconv %s: enabled=%d sbuf_ring_min_m=%d",
+                getattr(_EXT, "V9_C28_FUSED_SCONV_VARIANT", None),
+                int(self._c32_fused_sconv_ok),
+                _SBUF_RING_MIN_M,
+            )
+        elif getattr(_EXT, "V8_C28_FUSED_SCONV_VARIANT", None) is not None:
+            logger.info(
+                "rdma_ar v8 c28_fused_ar_sconv %s: ready=%d enabled=%d range=[%d..%d] nlive=%d wire_trim=%d",
+                getattr(_EXT, "V8_C28_FUSED_SCONV_VARIANT", None),
+                int(self._c32_fused_sconv_ok),
+                int(_FUSED_AR_SCONV_C28),
+                _FUSED_AR_SCONV_C28_MIN_T,
+                _FUSED_AR_SCONV_C28_MAX_T,
+                int(_FUSED_AR_SCONV_C28_NLIVE),
+                int(_ROW_AR_C28_WIRE),
+            )
 
         # Optional prefill-only pipelined 4-HCA RDMA ReduceScatter / RingShift sidecar (RDMA_RS_EXT).
         # Completely independent of decode's rdma_ar_ext_s7v3.so -> ZERO risk to C=1 decode!
@@ -665,12 +752,16 @@ class RdmaAllReduce:
     # -- helpers ---------------------------------------------------------------------------
     @staticmethod
     def _on_aux_stream() -> bool:
-        try:
-            from vllm.utils import torch_utils
+        global _TORCH_UTILS_MOD
+        tu = _TORCH_UTILS_MOD
+        if tu is None:
+            try:
+                from vllm.utils import torch_utils as tu
 
-            aux = getattr(torch_utils, "_aux_stream", None)
-        except Exception:  # noqa: BLE001
-            return False
+                _TORCH_UTILS_MOD = tu
+            except Exception:  # noqa: BLE001
+                return False
+        aux = getattr(tu, "_aux_stream", None)
         return aux is not None and torch.cuda.current_stream().cuda_stream == aux.cuda_stream
 
     def _audit(self, op: str, x: torch.Tensor, extra: str = "") -> None:
@@ -764,11 +855,18 @@ class RdmaAllReduce:
             _L2PF.before_collective("ar")
         if (ROWAR["scope"] is not None and x.dim() == 2 and x.shape[0] == ROWAR["scope"]  # w3 rowar
                 and x.shape[1] == _ROW_HIDDEN and x.dtype == torch.bfloat16 and not self._on_aux_stream()):  # w3 rowar
-            ROWAR["used"] += 1  # w3 rowar
-            out = self.h.all_reduce_rows(x, two_shot)  # w3 rowar
-            if _L2PF_AFTER is not None:  # w3 rowar
-                _L2PF_AFTER("ar")  # w3 rowar
-            return out  # w3 rowar
+            if x.shape[0] == _ROW_FULL:
+                ROWAR["used"] += 1  # w3 rowar
+                out = self.h.all_reduce_rows(x, two_shot)  # w3 rowar
+                if _L2PF_AFTER is not None:  # w3 rowar
+                    _L2PF_AFTER("ar")  # w3 rowar
+                return out  # w3 rowar
+            if _ROW_AR_C28_WIRE and hasattr(self.h, "all_reduce_c32_rows"):
+                ROWAR["used"] += 1
+                out = self.h.all_reduce_c32_rows(x, ROWAR["buf"], two_shot)
+                if _L2PF_AFTER is not None:
+                    _L2PF_AFTER("ar")
+                return out
         if _R7_PROJ:  # r7-comm2
             _r7 = self._r7_fold(x, two_shot)  # r7-comm2
             if _r7 is not None:  # r7-comm2
@@ -838,6 +936,78 @@ class RdmaAllReduce:
             _L2PF_AFTER("ar")
         return out
 
+    def can_fused_c32_sconv_attnres(self, num_tokens: int, hidden: int) -> bool:
+        return (
+            _FUSED_AR_SCONV_C28
+            and not self.disabled
+            and getattr(self, "_c32_fused_sconv_ok", False)
+            and _FUSED_AR_SCONV_C28_MIN_T <= num_tokens <= _FUSED_AR_SCONV_C28_MAX_T
+            and hidden == _ROW_HIDDEN == 4608
+            and (num_tokens * 4608 * 2) <= self.max_reduce_bytes
+            and not self._on_aux_stream()
+        )
+
+    def all_reduce_c32_sconv_attnres(
+        self,
+        x: torch.Tensor,
+        conv_w: torch.Tensor,
+        cache: torch.Tensor,
+        positions: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_idx: torch.Tensor,
+        slot_map: torch.Tensor,
+        q_start: torch.Tensor,
+        stream_off: int,
+        conv_out: torch.Tensor,
+        aux_out: torch.Tensor | None,
+        conv_res: torch.Tensor | None,
+        conv_addend: torch.Tensor | None,
+        stack: torch.Tensor,
+        mix_last: torch.Tensor | None,
+        queries: torch.Tensor,
+        norm_w: torch.Tensor,
+        eps: float = 1e-6,
+        norm_eps: float = 1e-6,
+        normalize_values: bool = True,
+    ) -> torch.Tensor | None:
+        """v8 C=2..8: 0-ULP fused 48-CTA RDMA AllReduce + SConv + AttnRes + RMSNorm (bf16 [1..64, 4608])."""
+        t_rows = int(x.shape[0])
+        hidden = int(x.shape[1])
+        if (
+            not self.can_fused_c32_sconv_attnres(t_rows, hidden)
+            or x.dtype != torch.bfloat16
+            or not x.is_contiguous()
+        ):
+            return None
+        if _XS_MODE != "off":
+            self._xstream_guard("all_reduce_c32_sconv_attnres", x)
+        nl_buf = (
+            ROWAR["buf"]
+            if (_FUSED_AR_SCONV_C28_NLIVE and ROWAR["scope"] == t_rows and ROWAR["buf"] is not None)
+            else None
+        )
+        wire_trim = bool(nl_buf is not None and _ROW_AR_C28_WIRE)
+        self._audit("all_reduce_c32_sconv_attnres", x, " wire_trim" if wire_trim else "")
+        if _L2PF is not None:
+            _L2PF.before_collective("ar")
+        if nl_buf is not None:
+            ROWAR["used"] += 1
+        if _FUSED_AR_SCONV_C28_V12 and hasattr(self.h, "all_reduce_c28_sconv_attnres_v12"):
+            out = self.h.all_reduce_c28_sconv_attnres_v12(
+                x, nl_buf, conv_w, cache, positions, block_table, seq_idx, slot_map, q_start,
+                int(stream_off), conv_out, aux_out, conv_res, conv_addend, stack, mix_last,
+                queries, norm_w, float(eps), float(norm_eps), bool(normalize_values), wire_trim,
+            )
+        else:
+            out = self.h.all_reduce_c32_sconv_attnres(
+                x, nl_buf, conv_w, cache, positions, block_table, seq_idx, slot_map, q_start,
+                int(stream_off), conv_out, aux_out, conv_res, conv_addend, stack, mix_last,
+                queries, norm_w, float(eps), float(norm_eps), bool(normalize_values), wire_trim,
+            )
+        if _L2PF_AFTER is not None:
+            _L2PF_AFTER("ar")
+        return out
+
     _DRAFT_AR_MODE_CODE = {
         "bf16": 0, "0": 0, "off": 0, "": 0,
         "int8": 1, "1": 1,
@@ -850,6 +1020,12 @@ class RdmaAllReduce:
         "0", "", "off", "false", "no"
     )
     _DRAFT_AR_BATCHED_MAX_M = int(os.environ.get("INKLING_DRAFT_AR_BATCHED_MAX_M", "256") or "256")
+    _DRAFT_AR_C18_ONESHOT = os.environ.get("INKLING_DRAFT_AR_C18_ONESHOT", "0").strip().lower() in (
+        "1", "on", "true", "yes",
+    )
+    _DRAFT_AR_C18_ONESHOT_MAX_M = max(
+        8, min(24, int(os.environ.get("INKLING_DRAFT_AR_C18_ONESHOT_MAX_M", "16") or "16"))
+    )
 
     def all_reduce_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor, eps: float,
@@ -887,6 +1063,18 @@ class RdmaAllReduce:
             ):
                 if _XS_MODE != "off":
                     self._xstream_guard("all_reduce_add_rmsnorm_batched", x)
+                use_1shot = bool(
+                    self._DRAFT_AR_C18_ONESHOT
+                    and rows <= self._DRAFT_AR_C18_ONESHOT_MAX_M
+                    and not out_h64
+                )
+                if use_1shot:
+                    try:
+                        return self.h.all_reduce_add_rmsnorm_batched(
+                            x, residual, gamma, float(eps), int(mc32), True
+                        )
+                    except TypeError:
+                        pass
                 try:
                     return self.h.all_reduce_add_rmsnorm_batched(
                         x, residual, gamma, float(eps), int(mc32)
@@ -1000,18 +1188,35 @@ class RdmaAllReduce:
         uses the domain-partitioned 8-slot ring (domain 0=target [0..3], domain 1=drafter [4..7])."""
         if not _R3_SENDBUF or self.disabled or not torch.cuda.is_current_stream_capturing():  # r6-comm
             return None  # r6-comm
-        n = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()  # r6-comm
+        esz = getattr(dtype, "itemsize", None)
+        if esz is None:
+            esz = torch.empty((), dtype=dtype).element_size()
+        n = torch.Size(shape).numel() * int(esz)  # r6-comm
         if n <= 0 or n % 16 or n > self.max_bytes:  # r6-comm
             return None  # r6-comm
-        if _SBUF_RING and int(shape[0]) > 16 and hasattr(self.h, "send_buffer_ring"):
-            b = self.h.send_buffer_ring(n, int(domain))
+        if _SBUF_RING and int(shape[0]) >= _SBUF_RING_MIN_M and hasattr(self.h, "send_buffer_ring"):
+            dom = 1 if int(domain) == 1 else 0
+            shp = tuple(shape)
+            last_map = getattr(self, "_sbuf_ring_last_shape", None)
+            if last_map is None:
+                last_map = {0: None, 1: None}
+                self._sbuf_ring_last_shape = last_map
+            if last_map.get(dom) != shp:
+                if hasattr(self.h, "reset_send_buffer_ring"):
+                    self.h.reset_send_buffer_ring(dom)
+                last_map[dom] = shp
+            b = self.h.send_buffer_ring(n, dom)
         else:
             b = self.h.send_buffer(n)  # r6-comm
         return None if b is None else b.view(dtype).view(shape)  # r6-comm
 
     def reset_send_buffer_ring(self, domain: int = 0) -> None:
         if _SBUF_RING and not self.disabled and self.h is not None and hasattr(self.h, "reset_send_buffer_ring"):
-            self.h.reset_send_buffer_ring(int(domain))
+            dom = 1 if int(domain) == 1 else 0
+            self.h.reset_send_buffer_ring(dom)
+            last_map = getattr(self, "_sbuf_ring_last_shape", None)
+            if last_map is not None:
+                last_map[dom] = None
   # r6-comm
     def stats(self, reset: bool = False) -> list:
         return [] if self.h is None else list(self.h.stats(reset))
@@ -1019,8 +1224,27 @@ class RdmaAllReduce:
 
 _SBUF_MAX_TOKENS = int(os.environ.get("INKLING_SENDBUF_MAX_TOKENS", "16"))
 _SBUF_RING = os.environ.get("RDMA_AR_SENDBUF_RING", "0").strip().lower() in ("1", "on", "true", "yes")
+_SBUF_RING_MIN_M = max(1, int(os.environ.get("RDMA_AR_SENDBUF_RING_MIN_M", "17") or 17))
+# Wave-V10 opt-in (default OFF): fix M<=16 capture-entry ring reset when RING_MIN_M<=16,
+# eliminate double get_send_buffer ring-advance on _s8/_c32 fallback, and honor combine_only
+# sendbuf on plan.tile>=64. 100% 0-ULP bit-invariant.
+_SBUF_RING_V10 = os.environ.get("INKLING_SENDBUF_RING_V10", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
 _DRAFT_AR_C32_MODE = os.environ.get("INKLING_DRAFT_AR_C32_MODE", "off").strip().lower()
 _SBUF_COUNT = 0
+_TORCH_UTILS_MOD = None
+_L2PF_MOD_CACHE = None
+_GET_TP_GROUP_FN = None
+
+
+def _get_tp_group_cached():
+    global _GET_TP_GROUP_FN
+    fn = _GET_TP_GROUP_FN
+    if fn is None:
+        from vllm.distributed import get_tp_group as fn
+        _GET_TP_GROUP_FN = fn
+    return fn()
 
 
 def reset_send_buffer_ring(domain: int = 0) -> None:
@@ -1028,8 +1252,7 @@ def reset_send_buffer_ring(domain: int = 0) -> None:
     if not _R3_SENDBUF or not _SBUF_RING or not torch.cuda.is_current_stream_capturing():
         return
     try:
-        from vllm.distributed import get_tp_group
-        comm = getattr(get_tp_group().device_communicator, "rdma_comm", None)
+        comm = getattr(_get_tp_group_cached().device_communicator, "rdma_comm", None)
         if comm is not None:
             comm.reset_send_buffer_ring(domain)
     except Exception:
@@ -1038,20 +1261,22 @@ def reset_send_buffer_ring(domain: int = 0) -> None:
 
 def get_send_buffer(shape, dtype: torch.dtype, max_tokens: int | None = None, domain: int = 0):
     """Allocate a registered RDMA send buffer during FULL CUDA graph capture only (zero staging AR)."""
-    global _SBUF_COUNT
+    global _SBUF_COUNT, _L2PF_MOD_CACHE
     if not _R3_SENDBUF:
         return None
     lim = _SBUF_MAX_TOKENS if max_tokens is None else max_tokens
     if shape[0] <= 0 or shape[0] > lim or not torch.cuda.is_current_stream_capturing():
         return None
     try:
-        from vllm.models.inkling2.ops import l2pf
-        if l2pf._is_piecewise_capturing():
+        _l2pf_m = _L2PF_MOD_CACHE
+        if _l2pf_m is None:
+            from vllm.models.inkling2.ops import l2pf as _l2pf_m
+            _L2PF_MOD_CACHE = _l2pf_m
+        if _l2pf_m._is_piecewise_capturing():
             return None
     except Exception:
         return None
-    from vllm.distributed import get_tp_group
-    comm = getattr(get_tp_group().device_communicator, "rdma_comm", None)
+    comm = getattr(_get_tp_group_cached().device_communicator, "rdma_comm", None)
     if comm is None:
         return None
     buf = comm.send_buffer(shape, dtype, domain=domain)

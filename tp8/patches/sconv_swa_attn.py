@@ -30,6 +30,13 @@ from torch import nn
 _SCONV_SPARSE = os.environ.get("INKLING_SCONV_SPARSE", "1").strip().lower() not in (
     "0", "", "off", "false", "no"
 )
+# INKLING_KV_BF12=1: right-size SConv head_size padding from 16,384 (128 KiB) to
+# 12,672 (99.000 KiB = 101,376 B, 256B-aligned rows, 100% BF16 0-ULP, raw=9,472 <= 12,672)
+# so Attention KV-BF12, SConv BF16, and Draft SWA share one uniform 99 KiB BlockPool.
+_KV_BF12 = os.environ.get("INKLING_KV_BF12", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
+_KV_BF12_SCONV_HEAD_SIZE = 12672  # 1 * 4 * 12672 * 2 B = 101,376 B = 99.000 KiB
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -168,7 +175,15 @@ class InklingConvState(nn.Module, AttentionLayerBase):
         # match a larger attention page; index the bound cache with its runtime
         # token dim (``cache_block_size``), not this kernel window size.
         raw_head_size = 2 * head_dim + 2 * hidden_per_head
-        self.head_size = 1 << (raw_head_size - 1).bit_length()
+        if (
+            _KV_BF12
+            and kernel_size == 4
+            and self.num_kv_heads == 1
+            and raw_head_size <= _KV_BF12_SCONV_HEAD_SIZE
+        ):
+            self.head_size = _KV_BF12_SCONV_HEAD_SIZE
+        else:
+            self.head_size = 1 << (raw_head_size - 1).bit_length()
         self.sliding_window = kernel_size
         self.block_size = kernel_size
         # Per-head D-sub-range (offset, width) for each stream. Streams share

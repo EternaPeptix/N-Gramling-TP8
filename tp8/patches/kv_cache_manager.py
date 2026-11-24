@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -14,7 +15,28 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    null_head_len,
+    trim_null_head,
+)
+
+_FAST_SPARSE_SW_BLOCKS = os.environ.get("INKLING_FAST_SPARSE_SW_BLOCKS", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+
+
+def _fast_group_block_ids(group: Sequence[KVCacheBlock]) -> list[int]:
+    n = len(group)
+    if _FAST_SPARSE_SW_BLOCKS and n >= 256:
+        nhl = null_head_len(group)
+        if nhl > 0:
+            res = [group[0].block_id] * n
+            for j in range(nhl, n):
+                res[j] = group[j].block_id
+            return res
+    return [blk.block_id for blk in group]
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -104,6 +126,8 @@ class KVCacheBlocks:
         )
         if allow_none and all(len(group) == 0 for group in groups):
             return None
+        if _FAST_SPARSE_SW_BLOCKS:
+            return tuple(_fast_group_block_ids(group) for group in groups)
         return tuple([blk.block_id for blk in group] for group in groups)
 
     def get_unhashed_block_ids(self) -> list[int]:

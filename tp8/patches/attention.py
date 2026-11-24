@@ -40,8 +40,10 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import (
+    KV_BF12_STATE_CONTENT_BYTES,
     FullAttentionSpec,
     KVCacheSpec,
+    KVQuantMode,
     SlidingWindowSpec,
 )
 
@@ -55,9 +57,57 @@ from .ops.attention import (
     rel_decode_attention,
 )
 from .ops import l2pf
+from .ops import linear as _lin_mod
+from .ops import sconv as _sconv_mod
 from .ops.linear import linear
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
+
+# Wave-V10: Lazy cached module refs eliminating repeated per-layer `from .ops import ...` overhead.
+_SKINNY_BF11_MOD = None
+_SKINNY_BF12_MOD = None
+_SM12_ATTN_FUSED_MOD = None
+_TSR_MOD = None
+
+
+def _get_skinny_bf11():
+    global _SKINNY_BF11_MOD
+    m = _SKINNY_BF11_MOD
+    if m is None:
+        from .ops import skinny_bf11 as m
+
+        _SKINNY_BF11_MOD = m
+    return m
+
+
+def _get_skinny_bf12():
+    global _SKINNY_BF12_MOD
+    m = _SKINNY_BF12_MOD
+    if m is None:
+        from .ops import skinny_bf12 as m
+
+        _SKINNY_BF12_MOD = m
+    return m
+
+
+def _get_sm12_attn_fused():
+    global _SM12_ATTN_FUSED_MOD
+    m = _SM12_ATTN_FUSED_MOD
+    if m is None:
+        from .ops import sm12_attn_fused as m
+
+        _SM12_ATTN_FUSED_MOD = m
+    return m
+
+
+def _get_tsr_mod():
+    global _TSR_MOD
+    m = _TSR_MOD
+    if m is None:
+        from .ops import tree_spec_runtime as m
+
+        _TSR_MOD = m
+    return m
 
 # INKLING_GLOBAL_DYN_OVERLAP=1: overlap global-layer k_sconv/v_sconv dynamic_taps
 # (~10.4 us/layer, 83 us/step) on a reusable side stream behind q_side + dual_kv
@@ -66,12 +116,32 @@ from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
 _GLOBAL_DYN_OVERLAP = os.environ.get(
     "INKLING_GLOBAL_DYN_OVERLAP", "1"
 ).strip().lower() not in ("0", "", "off", "false", "no")
+_GLOBAL_DYN_OVERLAP_GRAPH = os.environ.get(
+    "INKLING_GLOBAL_DYN_OVERLAP_GRAPH", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 _GLOBAL_DYN_OVERLAP_MAX_M = int(os.environ.get("INKLING_GLOBAL_DYN_OVERLAP_MAX_M", "16"))
+_GLOBAL_DUAL_KV_C28_PDL = os.environ.get(
+    "INKLING_GLOBAL_DUAL_KV_C28_PDL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 _FUSED_ATTN_SM12_FIX = os.environ.get(
     "INKLING_FUSED_DECODE_ATTN_SM12_FIX", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_SAM_EXT_ATTN_FIX = (
+    os.environ.get("INKLING_SAM_EXT_ATTN_FIX", "0").strip().lower() in ("1", "true", "on", "yes")
+    or os.environ.get("INKLING_SAM_EXT_K15", "0").strip().lower() in ("1", "true", "on", "yes")
+)
 _TREE_SPEC = os.environ.get("INKLING_TREE_SPEC", "0").strip().lower() not in (
     "0", "", "off", "false", "no"
+)
+_KV_BF12 = os.environ.get("INKLING_KV_BF12", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
+_KV_BF12_GLOBAL_ONLY = os.environ.get("INKLING_KV_BF12_GLOBAL_ONLY", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
+_FUSED_ATTN_V11 = (
+    os.environ.get("INKLING_FUSED_ATTN_V11_S48", "0").strip().lower() in ("1", "on", "true", "yes")
+    or os.environ.get("INKLING_FUSED_ATTN_V11_C1632_GLOBAL", "0").strip().lower() in ("1", "on", "true", "yes")
 )
 _DYN_STREAMS: dict[int, torch.cuda.Stream] = {}
 
@@ -87,10 +157,13 @@ def _get_dyn_stream(device: torch.device) -> torch.cuda.Stream | None:
         if torch.cuda.is_current_stream_capturing():
             return None
         st = torch.cuda.Stream(device=device)
-        # Materialize per-stream cuBLAS handle & workspace outside CUDA graph capture.
+        # Materialize per-stream cuBLAS handle & workspaces for all decode M buckets up to MAX_M outside capture.
         with torch.cuda.stream(st):
-            _z = torch.empty((1, 16), dtype=torch.bfloat16, device=device)
-            _ = torch.mm(_z, _z.t())
+            _zw = torch.zeros((4, 4608), dtype=torch.bfloat16, device=device)
+            _warm_ms = tuple(m for m in (8, 16, 32, 48, 64) if m <= max(8, _GLOBAL_DYN_OVERLAP_MAX_M))
+            for _wm in _warm_ms:
+                _zx = torch.zeros((_wm, 4608), dtype=torch.bfloat16, device=device)
+                _ = nn.functional.linear(_zx, _zw)
         st.synchronize()
         _DYN_STREAMS[dev_idx] = st
     return st
@@ -250,6 +323,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         self.max_decode_query_len = max_decode_query_len(vllm_config)
         assert vllm_config.cache_config.cache_dtype in ("auto", "bfloat16")
         self.kv_cache = torch.tensor([])
+        self._kv_bf12_emerg = None
         self._dyn_ev_in: torch.cuda.Event | None = None
         self._dyn_ev_out: torch.cuda.Event | None = None
         forward_context = vllm_config.compilation_config.static_forward_context
@@ -280,29 +354,72 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
         self.rel_proj_rev = self.rel_logits_proj.flip(-1).contiguous()
         self.rel_proj_t = self.rel_logits_proj.t().contiguous()
-        if not self.is_local and _GLOBAL_DYN_OVERLAP and self.rel_logits_proj.is_cuda:
-            dev = self.rel_logits_proj.device
-            _get_dyn_stream(dev)
-            self._ensure_dyn_events(dev)
+        try:
+            from .ops import sconv as _sc_v5
+            if hasattr(_sc_v5, "_get_target_attn_v5_lib"):
+                _sc_v5._get_target_attn_v5_lib()
+        except Exception:
+            pass
+        if not self.is_local and self.rel_logits_proj.is_cuda:
+            try:
+                from .ops import skinny_bf11 as _sbf11
+                if getattr(_sbf11, "FUSE_DYN", False) and self.k_sconv.dynamic:
+                    _w_v_dyn = self.v_sconv.weight_proj if (getattr(_sbf11, "FUSE_DYN_STRICT", False) and self.v_sconv.dynamic) else None
+                    _sbf11.qualify_dyn(self.k_sconv.weight_proj, _w_v_dyn)
+            except Exception:
+                pass
+            if _GLOBAL_DYN_OVERLAP:
+                dev = self.rel_logits_proj.device
+                _get_dyn_stream(dev)
+                self._ensure_dyn_events(dev)
+        if (_KV_BF12 or _FUSED_ATTN_V11) and self.rel_logits_proj.is_cuda:
+            from .ops import sm12_attn_fused as _sm12_f
+            _sm12_f._load_lib()
+            if _KV_BF12 and (not _KV_BF12_GLOBAL_ONLY or not self.is_local):
+                _sm12_f.get_kv_bf12_paged_lib()
+                if self._kv_bf12_emerg is None:
+                    self._kv_bf12_emerg = _sm12_f.KvBf12EmergPool(self.rel_logits_proj.device)
+            if _FUSED_ATTN_V11:
+                _sm12_f.ensure_v11_scratch(self.rel_logits_proj.device)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return Inkling2AttentionBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size = vllm_config.cache_config.block_size
+        dtype = vllm_config.model_config.dtype
+        use_bf12 = (
+            _KV_BF12
+            and (not _KV_BF12_GLOBAL_ONLY or not self.is_local)
+            and block_size in (16, 32, 64, 128, 256)
+            and self.head_dim == 128
+            and dtype == torch.bfloat16
+        )
+        if use_bf12:
+            block_size = 256
+        bf12_kw = (
+            {
+                "state_content_bytes": KV_BF12_STATE_CONTENT_BYTES,
+                "kv_quant_mode": KVQuantMode.KV_BF12,
+            }
+            if use_bf12
+            else {}
+        )
         if self.is_local:
             return SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_dim,
-                dtype=vllm_config.model_config.dtype,
+                dtype=dtype,
                 sliding_window=self.sliding_window,
+                **bf12_kw,
             )
         return FullAttentionSpec(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
-            dtype=vllm_config.model_config.dtype,
+            dtype=dtype,
+            **bf12_kw,
         )
 
     def _project(
@@ -319,20 +436,19 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         k_end = q_side + kv_size
         projected = linear(x_q, weight[: sum(self.q_side_splits)])
         kv_pair = None
+        skinny_bf11 = _get_skinny_bf11()
         if x_k.shape[0] <= 16:
-            from .ops import skinny_bf11
             if skinny_bf11.ENABLED:
-                from .ops import linear as _lin_mod
                 kv_pair = skinny_bf11.bf11_dual_kv(
                     x_k, x_v, weight[q_side:k_end], weight[k_end : k_end + kv_size],
                     pdl=_lin_mod._PDL_QKVR, trig=False,
                 )
         else:
-            from .ops import skinny_bf11
             if skinny_bf11.ENABLED and skinny_bf11.C32_ENABLED and x_k.shape[0] <= skinny_bf11.C32_MAX_M:
+                _c28_pdl = bool(_lin_mod._PDL_QKVR) if (_GLOBAL_DUAL_KV_C28_PDL and x_k.shape[0] <= 64) else False
                 kv_pair = skinny_bf11.bf11_dual_kv(
                     x_k, x_v, weight[q_side:k_end], weight[k_end : k_end + kv_size],
-                    pdl=False, trig=False,
+                    pdl=_c28_pdl, trig=_c28_pdl,
                 )
         if kv_pair is not None:
             k, v = kv_pair
@@ -367,6 +483,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
         k_end = q_side + kv_size
         q_side_w = weight[: sum(self.q_side_splits)]
+        self._last_dyn_overlap = False
         if not isinstance(x_k, torch.Tensor):
             # INKLING_PREFILL_SP_Q3=repl_kv: pre-projected [T, kv_dim] K/V + [T, W] dyn taps
             # from sharded x_k/x_v + all_to_all (strictly prefill-only, 100% BF16 exact!).
@@ -377,12 +494,47 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         w_k = weight[q_side:k_end]
         w_v = weight[k_end : k_end + kv_size]
 
+        # Wave-V9: Fused single-stream global q_side -> bf11_dual_kv_dyn (K+V+k_dyn+v_dyn)
+        # Kills 16 cuBLAS launches/step, 16 CUDA events, and eliminates dyn_stream completely (0-ULP!).
+        pre_projected = None
+        if self.k_sconv.dynamic and self.v_sconv.dynamic and x_k.is_cuda:
+            skinny_bf11 = _get_skinny_bf11()
+            _kv_m = int(x_k.shape[0])
+            if skinny_bf11.can_bf11_dual_kv_dyn(
+                _kv_m, w_k, w_v, self.k_sconv.weight_proj, self.v_sconv.weight_proj
+            ):
+                projected = None
+                _c28_pdl_ok = _kv_m <= 16 or (_GLOBAL_DUAL_KV_C28_PDL and _kv_m <= 64)
+                if (_kv_m <= 16 or (skinny_bf11.C32_ENABLED and _kv_m <= skinny_bf11.C32_MAX_M)) and _lin_mod._SKINNY and skinny_bf11.ENABLED:
+                    _q_pdl = _lin_mod._pdl_site(x_q, q_side_w, None) if _c28_pdl_ok else False
+                    _q_trig = _lin_mod._PDL_QKVR if _c28_pdl_ok else False
+                    projected = skinny_bf11.bf11_linear(x_q, q_side_w, pdl=_q_pdl, trig=_q_trig)
+                if projected is None:
+                    projected = linear(x_q, q_side_w)
+                add_linear_lora(self.qkvr, projected, x_q, range(4))
+                _fused_kv_pdl = _lin_mod._PDL_QKVR if _c28_pdl_ok else False
+                fused_res = skinny_bf11.bf11_dual_kv_dyn(
+                    x_k, x_v, w_k, w_v,
+                    self.k_sconv.weight_proj, self.v_sconv.weight_proj,
+                    pdl=_fused_kv_pdl, trig=_fused_kv_pdl,
+                )
+                if fused_res is not None:
+                    self._last_dyn_overlap = False
+                    k, v, k_dyn, v_dyn = fused_res
+                    add_linear_lora(self.qkvr, k, x_k, [4])
+                    add_linear_lora(self.qkvr, v, x_v, [5])
+                    q, r, gate, sinks = projected.split(self.q_side_splits, dim=-1)[:4]
+                    return q, r, gate, sinks, k, v, k_dyn, v_dyn
+                pre_projected = projected
+
         use_overlap = (
             _GLOBAL_DYN_OVERLAP
             and x_q.shape[0] <= _GLOBAL_DYN_OVERLAP_MAX_M
             and x_k.is_cuda
             and self.k_sconv.dynamic
             and self.v_sconv.dynamic
+            # Piecewise capture breaks across @eager_break_during_capture (_attention);
+            # forking dyn_stream inside Piece 1 leaks graph-pool buffers into eager Piece 2.
             and not l2pf._is_piecewise_capturing()
         )
         dyn_stream = None
@@ -393,6 +545,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 dyn_evs = self._ensure_dyn_events(x_k.device)
             if dyn_stream is None or dyn_evs is None:
                 use_overlap = False
+        self._last_dyn_overlap = use_overlap
 
         if use_overlap:
             assert dyn_stream is not None and dyn_evs is not None
@@ -406,36 +559,52 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 v_dyn = self.v_sconv.dynamic_taps(x_v)
                 ev_out.record(dyn_stream)
             try:
-                projected = None
-                from .ops import linear as _lin_mod
-                from .ops import skinny_bf11
+                projected = pre_projected
+                skinny_bf11 = _get_skinny_bf11()
 
-                can_bf11_kv = (
-                    skinny_bf11.ENABLED
-                    and skinny_bf11.USE_DUAL_KV
-                    and skinny_bf11.get_packed(w_k) is not None
-                    and skinny_bf11.get_packed(w_v) is not None
-                )
-                if x_q.shape[0] <= 16 and _lin_mod._SKINNY and skinny_bf11.ENABLED:
-                    projected = skinny_bf11.bf11_linear(
-                        x_q,
-                        q_side_w,
-                        pdl=_lin_mod._pdl_site(x_q, q_side_w, None),
-                        trig=(_lin_mod._PDL_QKVR and can_bf11_kv),
-                    )
                 if projected is None:
-                    projected = linear(x_q, q_side_w)
-                add_linear_lora(self.qkvr, projected, x_q, range(4))
+                    can_bf11_kv = (
+                        skinny_bf11.ENABLED
+                        and skinny_bf11.USE_DUAL_KV
+                        and skinny_bf11.get_packed(w_k) is not None
+                        and skinny_bf11.get_packed(w_v) is not None
+                    )
+                    _q_m = x_q.shape[0]
+                    _q_c28_ok = (
+                        17 <= _q_m <= 64
+                        and skinny_bf11.C32_ENABLED
+                        and _q_m <= skinny_bf11.C32_MAX_M
+                    )
+                    if (_q_m <= 16 or _q_c28_ok) and _lin_mod._SKINNY and skinny_bf11.ENABLED:
+                        _q_pdl = _lin_mod._pdl_site(x_q, q_side_w, None) if (_q_m <= 16 or _GLOBAL_DUAL_KV_C28_PDL) else False
+                        _q_trig = (_lin_mod._PDL_QKVR and can_bf11_kv) if (_q_m <= 16 or _GLOBAL_DUAL_KV_C28_PDL) else False
+                        projected = skinny_bf11.bf11_linear(
+                            x_q,
+                            q_side_w,
+                            pdl=_q_pdl,
+                            trig=_q_trig,
+                        )
+                    if projected is None:
+                        projected = linear(x_q, q_side_w)
+                    add_linear_lora(self.qkvr, projected, x_q, range(4))
 
                 kv_pair = None
-                if x_k.shape[0] <= 16 and skinny_bf11.ENABLED:
+                _kv_m = x_k.shape[0]
+                _kv_c28_ok = (
+                    17 <= _kv_m <= 64
+                    and skinny_bf11.C32_ENABLED
+                    and _kv_m <= skinny_bf11.C32_MAX_M
+                )
+                if (_kv_m <= 16 or _kv_c28_ok) and skinny_bf11.ENABLED:
+                    _kv_pdl = _lin_mod._PDL_QKVR if (_kv_m <= 16 or _GLOBAL_DUAL_KV_C28_PDL) else False
+                    # Do NOT fire PDL launch_dependents across the imminent cur.wait_event(ev_out) join!
                     kv_pair = skinny_bf11.bf11_dual_kv(
                         x_k,
                         x_v,
                         w_k,
                         w_v,
-                        pdl=_lin_mod._PDL_QKVR,
-                        trig=_lin_mod._PDL_QKVR,
+                        pdl=_kv_pdl,
+                        trig=False,
                     )
                 if kv_pair is not None:
                     k, v = kv_pair
@@ -456,45 +625,47 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             q, r, gate, sinks = projected.split(self.q_side_splits, dim=-1)[:4]
             return q, r, gate, sinks, k, v, k_dyn, v_dyn
 
-        projected = None
-        if x_q.shape[0] <= 16:
-            from .ops import linear as _lin_mod
-            from .ops import skinny_bf11
-            if _lin_mod._SKINNY and skinny_bf11.ENABLED:
-                projected = skinny_bf11.bf11_linear(
-                    x_q,
-                    q_side_w,
-                    pdl=_lin_mod._pdl_site(x_q, q_side_w, None),
-                    trig=False,
-                )
-        else:
-            from .ops import linear as _lin_mod
-            from .ops import skinny_bf11
-            if (
-                _lin_mod._SKINNY
-                and skinny_bf11.ENABLED
-                and skinny_bf11.C32_ENABLED
-                and x_q.shape[0] <= skinny_bf11.C32_MAX_M
-            ):
-                projected = skinny_bf11.bf11_linear(
-                    x_q,
-                    q_side_w,
-                    pdl=False,
-                    trig=False,
-                )
+        projected = pre_projected
         if projected is None:
-            projected = linear(x_q, q_side_w)
-        add_linear_lora(self.qkvr, projected, x_q, range(4))
+            skinny_bf11 = _get_skinny_bf11()
+            if x_q.shape[0] <= 16:
+                if _lin_mod._SKINNY and skinny_bf11.ENABLED:
+                    projected = skinny_bf11.bf11_linear(
+                        x_q,
+                        q_side_w,
+                        pdl=_lin_mod._pdl_site(x_q, q_side_w, None),
+                        trig=False,
+                    )
+            else:
+                if (
+                    _lin_mod._SKINNY
+                    and skinny_bf11.ENABLED
+                    and skinny_bf11.C32_ENABLED
+                    and x_q.shape[0] <= skinny_bf11.C32_MAX_M
+                ):
+                    _q_pdl = (
+                        _lin_mod._pdl_site(x_q, q_side_w, None)
+                        if (_GLOBAL_DUAL_KV_C28_PDL and x_q.shape[0] <= 64)
+                        else False
+                    )
+                    projected = skinny_bf11.bf11_linear(
+                        x_q,
+                        q_side_w,
+                        pdl=_q_pdl,
+                        trig=False,
+                    )
+            if projected is None:
+                projected = linear(x_q, q_side_w)
+            add_linear_lora(self.qkvr, projected, x_q, range(4))
 
         # Dynamic taps depend solely on x_k / x_v (already produced by attn_res).
         k_dyn = self.k_sconv.dynamic_taps(x_k)
         v_dyn = self.v_sconv.dynamic_taps(x_v)
 
         kv_pair = None
+        skinny_bf11 = _get_skinny_bf11()
         if x_k.shape[0] <= 16:
-            from .ops import skinny_bf11
             if skinny_bf11.ENABLED:
-                from .ops import linear as _lin_mod
                 kv_pair = skinny_bf11.bf11_dual_kv(
                     x_k,
                     x_v,
@@ -504,15 +675,15 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                     trig=_lin_mod._PDL_QKVR,
                 )
         else:
-            from .ops import skinny_bf11
             if skinny_bf11.ENABLED and skinny_bf11.C32_ENABLED and x_k.shape[0] <= skinny_bf11.C32_MAX_M:
+                _kv_trig = bool(_lin_mod._PDL_QKVR) if (_GLOBAL_DUAL_KV_C28_PDL and x_k.shape[0] <= 64) else False
                 kv_pair = skinny_bf11.bf11_dual_kv(
                     x_k,
                     x_v,
                     w_k,
                     w_v,
                     pdl=False,
-                    trig=False,
+                    trig=_kv_trig,
                 )
         if kv_pair is not None:
             k, v = kv_pair
@@ -523,6 +694,84 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         add_linear_lora(self.qkvr, v, x_v, [5])
         q, r, gate, sinks = projected.split(self.q_side_splits, dim=-1)[:4]
         return q, r, gate, sinks, k, v, k_dyn, v_dyn
+
+    def _is_kv_bf12(self) -> bool:
+        return (
+            self.kv_cache.numel() > 0
+            and self.kv_cache.ndim == 4
+            and int(self.kv_cache.shape[-1]) in (198, 396)
+        )
+
+    def _get_kv_bf12_emerg(self):
+        from .ops import sm12_attn_fused as _sm12_f
+        if self._kv_bf12_emerg is None:
+            self._kv_bf12_emerg = _sm12_f.KvBf12EmergPool(self.kv_cache.device)
+        if self.kv_cache.numel() > 0:
+            _sm12_f.register_kv_bf12_emerg(self.kv_cache, self._kv_bf12_emerg)
+        return self._kv_bf12_emerg
+
+    def _kv_bf12_prologue_and_store(
+        self,
+        q, r_view, k, v, tau, k_dynamic, v_dynamic,
+        positions, conv_md, md, clipped_q, rel_out,
+        *, skip_rel: bool = False, include_rel_t: bool = False,
+    ) -> None:
+        """Run unmodified `attention_prologue` into a compact BF16 staging buffer
+        and encode bit-exact KV-BF12 into `self.kv_cache` via `kv_bf12_store_prefill`."""
+        from .ops import sm12_attn_fused as _sm12_f
+        T = int(md.slot_mapping.shape[0])
+        n_tmp_blks = max(1, (T + 255) // 256)
+        tmp_k = q.new_empty((n_tmp_blks, 256, self.num_kv_heads, self.head_dim))
+        tmp_v = q.new_empty((n_tmp_blks, 256, self.num_kv_heads, self.head_dim))
+        lin_slots = torch.arange(T, device=md.slot_mapping.device, dtype=torch.int64)
+        tmp_slot_mapping = torch.where(md.slot_mapping >= 0, lin_slots, md.slot_mapping)
+        kw = {
+            "clip_threshold": self.qk_clip,
+            "rel_threshold": self.rel_clip,
+            "norm_eps": self.eps,
+            "rel_proj_rev": getattr(self, "rel_proj_rev", None),
+        }
+        if skip_rel:
+            kw["skip_rel"] = True
+        if include_rel_t:
+            kw["rel_proj_t"] = getattr(self, "rel_proj_t", None)
+            kw["is_local"] = self.is_local
+        attention_prologue(
+            q, r_view, k, v,
+            self.q_scale, self.r_scale, tau, self.rel_proj_shifted,
+            self.k_sconv.conv_weight, self.v_sconv.conv_weight,
+            k_dynamic, v_dynamic,
+            self.conv_state.kv_cache, positions,
+            conv_md.block_table, conv_md.seq_idx, conv_md.slot_mapping, conv_md.query_start,
+            tmp_k, tmp_v, tmp_slot_mapping,
+            clipped_q, rel_out, md.query_start_loc, md.seq_lens,
+            **kw,
+        )
+        _discard_dev = None
+        if (
+            self.is_local
+            and T > 256
+            and md.slot_mapping.is_cuda
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _cached_disc = getattr(md, "_kv_bf12_discard_blk_dev_cache", None)
+            if _cached_disc is not None and _cached_disc[0] == T:
+                _discard_dev = _cached_disc[1]
+            else:
+                from . import prefill_sp_rs as _psr
+                _discard_dev = _psr.detect_discard_block_gpu(md.slot_mapping[:T], 256)
+                try:
+                    md._kv_bf12_discard_blk_dev_cache = (T, _discard_dev)
+                except Exception:
+                    pass
+        _sm12_f.kv_bf12_store_prefill(
+            tmp_k.view(-1, self.num_kv_heads, self.head_dim)[:T],
+            tmp_v.view(-1, self.num_kv_heads, self.head_dim)[:T],
+            md.slot_mapping,
+            self.kv_cache,
+            self._get_kv_bf12_emerg(),
+            discard_blk_dev=_discard_dev,
+        )
 
     def _split_kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
         key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
@@ -552,6 +801,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             x_k = x_v = x_q
         assert x_k is not None and x_v is not None
         if self.is_local:
+            self._last_dyn_overlap = False
             q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
             k_dyn = self.k_sconv.dynamic_taps(x_k)
             v_dyn = self.v_sconv.dynamic_taps(x_v)
@@ -612,6 +862,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             )
         clipped_q = q.new_empty(q.shape)
         from .ops import sm12_attn as _sm12_attn
+        if hasattr(l2pf, "join_cross_boundary"):
+            l2pf.join_cross_boundary()
 
         if (
             self.is_local
@@ -625,44 +877,62 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             and self.num_kv_heads == 1
             and getattr(self, "rel_proj_t", None) is not None
             and not torch.cuda.is_current_stream_capturing()
-            and _sm12_attn.get_local_otf_rel_lib() is not None
+            and (
+                _sm12_attn.get_pf_fp8_attn_v6_lib() is not None
+                or _sm12_attn.get_local_otf_rel_lib() is not None
+            )
         ):
             conv_md = conv_metadata(self.conv_state)
             assert conv_md is not None
-            key_cache, value_cache = self._split_kv_cache()
             r_view = r.view(num_tokens, self.num_heads, self.d_rel)
-            attention_prologue(
-                q,
-                r_view,
-                k,
-                v,
-                self.q_scale,
-                self.r_scale,
-                tau,
-                self.rel_proj_shifted,
-                self.k_sconv.conv_weight,
-                self.v_sconv.conv_weight,
-                k_dynamic,
-                v_dynamic,
-                self.conv_state.kv_cache,
-                positions,
-                conv_md.block_table,
-                conv_md.seq_idx,
-                conv_md.slot_mapping,
-                conv_md.query_start,
-                key_cache,
-                value_cache,
-                md.slot_mapping,
-                clipped_q,
-                None,
-                md.query_start_loc,
-                md.seq_lens,
-                clip_threshold=self.qk_clip,
-                rel_threshold=self.rel_clip,
-                norm_eps=self.eps,
-                rel_proj_rev=getattr(self, "rel_proj_rev", None),
-                skip_rel=True,
-            )
+            if self._is_kv_bf12():
+                from .ops import sm12_attn_fused as _sm12_f
+                self._kv_bf12_prologue_and_store(
+                    q, r_view, k, v, tau, k_dynamic, v_dynamic,
+                    positions, conv_md, md, clipped_q, None, skip_rel=True,
+                )
+                key_cache, value_cache, _bt_swa = _sm12_f.kv_bf12_stage_active_blocks(
+                    self.kv_cache, self._get_kv_bf12_emerg(),
+                    md.block_table, md.seq_lens, cu_seqlens_q=md.query_start_loc,
+                    window=self.window_size[0], unpack_k=True, unpack_v=True,
+                    seq_lens_cpu=getattr(md, "seq_lens_cpu", None),
+                    query_lens_cpu=getattr(md, "query_lens_cpu", None),
+                )
+            else:
+                key_cache, value_cache = self._split_kv_cache()
+                _bt_swa = md.block_table
+                attention_prologue(
+                    q,
+                    r_view,
+                    k,
+                    v,
+                    self.q_scale,
+                    self.r_scale,
+                    tau,
+                    self.rel_proj_shifted,
+                    self.k_sconv.conv_weight,
+                    self.v_sconv.conv_weight,
+                    k_dynamic,
+                    v_dynamic,
+                    self.conv_state.kv_cache,
+                    positions,
+                    conv_md.block_table,
+                    conv_md.seq_idx,
+                    conv_md.slot_mapping,
+                    conv_md.query_start,
+                    key_cache,
+                    value_cache,
+                    md.slot_mapping,
+                    clipped_q,
+                    None,
+                    md.query_start_loc,
+                    md.seq_lens,
+                    clip_threshold=self.qk_clip,
+                    rel_threshold=self.rel_clip,
+                    norm_eps=self.eps,
+                    rel_proj_rev=getattr(self, "rel_proj_rev", None),
+                    skip_rel=True,
+                )
             nt = md.num_actual_tokens
             if _sm12_attn.local_swa_otf_rel_prefill(
                 clipped_q[:nt],
@@ -671,7 +941,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 self.rel_proj_t,
                 key_cache,
                 value_cache,
-                md.block_table,
+                _bt_swa,
                 md.seq_lens,
                 md.query_start_loc,
                 gate[:nt],
@@ -690,21 +960,34 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             and md is not None
             and num_decode_tokens == 0
             and decode_splits == 0
-            and num_tokens >= _sm12_attn._PF_GLOBAL_OTF_REL_MIN_T
+            and (
+                num_tokens >= _sm12_attn._PF_GLOBAL_OTF_REL_MIN_T
+                or (
+                    _sm12_attn._PF_GLOBAL_WARM_MIN_QLEN >= 64
+                    and md.max_query_len >= _sm12_attn._PF_GLOBAL_WARM_MIN_QLEN
+                    and (md.max_seq_len - md.max_query_len)
+                    >= max(_sm12_attn._PF_GLOBAL_MIN_PAST, _sm12_attn._PF_GLOBAL_WARM_MIN_PAST)
+                )
+            )
             and _sm12_attn._PF_GLOBAL_OTF_REL
             and self.head_dim == 128
             and self.d_rel == 16
             and self.num_kv_heads == 1
             and getattr(self, "rel_proj_t", None) is not None
             and not torch.cuda.is_current_stream_capturing()
-            and _sm12_attn.get_global_tail_otf_rel_lib() is not None
+            and (
+                _sm12_attn.get_pf_fp8_attn_v6_lib() is not None
+                or _sm12_attn.get_global_tail_otf_rel_lib() is not None
+            )
         ):
-            from .ops import sconv as _sconv_mod
-
             if getattr(_sconv_mod, "_PROLOGUE_PREFILL_OPT", True):
                 conv_md = conv_metadata(self.conv_state)
                 assert conv_md is not None
-                key_cache, value_cache = self._split_kv_cache()
+                _is_bf12_g = self._is_kv_bf12()
+                if _is_bf12_g:
+                    key_cache = value_cache = self.kv_cache
+                else:
+                    key_cache, value_cache = self._split_kv_cache()
                 r_view = r.view(num_tokens, self.num_heads, self.d_rel)
                 if _sm12_attn.can_global_otf_rel_prefill(
                     clipped_q,
@@ -716,39 +999,46 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                     gate,
                     sinks,
                     output,
+                    kv_bf12=_is_bf12_g,
                 ):
-                    attention_prologue(
-                        q,
-                        r_view,
-                        k,
-                        v,
-                        self.q_scale,
-                        self.r_scale,
-                        tau,
-                        self.rel_proj_shifted,
-                        self.k_sconv.conv_weight,
-                        self.v_sconv.conv_weight,
-                        k_dynamic,
-                        v_dynamic,
-                        self.conv_state.kv_cache,
-                        positions,
-                        conv_md.block_table,
-                        conv_md.seq_idx,
-                        conv_md.slot_mapping,
-                        conv_md.query_start,
-                        key_cache,
-                        value_cache,
-                        md.slot_mapping,
-                        clipped_q,
-                        None,
-                        md.query_start_loc,
-                        md.seq_lens,
-                        clip_threshold=self.qk_clip,
-                        rel_threshold=self.rel_clip,
-                        norm_eps=self.eps,
-                        rel_proj_rev=getattr(self, "rel_proj_rev", None),
-                        skip_rel=True,
-                    )
+                    if _is_bf12_g:
+                        self._kv_bf12_prologue_and_store(
+                            q, r_view, k, v, tau, k_dynamic, v_dynamic,
+                            positions, conv_md, md, clipped_q, None, skip_rel=True,
+                        )
+                    else:
+                        attention_prologue(
+                            q,
+                            r_view,
+                            k,
+                            v,
+                            self.q_scale,
+                            self.r_scale,
+                            tau,
+                            self.rel_proj_shifted,
+                            self.k_sconv.conv_weight,
+                            self.v_sconv.conv_weight,
+                            k_dynamic,
+                            v_dynamic,
+                            self.conv_state.kv_cache,
+                            positions,
+                            conv_md.block_table,
+                            conv_md.seq_idx,
+                            conv_md.slot_mapping,
+                            conv_md.query_start,
+                            key_cache,
+                            value_cache,
+                            md.slot_mapping,
+                            clipped_q,
+                            None,
+                            md.query_start_loc,
+                            md.seq_lens,
+                            clip_threshold=self.qk_clip,
+                            rel_threshold=self.rel_clip,
+                            norm_eps=self.eps,
+                            rel_proj_rev=getattr(self, "rel_proj_rev", None),
+                            skip_rel=True,
+                        )
                     nt = md.num_actual_tokens
                     tau_nt = tau[:nt] if tau is not None else None
                     if _sm12_attn.global_otf_rel_prefill(
@@ -770,6 +1060,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                         rel_threshold=self.rel_clip,
                         seq_lens_cpu=md.seq_lens_cpu,
                         query_lens_cpu=md.query_lens_cpu,
+                        kv_bf12_cache=self.kv_cache if _is_bf12_g else None,
+                        kv_bf12_emerg=self._get_kv_bf12_emerg() if _is_bf12_g else None,
                     ):
                         if nt < num_tokens:
                             output[nt:].zero_()
@@ -780,10 +1072,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         #     (strictly decode/verify; never fires on prefill!).
         _active_tree_st = None
         if _TREE_SPEC and num_tokens <= 16:
-            from .ops import tree_spec_runtime as _tsr
+            _tsr = _get_tsr_mod()
             _active_tree_st = _tsr.get_active_tree_state(num_tokens)
         if md is not None and self.head_dim == 128 and self.d_rel == 16 and self.num_kv_heads == 1:
-            from .ops import sconv as _sconv_mod, sm12_attn_fused
+            sm12_attn_fused = _get_sm12_attn_fused()
             _max_q_bkt = bucket_max_seqlen_q(md.max_query_len)
             _g_ratio = self.num_heads // self.num_kv_heads
             _can_tree_fused = (
@@ -793,27 +1085,46 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 and getattr(_active_tree_st, "tree_meta", None) is not None
                 and sm12_attn_fused.has_tree_lib()
             )
+            _max_q_lim = (
+                96
+                if (_SAM_EXT_ATTN_FIX and num_tokens <= 32 and int(md.num_reqs) <= 2 and _max_q_bkt <= 16)
+                else 64
+            )
             _try_fused_c1 = (
                 num_tokens <= 16
                 and sm12_attn_fused.ENABLED
                 and (_active_tree_st is None or _can_tree_fused)
-                and (bool(decode_splits) or (_FUSED_ATTN_SM12_FIX and _max_q_bkt * _g_ratio <= 64))
+                and (bool(decode_splits) or (_FUSED_ATTN_SM12_FIX and _max_q_bkt * _g_ratio <= _max_q_lim))
             )
             _try_fused_c32 = (
                 _active_tree_st is None
                 and 17 <= num_tokens <= sm12_attn_fused.MAX_TOKENS_C32
                 and sm12_attn_fused.ENABLED_C32
                 and decode_splits == 0
-                and _max_q_bkt * _g_ratio <= 64
+                and _max_q_bkt * _g_ratio <= _max_q_lim
             )
             if _try_fused_c1 or _try_fused_c32:
                 if l2pf.WO and num_tokens <= 16:
-                    from .ops import skinny_bf11, skinny_bf12
-                    _wt = skinny_bf11.l2pf_tensor(self.wo_ud.weight) if skinny_bf11.ENABLED else skinny_bf12.l2pf_tensor(self.wo_ud.weight)
+                    skinny_bf11 = _get_skinny_bf11()
+                    _wt = (
+                        skinny_bf11.l2pf_tensor(self.wo_ud.weight)
+                        if skinny_bf11.ENABLED
+                        else _get_skinny_bf12().l2pf_tensor(self.wo_ud.weight)
+                    )
                     l2pf.fork(_wt, kind="attn")
+                elif l2pf.C32 and l2pf.C32_WO and 17 <= num_tokens <= l2pf.C32_MAX_M:
+                    skinny_bf11 = _get_skinny_bf11()
+                    _wt = skinny_bf11.l2pf_tensor(self.wo_ud.weight, num_tokens=num_tokens) if skinny_bf11.ENABLED else self.wo_ud.weight
+                    l2pf.fork(_wt, kind="attn", num_tokens=num_tokens)
                 conv_md = conv_metadata(self.conv_state)
                 assert conv_md is not None
-                key_cache, value_cache = self._split_kv_cache()
+                _is_bf12_d = self._is_kv_bf12()
+                if _is_bf12_d:
+                    key_cache = value_cache = self.kv_cache
+                    _bf12_emerg = self._get_kv_bf12_emerg()
+                else:
+                    key_cache, value_cache = self._split_kv_cache()
+                    _bf12_emerg = None
                 rel_proj_t = getattr(self, "rel_proj_t", None)
                 if rel_proj_t is None and self.rel_extent > 0 and not torch.cuda.is_current_stream_capturing():
                     rel_proj_t = sm12_attn_fused.prepack_rel_proj_t(self.rel_logits_proj)
@@ -839,6 +1150,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                             num_actual_tokens=md.num_actual_tokens,
                             n_live_buf=_sconv_mod._rowar_nlive_buf(num_tokens),
                             q_out_buf=clipped_q,
+                            pdl_prologue=(False if (not self.is_local and getattr(self, "_last_dyn_overlap", False)) else None),
+                            kv_bf12_cache=self.kv_cache if _is_bf12_d else None,
+                            kv_bf12_emerg=_bf12_emerg,
                         ):
                             return
                     elif sm12_attn_fused.fused_target_decode_attn(
@@ -858,7 +1172,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                         num_actual_tokens=md.num_actual_tokens,
                         n_live_buf=_sconv_mod._rowar_nlive_buf(num_tokens),
                         q_out_buf=clipped_q,
+                        pdl_prologue=(False if (not self.is_local and getattr(self, "_last_dyn_overlap", False)) else None),
                         max_seqlen_q=_max_q_bkt,
+                        kv_bf12_cache=self.kv_cache if _is_bf12_d else None,
+                        kv_bf12_emerg=_bf12_emerg,
                     ):
                         return
         # Sheared for tml_fa4 (see attention_prologue); the decode kernels
@@ -885,38 +1202,47 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                     l2pf.fork(_wt, kind="attn")
             conv_md = conv_metadata(self.conv_state)
             assert conv_md is not None
-            key_cache, value_cache = self._split_kv_cache()
-            attention_prologue(
-                q,
-                r.view(num_tokens, self.num_heads, self.d_rel),
-                k,
-                v,
-                self.q_scale,
-                self.r_scale,
-                tau,
-                self.rel_proj_shifted,
-                self.k_sconv.conv_weight,
-                self.v_sconv.conv_weight,
-                k_dynamic,
-                v_dynamic,
-                self.conv_state.kv_cache,
-                positions,
-                conv_md.block_table,
-                conv_md.seq_idx,
-                conv_md.slot_mapping,
-                conv_md.query_start,
-                key_cache,
-                value_cache,
-                md.slot_mapping,
-                clipped_q,
-                rel_logits,
-                md.query_start_loc,
-                md.seq_lens,
-                clip_threshold=self.qk_clip,
-                rel_threshold=self.rel_clip,
-                norm_eps=self.eps,
-                rel_proj_rev=getattr(self, "rel_proj_rev", None),
-            )
+            if self._is_kv_bf12():
+                self._kv_bf12_prologue_and_store(
+                    q, r.view(num_tokens, self.num_heads, self.d_rel), k, v,
+                    tau, k_dynamic, v_dynamic, positions, conv_md, md,
+                    clipped_q, rel_logits, skip_rel=False, include_rel_t=True,
+                )
+            else:
+                key_cache, value_cache = self._split_kv_cache()
+                attention_prologue(
+                    q,
+                    r.view(num_tokens, self.num_heads, self.d_rel),
+                    k,
+                    v,
+                    self.q_scale,
+                    self.r_scale,
+                    tau,
+                    self.rel_proj_shifted,
+                    self.k_sconv.conv_weight,
+                    self.v_sconv.conv_weight,
+                    k_dynamic,
+                    v_dynamic,
+                    self.conv_state.kv_cache,
+                    positions,
+                    conv_md.block_table,
+                    conv_md.seq_idx,
+                    conv_md.slot_mapping,
+                    conv_md.query_start,
+                    key_cache,
+                    value_cache,
+                    md.slot_mapping,
+                    clipped_q,
+                    rel_logits,
+                    md.query_start_loc,
+                    md.seq_lens,
+                    clip_threshold=self.qk_clip,
+                    rel_threshold=self.rel_clip,
+                    norm_eps=self.eps,
+                    rel_proj_rev=getattr(self, "rel_proj_rev", None),
+                    rel_proj_t=getattr(self, "rel_proj_t", None),
+                    is_local=self.is_local,
+                )
         if decode_splits:
             assert md is not None
             self._decode_attention(
@@ -930,6 +1256,67 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 num_decodes,
             )
         if num_decode_tokens < num_tokens:
+            if md is not None and num_decode_tokens == 0:
+                num_splits, use_scheduler = plan_attention(
+                    self.is_local,
+                    md.query_lens_cpu[num_decodes:],
+                    md.seq_lens_cpu[num_decodes:],
+                    self.num_heads,
+                    self.num_kv_heads,
+                )
+                nt_s1 = md.num_actual_tokens - (md.num_decode_tokens if num_decodes else 0)
+                max_q_s1 = bucket_max_seqlen_q(md.max_query_len)
+                if (
+                    not use_scheduler
+                    and nt_s1 > 0
+                    and _sm12_attn.can_fuse_gs_s1(
+                        num_reqs=int(md.seq_lens.shape[0] - num_decodes),
+                        max_seqlen_q=max_q_s1,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim=self.head_dim,
+                        num_splits=num_splits,
+                    )
+                ):
+                    cu_q_s1 = md.query_start_loc[num_decodes:]
+                    if num_decodes:
+                        cu_q_s1 = cu_q_s1 - md.num_decode_tokens
+                    if self._is_kv_bf12():
+                        if torch.cuda.is_current_stream_capturing():
+                            raise RuntimeError(
+                                "KV-BF12 fallback rel_attention_fused_s1 cannot execute during CUDA graph capture"
+                            )
+                        from .ops import sm12_attn_fused as _sm12_f
+                        key_cache, value_cache, _bt_s1 = _sm12_f.kv_bf12_stage_active_blocks(
+                            self.kv_cache, self._get_kv_bf12_emerg(),
+                            md.block_table[num_decodes:], md.seq_lens[num_decodes:],
+                            cu_seqlens_q=cu_q_s1,
+                            window=self.window_size[0] if self.is_local else -1,
+                            unpack_k=True, unpack_v=True,
+                            seq_lens_cpu=(md.seq_lens_cpu[num_decodes:] if getattr(md, "seq_lens_cpu", None) is not None else None),
+                            query_lens_cpu=(md.query_lens_cpu[num_decodes:] if getattr(md, "query_lens_cpu", None) is not None else None),
+                        )
+                    else:
+                        key_cache, value_cache = self._split_kv_cache()
+                        _bt_s1 = md.block_table[num_decodes:]
+                    _sm12_attn.rel_attention_fused_s1(
+                        clipped_q[:nt_s1],
+                        key_cache,
+                        value_cache,
+                        block_table=_bt_s1,
+                        cache_seqlens=md.seq_lens[num_decodes:],
+                        cu_seqlens_q=cu_q_s1,
+                        max_seqlen_q=max_q_s1,
+                        softmax_scale=self.scaling,
+                        window_size=self.window_size,
+                        sheared_bias=rel_logits[: nt_s1 + 128],
+                        gate=gate[:nt_s1],
+                        sinks=sinks[:nt_s1],
+                        y_out=output[:nt_s1],
+                    )
+                    if nt_s1 < num_tokens:
+                        output[nt_s1:].zero_()
+                    return
             out = q.new_empty(
                 (num_tokens - num_decode_tokens, self.num_heads, self.head_dim),
                 dtype=torch.float32,
@@ -1003,12 +1390,32 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         num_splits: int,
         num_reqs: int,
     ) -> None:
-        key_cache, value_cache = self._split_kv_cache()
         mixed = num_reqs < md.seq_lens.shape[0]
         num_tokens = md.num_decode_tokens if mixed else md.num_actual_tokens
         max_query_len = md.max_query_len
         if mixed:
             max_query_len = min(self.max_decode_query_len, num_tokens - num_reqs + 1)
+        if self._is_kv_bf12():
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "KV-BF12 fallback _decode_attention cannot execute during CUDA graph capture; "
+                    "ensure fused_decode_attn_exact_sm121_v10 handles decode bucket"
+                )
+            from .ops import sm12_attn_fused as _sm12_f
+            _sl_cpu_d = getattr(md, "seq_lens_cpu", None)
+            _ql_cpu_d = getattr(md, "query_lens_cpu", None)
+            key_cache, value_cache, _bt_dec = _sm12_f.kv_bf12_stage_active_blocks(
+                self.kv_cache, self._get_kv_bf12_emerg(),
+                md.block_table[:num_reqs], md.seq_lens[:num_reqs],
+                cu_seqlens_q=md.query_start_loc[: num_reqs + 1],
+                window=self.window_size[0] if self.is_local else -1,
+                unpack_k=True, unpack_v=True,
+                seq_lens_cpu=(_sl_cpu_d[:num_reqs] if _sl_cpu_d is not None else None),
+                query_lens_cpu=(_ql_cpu_d[:num_reqs] if _ql_cpu_d is not None else None),
+            )
+        else:
+            key_cache, value_cache = self._split_kv_cache()
+            _bt_dec = md.block_table[:num_reqs]
         rel_decode_attention(
             q,
             key_cache,
@@ -1017,7 +1424,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             gate,
             sinks,
             output,
-            block_table=md.block_table[:num_reqs],
+            block_table=_bt_dec,
             cache_seqlens=md.seq_lens[:num_reqs],
             cu_seqlens_q=md.query_start_loc[: num_reqs + 1],
             max_query_len=max_query_len,
@@ -1044,11 +1451,27 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         cu_seqlens_q = md.query_start_loc[num_decodes:]
         if num_decodes:
             cu_seqlens_q = cu_seqlens_q - num_decode_tokens
-        key_cache, value_cache = self._split_kv_cache()
         from .ops import sm12_attn as _sm12_attn
-
         _sl_cpu = getattr(md, "seq_lens_cpu", None)
         _ql_cpu = getattr(md, "query_lens_cpu", None)
+        if self._is_kv_bf12():
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "KV-BF12 fallback _fa4_attention cannot execute during CUDA graph capture"
+                )
+            from .ops import sm12_attn_fused as _sm12_f
+            key_cache, value_cache, _bt_fa4 = _sm12_f.kv_bf12_stage_active_blocks(
+                self.kv_cache, self._get_kv_bf12_emerg(),
+                md.block_table[num_decodes:], md.seq_lens[num_decodes:],
+                cu_seqlens_q=cu_seqlens_q,
+                window=self.window_size[0] if self.is_local else -1,
+                unpack_k=True, unpack_v=True,
+                seq_lens_cpu=(_sl_cpu[num_decodes:] if _sl_cpu is not None else None),
+                query_lens_cpu=(_ql_cpu[num_decodes:] if _ql_cpu is not None else None),
+            )
+        else:
+            key_cache, value_cache = self._split_kv_cache()
+            _bt_fa4 = md.block_table[num_decodes:]
         _sm12_attn.set_prefill_cpu_lens(
             _sl_cpu[num_decodes:] if _sl_cpu is not None else None,
             _ql_cpu[num_decodes:] if _ql_cpu is not None else None,
@@ -1058,7 +1481,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 q[:nt],
                 key_cache,
                 value_cache,
-                block_table=md.block_table[num_decodes:],
+                block_table=_bt_fa4,
                 cache_seqlens=md.seq_lens[num_decodes:],
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=bucket_max_seqlen_q(md.max_query_len),

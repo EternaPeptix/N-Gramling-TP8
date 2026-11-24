@@ -58,6 +58,378 @@ FUSE_REJECT = os.environ.get("INKLING_SYNC_FREE_FUSE_REJECT", "1").strip().lower
 ZERO_COPY_SLICE = os.environ.get("INKLING_SYNC_FREE_SLICE", "1").strip().lower() not in _OFF
 FP32_FUSE = os.environ.get("INKLING_SYNC_FREE_FP32_FUSE", "0").strip().lower() not in _OFF
 TREE_SPEC = os.environ.get("INKLING_TREE_SPEC", "0").strip().lower() not in _OFF
+# Wave-V7 Native SM121a SyncFree CUDA Stack (STRICT 0-ULP, opt-in default OFF = 0)
+CUDA_V7 = os.environ.get("INKLING_SYNC_FREE_CUDA_V7", "0").strip().lower() not in _OFF
+V7_PDL = os.environ.get("INKLING_SYNC_FREE_V7_PDL", "1").strip().lower() not in _OFF
+V7_LIB_PATH = os.environ.get("INKLING_DSPARK_V7_LIB", "/rdma/libdspark_markov_v7.so")
+_SF_V7_LIB = None
+_SF_V7_TRIED = False
+_SF_V7_QUAL: dict[int, bool] = {}
+_SF_V7_WS: dict[int, dict] = {}
+
+# Wave-V9 Phase-2: 4-slot static output ring buffer (default OFF = 0, 100% 0-ULP invariant).
+# Eliminates 3 per-step torch.empty allocations (sampled, num_sampled, num_rejected) so dtgraph
+# Phase 2B ("td") sees fixed device pointers per slot 0..3 and replays statically with 0 ExecUpdate!
+STATIC_RING = os.environ.get("INKLING_DTGRAPH_STATIC_RING", "0").strip().lower() not in _OFF
+STATIC_RING_SLOTS = 4
+# Wave-V11 opt-in host-overhead micro-trims in sync_free (default OFF = 0, 100% 0-ULP exact!):
+#   - Eliminates 4 per-step Python imports (dtgraph, NO_LOGPROBS, tensor_model_parallel_all_gather, l2pf).
+#   - Caches (slot, num_reqs) static ring slice views + direct last-ring ref (eliminates 3 slice allocs/step).
+#   - Caches static [M, 1] dummy logits placeholder (eliminates 1 CUDA tensor alloc/step).
+#   - Defers Triton _kernels() lookup until Triton fallback + B=1 fast scalar check in step_armed.
+FAST_V11 = os.environ.get("INKLING_SYNC_FREE_FAST_V11", "0").strip().lower() not in _OFF
+_CACHED_DTG_REC_FN = None
+_CACHED_NO_LOGPROBS = None
+_CACHED_TP_AG = None
+_CACHED_L2PF_FORK_CB = None
+_CACHED_L2PF_PROBED = False
+_DUMMY_LOGITS_CACHE: dict[tuple, torch.Tensor] = {}
+_SF_LAST_RING_OBJ = None
+
+
+def _fast_tp_all_gather():
+    global _CACHED_TP_AG
+    fn = _CACHED_TP_AG
+    if fn is None:
+        from vllm.distributed import tensor_model_parallel_all_gather as _tpag
+        _CACHED_TP_AG = _tpag
+        fn = _tpag
+    return fn
+
+
+def _fast_l2pf_fork_cb(tag: str) -> None:
+    global _CACHED_L2PF_FORK_CB, _CACHED_L2PF_PROBED
+    if not _CACHED_L2PF_PROBED:
+        _CACHED_L2PF_PROBED = True
+        try:
+            from . import l2pf as _l2pf_cb
+            _CACHED_L2PF_FORK_CB = getattr(_l2pf_cb, "fork_cross_boundary", None)
+        except Exception:
+            _CACHED_L2PF_FORK_CB = None
+    if _CACHED_L2PF_FORK_CB is not None:
+        _CACHED_L2PF_FORK_CB(tag)
+
+
+def _fast_dummy_logits(m: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    dk = (m, dtype, str(device))
+    dm = _DUMMY_LOGITS_CACHE.get(dk)
+    if dm is None:
+        dm = torch.empty((m, 1), dtype=dtype, device=device)
+        _DUMMY_LOGITS_CACHE[dk] = dm
+    return dm
+
+
+class _StaticOutputRing:
+    """Per-device 4-slot static ring buffer for (sampled, num_sampled, num_rejected) with Event fences."""
+
+    def __init__(self, device: torch.device, max_reqs: int, cols: int):
+        self.device = device
+        self.max_reqs = max(64, int(max_reqs))
+        self.cols = int(cols)
+        self.sampled = [
+            torch.empty((self.max_reqs, self.cols), dtype=torch.int64, device=device)
+            for _ in range(STATIC_RING_SLOTS)
+        ]
+        self.num_sampled = [
+            torch.empty((self.max_reqs,), dtype=torch.int32, device=device)
+            for _ in range(STATIC_RING_SLOTS)
+        ]
+        self.num_rejected = [
+            torch.empty((self.max_reqs,), dtype=torch.int32, device=device)
+            for _ in range(STATIC_RING_SLOTS)
+        ]
+        is_cuda = getattr(device, "type", "") == "cuda"
+        self.events = [torch.cuda.Event() if is_cuda else None for _ in range(STATIC_RING_SLOTS)]
+        self.recorded = [False] * STATIC_RING_SLOTS
+        self.cursor = 0
+        self.acquires = 0
+        self.waits = 0
+        self._slice_cache: dict[tuple[int, int], tuple] = {}
+
+    def acquire(self, num_reqs: int):
+        slot = self.cursor
+        self.cursor = (slot + 1) % STATIC_RING_SLOTS
+        ev = self.events[slot]
+        if self.recorded[slot] and ev is not None:
+            if not ev.query():
+                ev.synchronize()
+                self.waits += 1
+            self.recorded[slot] = False
+        self.acquires += 1
+        if FAST_V11:
+            ck = (slot, num_reqs)
+            res = self._slice_cache.get(ck)
+            if res is None:
+                res = (
+                    slot,
+                    self.sampled[slot][:num_reqs],
+                    self.num_sampled[slot][:num_reqs],
+                    self.num_rejected[slot][:num_reqs],
+                )
+                self._slice_cache[ck] = res
+            return res
+        return (
+            slot,
+            self.sampled[slot][:num_reqs],
+            self.num_sampled[slot][:num_reqs],
+            self.num_rejected[slot][:num_reqs],
+        )
+
+    def fence(self, slot: int, stream=None) -> None:
+        global _CACHED_DTG_REC_FN
+        ev = self.events[slot]
+        if ev is None:
+            return
+        if stream is None:
+            stream = torch.cuda.current_stream(self.device)
+        if FAST_V11:
+            rec_fn = _CACHED_DTG_REC_FN
+            if rec_fn is None:
+                try:
+                    from . import dtgraph as _dtg_m  # noqa: PLC0415
+                    rec_fn = _dtg_m._ORIG.get("Event.record", torch.cuda.Event.record)
+                except Exception:  # noqa: BLE001
+                    rec_fn = torch.cuda.Event.record
+                _CACHED_DTG_REC_FN = rec_fn
+        else:
+            try:
+                from . import dtgraph as _dtg_m  # noqa: PLC0415
+                rec_fn = _dtg_m._ORIG.get("Event.record", torch.cuda.Event.record)
+            except Exception:  # noqa: BLE001
+                rec_fn = torch.cuda.Event.record
+        rec_fn(ev, stream)
+        self.recorded[slot] = True
+
+
+_SF_RINGS: dict[tuple[int, int], _StaticOutputRing] = {}
+_SF_LAST_RING_STATE: tuple[int, int, int, int, int] | None = None  # (dev_idx, slot, p_s, p_ns, p_nr)
+
+
+def _acquire_static_ring_outputs(device: torch.device, num_reqs: int, cols: int):
+    global _SF_LAST_RING_STATE, _SF_LAST_RING_OBJ
+    if not STATIC_RING:
+        _SF_LAST_RING_STATE = None
+        return None
+    is_cuda = getattr(device, "type", "") == "cuda"
+    if is_cuda and torch.cuda.is_current_stream_capturing():
+        _SF_LAST_RING_STATE = None
+        return None
+    d_idx = _sf_dev_idx(device) if is_cuda else -1
+    rkey = (d_idx, int(cols))
+    ring = _SF_RINGS.get(rkey)
+    if ring is None or ring.max_reqs < num_reqs:
+        ring = _StaticOutputRing(device, max(64, int(num_reqs)), int(cols))
+        _SF_RINGS[rkey] = ring
+    slot, s_t, ns_t, nr_t = ring.acquire(int(num_reqs))
+    _SF_LAST_RING_OBJ = (d_idx, ring)
+    _SF_LAST_RING_STATE = (
+        d_idx,
+        slot,
+        int(s_t.data_ptr()),
+        int(ns_t.data_ptr()),
+        int(nr_t.data_ptr()),
+    )
+    return slot, s_t, ns_t, nr_t
+
+
+def clear_static_ring_state() -> None:
+    """Clear active-step static ring pointer state so fallback steps never leak stale pointers."""
+    global _SF_LAST_RING_STATE
+    _SF_LAST_RING_STATE = None
+
+
+def get_static_ring_state() -> tuple[int, int, int, int] | None:
+    """Return (slot, sampled_ptr, num_sampled_ptr, num_rejected_ptr) for the active step, or None."""
+    st = _SF_LAST_RING_STATE
+    if st is None:
+        return None
+    return st[1], st[2], st[3], st[4]
+
+
+def fence_static_ring_slot(device: torch.device, slot: int, cols: int | None = None, stream=None) -> None:
+    """Record completion event on ring slot `slot` strictly after AsyncOutput + Phase-2B td finish."""
+    is_cuda = getattr(device, "type", "") == "cuda"
+    d_idx = _sf_dev_idx(device) if is_cuda else -1
+    if FAST_V11 and cols is None and _SF_LAST_RING_OBJ is not None and _SF_LAST_RING_OBJ[0] == d_idx and len(_SF_RINGS) == 1:
+        _SF_LAST_RING_OBJ[1].fence(int(slot), stream=stream)
+        return
+    if cols is not None:
+        ring = _SF_RINGS.get((d_idx, int(cols)))
+        if ring is not None:
+            ring.fence(int(slot), stream=stream)
+        return
+    for (rd, _rc), ring in _SF_RINGS.items():
+        if rd == d_idx:
+            ring.fence(int(slot), stream=stream)
+
+
+def _sf_dev_idx(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def _get_sf_v7_lib():
+    global _SF_V7_LIB, _SF_V7_TRIED
+    if not _SF_V7_TRIED:
+        _SF_V7_TRIED = True
+        if CUDA_V7 and os.path.isfile(V7_LIB_PATH):
+            try:
+                import ctypes
+                c_vp = ctypes.c_void_p
+                c_i = ctypes.c_int
+                c_i64 = ctypes.c_int64
+                c_u32 = ctypes.c_uint32
+                c_u64 = ctypes.c_uint64
+                c_f = ctypes.c_float
+                lib = ctypes.CDLL(V7_LIB_PATH)
+                sigs = {
+                    "sync_free_local_pairs_v7_fwd": [
+                        c_vp, c_i, c_i64, c_vp, c_vp, c_vp,
+                        c_i, c_i, c_i, c_i, c_i,
+                        c_f, c_f, c_i, c_i, c_i, c_i, c_i, c_u64,
+                    ],
+                    "sync_free_k0_tok_status_v7_fwd": [
+                        c_vp, c_i, c_i, c_i, c_vp, c_i,
+                        c_vp, c_vp, c_vp, c_vp, c_i, c_vp, c_i, c_u64,
+                    ],
+                    "sync_free_fused_reject_v7_fwd": [
+                        c_vp, c_i, c_i, c_i, c_i, c_vp, c_i64,
+                        c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp,
+                        c_u32, c_i, c_u64,
+                    ],
+                    "sync_free_fused_tree_reject_v7_fwd": [
+                        c_vp, c_i, c_i, c_i, c_i, c_i, c_vp, c_i64,
+                        c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp,
+                        c_vp, c_vp, c_vp, c_vp, c_vp, c_u32, c_i, c_u64,
+                    ],
+                }
+                for sym, argtypes in sigs.items():
+                    fn = getattr(lib, sym)
+                    fn.argtypes = argtypes
+                    fn.restype = c_i
+                _SF_V7_LIB = lib
+                logger.info("INKLING_SYNC_FREE_CUDA_V7=1: loaded %s (16 B/row SPLIT=1 AG + direct reject/K0)", V7_LIB_PATH)
+            except (OSError, AttributeError):
+                _SF_V7_LIB = None
+    return _SF_V7_LIB
+
+
+def _prealloc_sf_v7_ws(device: torch.device, max_m: int = MAX_M) -> dict | None:
+    if not CUDA_V7 or device.type != "cuda" or _capturing():
+        return None
+    d = _sf_dev_idx(device)
+    mm = max(256, int(max_m))
+    ws = _SF_V7_WS.get(d)
+    if ws is not None and ws["max_m"] >= mm:
+        return ws
+    ws = {
+        "max_m": mm,
+        "rec_split": torch.empty((mm, 16, 4), dtype=torch.float32, device=device),
+        "pair_out": [
+            torch.empty((mm, 4), dtype=torch.float32, device=device),
+            torch.empty((mm, 4), dtype=torch.float32, device=device),
+        ],
+        "sem": [
+            torch.zeros((mm,), dtype=torch.int32, device=device),
+            torch.zeros((mm,), dtype=torch.int32, device=device),
+        ],
+        "idx": 0,
+    }
+    _SF_V7_WS[d] = ws
+    return ws
+
+
+def _sf_v7_ok(device: torch.device) -> bool:
+    if not CUDA_V7 or device.type != "cuda":
+        return False
+    d = _sf_dev_idx(device)
+    return bool(_SF_V7_QUAL.get(d, False) and d in _SF_V7_WS and _get_sf_v7_lib() is not None)
+
+
+@torch.no_grad()
+def qualify_sf_v7(device: torch.device, cap: float | None, dt: torch.dtype, fp32_divmode: int) -> bool:
+    """Fail-closed 0-ULP startup qualification for SyncFree CUDA v7 (local_pairs SPLIT=1, k0, fused_reject)."""
+    d = _sf_dev_idx(device)
+    if d in _SF_V7_QUAL:
+        return _SF_V7_QUAL[d]
+    lib = _get_sf_v7_lib()
+    ws = _prealloc_sf_v7_ws(device, MAX_M) if lib is not None else None
+    if lib is None or ws is None or _capturing():
+        _SF_V7_QUAL[d] = False
+        return False
+    ok = False
+    try:
+        stream = int(torch.cuda.current_stream(device).cuda_stream)
+        k = _kernels()
+        gen = torch.Generator(device=device)
+        gen.manual_seed(7091)
+        M_q, V_q = 4, 4096
+        lg = (torch.randn((M_q, V_q), device=device, generator=gen) * 6.0).to(dt)
+        fp32_ch = bool(dt == torch.float32 and FP32_FUSE and cap is not None and fp32_divmode in (0, 1))
+        has_cap = cap is not None and (dt == torch.bfloat16 or fp32_ch)
+        inv_c = inv_cap_of(cap) if has_cap else 1.0
+        cap_f = _f32(cap) if has_cap else 1.0
+        # Reference Triton SPLIT=4 -> global winner across single rank
+        seg_ref = SF_BLOCK * k["triton"].cdiv(k["triton"].cdiv(V_q, SF_BLOCK), 4)
+        p_ref = torch.empty((M_q * 4, 4), dtype=torch.float32, device=device)
+        k["local"][(M_q, 4)](
+            lg, lg.stride(0), p_ref, V_q, 128, seg_ref, inv_c, cap_f,
+            CAP=has_cap, SPLIT=4, BLOCK=SF_BLOCK,
+            FP32_CHAIN=fp32_ch, DIVMODE=fp32_divmode if fp32_ch else 0, num_warps=8,
+        )
+        t_ref = torch.empty((M_q,), dtype=torch.int64, device=device)
+        k["tok_only"][(M_q,)](p_ref, M_q, t_ref, TP=1, SPLIT=4, NP=4, PDL=False, num_warps=1)
+        # V7 CUDA SPLIT=16 coherent collapse -> (M_q, 4)
+        seg_v7 = ((V_q + 15) // 16 + 7) & ~7
+        p_v7 = torch.empty((M_q, 4), dtype=torch.float32, device=device)
+        sem_v7 = torch.zeros((M_q,), dtype=torch.int32, device=device)
+        rc1 = lib.sync_free_local_pairs_v7_fwd(
+            lg.data_ptr(), 1 if dt == torch.float32 else 0, int(lg.stride(0)),
+            ws["rec_split"].data_ptr(), p_v7.data_ptr(), sem_v7.data_ptr(),
+            M_q, 16, V_q, 128, seg_v7, inv_c, cap_f,
+            1 if has_cap else 0, 1 if fp32_ch else 0,
+            fp32_divmode if fp32_ch else 0, 1, 0, stream,
+        )
+        t_v7 = torch.empty((M_q,), dtype=torch.int64, device=device)
+        rc2 = lib.sync_free_k0_tok_status_v7_fwd(
+            p_v7.data_ptr(), M_q, 1, 1, t_v7.data_ptr(), 0,
+            0, 0, 0, 0, 0, 0, 0, stream,
+        )
+        # Also verify exact tie-break + rejection kernel parity on dummy 1-req batch
+        g_r = p_v7.repeat(2, 1).contiguous()
+        s_ref = torch.full((1, 4), -9, dtype=torch.int64, device=device)
+        s_v7 = s_ref.clone()
+        ns_r, nr_r = torch.empty((1,), dtype=torch.int32, device=device), torch.empty((1,), dtype=torch.int32, device=device)
+        ns_c, nr_c = torch.empty_like(ns_r), torch.empty_like(nr_r)
+        sl_q = torch.tensor([10], dtype=torch.int32, device=device)
+        ids_q = torch.tensor([0, int(t_v7[0].item()), int(t_v7[1].item()) + 1, 0], dtype=torch.int32, device=device)
+        pos_q = torch.tensor([5, 6, 7, 8], dtype=torch.int64, device=device)
+        lidx_q = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+        imap_q = torch.tensor([0], dtype=torch.int32, device=device)
+        pfl_q = torch.tensor([4], dtype=torch.int32, device=device)
+        cu_q = torch.tensor([0, 4], dtype=torch.int32, device=device)
+        k["fused_reject"][(1,)](
+            g_r, M_q, s_ref, 4, ns_r, nr_r, sl_q, ids_q, pos_q, lidx_q, imap_q, pfl_q, cu_q,
+            TP=2, SPLIT=1, NP=2, PDL=False, num_warps=1,
+        )
+        rc3 = lib.sync_free_fused_reject_v7_fwd(
+            g_r.data_ptr(), M_q, 1, 2, 1, s_v7.data_ptr(), 4, ns_c.data_ptr(), nr_c.data_ptr(),
+            sl_q.data_ptr(), ids_q.data_ptr(), pos_q.data_ptr(), lidx_q.data_ptr(),
+            imap_q.data_ptr(), pfl_q.data_ptr(), cu_q.data_ptr(),
+            2, 0, stream,  # bit1: pos_i64
+        )
+        torch.cuda.synchronize(device)
+        ok = (
+            rc1 == 0 and rc2 == 0 and rc3 == 0
+            and bool(torch.equal(t_v7, t_ref))
+            and bool(torch.equal(ns_c, ns_r))
+            and bool(torch.equal(nr_c, nr_r))
+            and bool(torch.equal(s_v7[0, : int(ns_r[0].item())], s_ref[0, : int(ns_r[0].item())]))
+        )
+    except Exception:
+        ok = False
+    _SF_V7_QUAL[d] = ok
+    logger.info("INKLING_SYNC_FREE_CUDA_V7 qualify dev=%d: ok=%d (SPLIT=1 16B/row AG)", d, int(ok))
+    return ok
 
 _S: dict = {
     "armed": False,
@@ -443,6 +815,39 @@ def sf_local_pairs(local: torch.Tensor, valid: int, vstart: int, cap: float | No
     if cap is not None and not fuse:
         local = torch_chain(local, cap).contiguous()
         cap = None
+    if _sf_v7_ok(local.device):
+        ws = _SF_V7_WS[_sf_dev_idx(local.device)]
+        if M <= ws["max_m"]:
+            lib = _get_sf_v7_lib()
+            v7_splits = 16 if M <= 6 else (8 if M <= 127 else 4)
+            seg_v7 = ((valid + v7_splits - 1) // v7_splits + 7) & ~7
+            idx = ws["idx"]
+            ws["idx"] = idx ^ 1
+            pair_v7 = ws["pair_out"][idx][:M]
+            sem_v7 = ws["sem"][idx]
+            rc = lib.sync_free_local_pairs_v7_fwd(
+                local.data_ptr(),
+                1 if local.dtype == torch.float32 else 0,
+                int(local.stride(0)),
+                ws["rec_split"].data_ptr(),
+                pair_v7.data_ptr(),
+                sem_v7.data_ptr(),
+                int(M),
+                int(v7_splits),
+                int(valid),
+                int(vstart),
+                int(seg_v7),
+                inv_cap_of(cap) if cap is not None else 1.0,
+                _f32(cap) if cap is not None else 1.0,
+                1 if cap is not None else 0,
+                1 if fp32_chain else 0,
+                int(fp32_divmode if fp32_chain else 0),
+                1,
+                0,
+                int(torch.cuda.current_stream(local.device).cuda_stream),
+            )
+            if rc == 0:
+                return pair_v7
     seg = SF_BLOCK * k["triton"].cdiv(k["triton"].cdiv(valid, SF_BLOCK), split)
     pair = torch.empty((M * split, 4), dtype=torch.float32, device=local.device)
     k["local"][(M, split)](local, local.stride(0), pair, valid, vstart, seg,
@@ -463,6 +868,16 @@ def sf_tok_only(
     k = _kernels()
     assert gathered.shape == (tp * M * split, 4) and gathered.is_contiguous() and gathered.dtype == torch.float32
     tok = torch.empty((M,), dtype=torch.int64, device=gathered.device)
+    if _sf_v7_ok(gathered.device):
+        lib = _get_sf_v7_lib()
+        rc = lib.sync_free_k0_tok_status_v7_fwd(
+            gathered.data_ptr(), int(M), int(tp), int(split),
+            tok.data_ptr(), 0, 0, 0, 0, 0, 0, 0,
+            1 if pdl else 0,
+            int(torch.cuda.current_stream(gathered.device).cuda_stream),
+        )
+        if rc == 0:
+            return tok
     k["tok_only"][(M,)](
         gathered, M, tok, TP=tp, SPLIT=split, NP=triton_np2(tp * split),
         PDL=pdl, num_warps=1, launch_pdl=pdl,
@@ -539,13 +954,28 @@ def step_armed(runner, input_batch, grammar_output) -> tuple[bool, bool]:
         if idx is None or len(idx) == 0:
             return False, False
         ss = sp.sampling_states
-        if not bool(np.all(ss.temperature.np[idx] == 0.0)):
-            return False, False
-        if bool(np.any(sp.needs_logits_processing[idx])):
-            return False, False
-        from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+        if FAST_V11 and len(idx) == 1:
+            i0 = int(idx[0])
+            if ss.temperature.np[i0] != 0.0:
+                return False, False
+            if sp.needs_logits_processing[i0]:
+                return False, False
+        else:
+            if not bool(np.all(ss.temperature.np[idx] == 0.0)):
+                return False, False
+            if bool(np.any(sp.needs_logits_processing[idx])):
+                return False, False
+        if FAST_V11:
+            global _CACHED_NO_LOGPROBS
+            no_lp = _CACHED_NO_LOGPROBS
+            if no_lp is None:
+                from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS as _nlp
+                _CACHED_NO_LOGPROBS = _nlp
+                no_lp = _nlp
+        else:
+            from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS as no_lp
 
-        if ss.max_num_logprobs(idx) != NO_LOGPROBS:
+        if ss.max_num_logprobs(idx) != no_lp:
             return False, False
         lts = getattr(sp, "logprob_token_ids_state", None)
         if lts is not None and lts.max_num_token_ids(idx) != 0:
@@ -682,6 +1112,38 @@ def _install_sampler_hook() -> None:
                 _S["gathered"] = None
                 gathered, M_g, tp_g, split_g = g_info
                 if M_g == logits.shape[0]:
+                    # Wave-V7 3->1 K=0 fusion: argmax + num_sampled + num_rejected in 1 native 1-warp launch!
+                    if (
+                        M_g == input_batch.num_reqs
+                        and input_batch.num_reqs > 0
+                        and _sf_v7_ok(gathered.device)
+                        and input_batch.seq_lens.dtype == torch.int32
+                        and self.req_states.prefill_len.gpu.dtype == torch.int32
+                        and input_batch.idx_mapping.dtype in (torch.int32, torch.int64)
+                    ):
+                        lib = _get_sf_v7_lib()
+                        tok_v7 = torch.empty((M_g,), dtype=torch.int64, device=gathered.device)
+                        ns_v7 = torch.empty((M_g,), dtype=torch.int32, device=gathered.device)
+                        nr_v7 = torch.empty((M_g,), dtype=torch.int32, device=gathered.device)
+                        rc_k0 = lib.sync_free_k0_tok_status_v7_fwd(
+                            gathered.data_ptr(), int(M_g), int(tp_g), int(split_g),
+                            tok_v7.data_ptr(), 1, ns_v7.data_ptr(), nr_v7.data_ptr(),
+                            input_batch.seq_lens.data_ptr(),
+                            input_batch.idx_mapping.data_ptr(),
+                            1 if input_batch.idx_mapping.dtype == torch.int64 else 0,
+                            self.req_states.prefill_len.gpu.data_ptr(),
+                            1 if V7_PDL else 0,
+                            int(torch.cuda.current_stream(gathered.device).cuda_stream),
+                        )
+                        if rc_k0 == 0:
+                            return SamplerOutput(
+                                sampled_token_ids=tok_v7.view(-1, 1),
+                                logprobs_tensors=None,
+                                num_nans=None,
+                                num_sampled=ns_v7,
+                                num_rejected=nr_v7,
+                                sampling_mask_tensors=None,
+                            )
                     tok = sf_tok_only(gathered, M_g, tp_g, split_g, pdl=True)
             if tok is not None and _S.get("armed_k0", False):
                 _S["tok"] = None
@@ -733,6 +1195,7 @@ def _install_rejection_hook() -> None:
         orig_call = cls.__call__
 
         def _direct_call(self, logits, input_batch, draft_logits=None):
+            clear_static_ring_state()
             g_info = _S.get("gathered")
             tok = _S.get("tok")
             if g_info is not None:
@@ -750,18 +1213,24 @@ def _install_rejection_hook() -> None:
                         and input_batch.positions.stride(0) == 1
                         and input_batch.logits_indices.stride(0) == 1
                     ):
-                        sampled = torch.empty(
-                            (num_reqs, self.num_speculative_steps + 1),
-                            dtype=torch.int64,
-                            device=gathered.device,
+                        _ring_out = _acquire_static_ring_outputs(
+                            gathered.device, num_reqs, self.num_speculative_steps + 1
                         )
-                        num_sampled = torch.empty(
-                            (num_reqs,), dtype=torch.int32, device=gathered.device
-                        )
-                        num_rejected = torch.empty(
-                            (num_reqs,), dtype=torch.int32, device=gathered.device
-                        )
-                        k = _kernels()
+                        if _ring_out is not None:
+                            _, sampled, num_sampled, num_rejected = _ring_out
+                        else:
+                            sampled = torch.empty(
+                                (num_reqs, self.num_speculative_steps + 1),
+                                dtype=torch.int64,
+                                device=gathered.device,
+                            )
+                            num_sampled = torch.empty(
+                                (num_reqs,), dtype=torch.int32, device=gathered.device
+                            )
+                            num_rejected = torch.empty(
+                                (num_reqs,), dtype=torch.int32, device=gathered.device
+                            )
+                        k = None if FAST_V11 else _kernels()
                         tree_st = None
                         tsr_mod = None
                         if TREE_SPEC and num_reqs == 1:
@@ -771,60 +1240,128 @@ def _install_rejection_hook() -> None:
                                 import tree_spec_runtime as tsr_mod  # type: ignore[no-redef]
                             tree_st = tsr_mod.get_active_tree_state(M_g)
                         if tree_st is not None and tsr_mod is not None:
-                            k["fused_tree_reject"][(1,)](
-                                gathered,
-                                M_g,
-                                sampled,
-                                sampled.stride(0),
-                                num_sampled,
-                                num_rejected,
-                                input_batch.seq_lens,
-                                input_batch.input_ids,
-                                input_batch.positions,
-                                input_batch.logits_indices,
-                                input_batch.idx_mapping,
-                                self.sampler.req_states.prefill_len.gpu,
-                                input_batch.cu_num_logits,
-                                tree_st.tree_parent,
-                                tree_st.n_live,
-                                tree_st.accepted_path,
-                                tree_st.accepted_len,
-                                tree_st.needs_compact,
-                                TP=tp_g,
-                                SPLIT=split_g,
-                                NP=triton_np2(tp_g * split_g),
-                                MAX_M=tree_st.max_m,
-                                PDL=True,
-                                num_warps=1,
-                                launch_pdl=True,
-                            )
+                            ran_v7_tr = False
+                            if (
+                                _sf_v7_ok(gathered.device)
+                                and input_batch.seq_lens.dtype == torch.int32
+                                and self.sampler.req_states.prefill_len.gpu.dtype == torch.int32
+                                and input_batch.cu_num_logits.dtype == torch.int32
+                                and input_batch.input_ids.dtype in (torch.int32, torch.int64)
+                                and input_batch.positions.dtype in (torch.int32, torch.int64)
+                                and input_batch.logits_indices.dtype in (torch.int32, torch.int64)
+                                and input_batch.idx_mapping.dtype in (torch.int32, torch.int64)
+                            ):
+                                lib_r = _get_sf_v7_lib()
+                                dflags = (
+                                    (1 if input_batch.input_ids.dtype == torch.int64 else 0)
+                                    | (2 if input_batch.positions.dtype == torch.int64 else 0)
+                                    | (4 if input_batch.logits_indices.dtype == torch.int64 else 0)
+                                    | (8 if input_batch.idx_mapping.dtype == torch.int64 else 0)
+                                )
+                                rc_tr = lib_r.sync_free_fused_tree_reject_v7_fwd(
+                                    gathered.data_ptr(), int(M_g), int(num_reqs), int(tp_g), int(split_g),
+                                    int(tree_st.max_m), sampled.data_ptr(), int(sampled.stride(0)),
+                                    num_sampled.data_ptr(), num_rejected.data_ptr(),
+                                    input_batch.seq_lens.data_ptr(), input_batch.input_ids.data_ptr(),
+                                    input_batch.positions.data_ptr(), input_batch.logits_indices.data_ptr(),
+                                    input_batch.idx_mapping.data_ptr(), self.sampler.req_states.prefill_len.gpu.data_ptr(),
+                                    input_batch.cu_num_logits.data_ptr(), tree_st.tree_parent.data_ptr(),
+                                    tree_st.n_live.data_ptr(), tree_st.accepted_path.data_ptr(),
+                                    tree_st.accepted_len.data_ptr(), tree_st.needs_compact.data_ptr(),
+                                    int(dflags), 1 if V7_PDL else 0,
+                                    int(torch.cuda.current_stream(gathered.device).cuda_stream),
+                                )
+                                ran_v7_tr = (rc_tr == 0)
+                            if not ran_v7_tr:
+                                if k is None:
+                                    k = _kernels()
+                                k["fused_tree_reject"][(1,)](
+                                    gathered,
+                                    M_g,
+                                    sampled,
+                                    sampled.stride(0),
+                                    num_sampled,
+                                    num_rejected,
+                                    input_batch.seq_lens,
+                                    input_batch.input_ids,
+                                    input_batch.positions,
+                                    input_batch.logits_indices,
+                                    input_batch.idx_mapping,
+                                    self.sampler.req_states.prefill_len.gpu,
+                                    input_batch.cu_num_logits,
+                                    tree_st.tree_parent,
+                                    tree_st.n_live,
+                                    tree_st.accepted_path,
+                                    tree_st.accepted_len,
+                                    tree_st.needs_compact,
+                                    TP=tp_g,
+                                    SPLIT=split_g,
+                                    NP=triton_np2(tp_g * split_g),
+                                    MAX_M=tree_st.max_m,
+                                    PDL=True,
+                                    num_warps=1,
+                                    launch_pdl=True,
+                                )
                             tsr_mod.compact_tree_kv_conv(
                                 tree_st,
                                 input_batch.positions,
                                 use_pdl=True,
                             )
                         else:
-                            k["fused_reject"][(num_reqs,)](
-                                gathered,
-                                M_g,
-                                sampled,
-                                sampled.stride(0),
-                                num_sampled,
-                                num_rejected,
-                                input_batch.seq_lens,
-                                input_batch.input_ids,
-                                input_batch.positions,
-                                input_batch.logits_indices,
-                                input_batch.idx_mapping,
-                                self.sampler.req_states.prefill_len.gpu,
-                                input_batch.cu_num_logits,
-                                TP=tp_g,
-                                SPLIT=split_g,
-                                NP=triton_np2(tp_g * split_g),
-                                PDL=True,
-                                num_warps=1,
-                                launch_pdl=True,
-                            )
+                            ran_v7_fr = False
+                            if (
+                                _sf_v7_ok(gathered.device)
+                                and input_batch.seq_lens.dtype == torch.int32
+                                and self.sampler.req_states.prefill_len.gpu.dtype == torch.int32
+                                and input_batch.cu_num_logits.dtype == torch.int32
+                                and input_batch.input_ids.dtype in (torch.int32, torch.int64)
+                                and input_batch.positions.dtype in (torch.int32, torch.int64)
+                                and input_batch.logits_indices.dtype in (torch.int32, torch.int64)
+                                and input_batch.idx_mapping.dtype in (torch.int32, torch.int64)
+                            ):
+                                lib_r = _get_sf_v7_lib()
+                                dflags = (
+                                    (1 if input_batch.input_ids.dtype == torch.int64 else 0)
+                                    | (2 if input_batch.positions.dtype == torch.int64 else 0)
+                                    | (4 if input_batch.logits_indices.dtype == torch.int64 else 0)
+                                    | (8 if input_batch.idx_mapping.dtype == torch.int64 else 0)
+                                )
+                                rc_fr = lib_r.sync_free_fused_reject_v7_fwd(
+                                    gathered.data_ptr(), int(M_g), int(num_reqs), int(tp_g), int(split_g),
+                                    sampled.data_ptr(), int(sampled.stride(0)),
+                                    num_sampled.data_ptr(), num_rejected.data_ptr(),
+                                    input_batch.seq_lens.data_ptr(), input_batch.input_ids.data_ptr(),
+                                    input_batch.positions.data_ptr(), input_batch.logits_indices.data_ptr(),
+                                    input_batch.idx_mapping.data_ptr(), self.sampler.req_states.prefill_len.gpu.data_ptr(),
+                                    input_batch.cu_num_logits.data_ptr(),
+                                    int(dflags), 1 if V7_PDL else 0,
+                                    int(torch.cuda.current_stream(gathered.device).cuda_stream),
+                                )
+                                ran_v7_fr = (rc_fr == 0)
+                            if not ran_v7_fr:
+                                if k is None:
+                                    k = _kernels()
+                                k["fused_reject"][(num_reqs,)](
+                                    gathered,
+                                    M_g,
+                                    sampled,
+                                    sampled.stride(0),
+                                    num_sampled,
+                                    num_rejected,
+                                    input_batch.seq_lens,
+                                    input_batch.input_ids,
+                                    input_batch.positions,
+                                    input_batch.logits_indices,
+                                    input_batch.idx_mapping,
+                                    self.sampler.req_states.prefill_len.gpu,
+                                    input_batch.cu_num_logits,
+                                    TP=tp_g,
+                                    SPLIT=split_g,
+                                    NP=triton_np2(tp_g * split_g),
+                                    PDL=True,
+                                    num_warps=1,
+                                    launch_pdl=True,
+                                )
                         return SamplerOutput(
                             sampled_token_ids=sampled,
                             logprobs_tensors=None,
@@ -846,6 +1383,8 @@ def _install_rejection_hook() -> None:
                         self.sampler.req_states.prefill_len.gpu,
                     )
                     num_reqs = input_batch.num_reqs
+                    # Do NOT acquire static ring outputs on this fallback path: get_num_sampled_and_rejected()
+                    # below replaces num_sampled & num_rejected with freshly allocated tensors.
                     sampled = draft_sampled.new_empty(
                         (num_reqs, self.num_speculative_steps + 1), dtype=torch.int64
                     )
@@ -957,12 +1496,15 @@ def _state(model, hidden_states: torch.Tensor):
                 st["fp32_divmode"] = -1
         else:
             st["fp32_divmode"] = -1
+        if CUDA_V7:
+            qualify_sf_v7(hidden_states.device, cap, dt, st["fp32_divmode"])
         dummy = torch.zeros((2, V), dtype=dt, device=hidden_states.device)
         p = sf_local_pairs(dummy, valid, rank * V, cap, split, st["fuse"], fp32_divmode=st["fp32_divmode"])
+        eff_sp_dum = max(1, int(p.shape[0]) // 2)
         g_dum = p.repeat(tp, 1).contiguous()
-        sf_onehot(g_dum, 2, tp, org, split, dt)
-        sf_tok_only(g_dum, 2, tp, split)
-        sf_tok_only(g_dum, 2, tp, split, pdl=True)
+        sf_onehot(g_dum, 2, tp, org, eff_sp_dum, dt)
+        sf_tok_only(g_dum, 2, tp, eff_sp_dum)
+        sf_tok_only(g_dum, 2, tp, eff_sp_dum, pdl=True)
         if DIRECT and MODE == "argmax":
             k = _kernels()
             s_dum = torch.empty((1, 8), dtype=torch.int64, device=hidden_states.device)
@@ -1101,8 +1643,34 @@ def _cert_state(lp, head, W: torch.Tensor, valid: int, cap, dt, device):
             cs.ch = ch
             cs.cuda_state = cs_cu
             torch.cuda.empty_cache()
-            logger.info("INKLING_CERT_HEAD_CUDA_ONLY=1: skipped 117.4 MiB Triton MXINT8 table; "
-                        "CUDA int7_g32 serves M=2..16, stock fp32 head serves M=1 & M>16")
+            _v7_sum = None
+            try:
+                from . import cert_head_cuda_v7 as _ch7_log
+                if hasattr(_ch7_log, "active_summary_global") and isinstance(cs_cu, _ch7_log.CudaCertStateV7Adapter):
+                    _v7_sum = _ch7_log.active_summary_global()
+            except Exception:
+                _v7_sum = None
+            if _v7_sum is not None:
+                _ok_tot = _v7_sum["ok_le16"] + _v7_sum["ok_gt16"]
+                _max_m_s = _v7_sum["max_m"]
+                _bad_gt16 = _v7_sum["bad_gt16"]
+                _served_hi = _max_m_s if (_v7_sum["ok_gt16"] > 0 and not _bad_gt16) else 16
+                logger.info(
+                    "INKLING_CERT_HEAD_CUDA_ONLY=1: skipped 117.4 MiB Triton MXINT8 table; "
+                    "CUDA V%d INT6_g512_ms8 (S1=%.1f MB, ref=%s) serves M=2..%d (%d/%d ok; bad_gt16=%s), "
+                    "stock fp32 head serves M=1 & disqualified/M>%d",
+                    _v7_sum["lib_ver"], _v7_sum["s1_mb"], _v7_sum["qualify_ref"],
+                    _served_hi, _ok_tot, max(0, _max_m_s - 1),
+                    _bad_gt16 if len(_bad_gt16) <= 8 else f"{len(_bad_gt16)} rows ({_bad_gt16[0]}..{_bad_gt16[-1]})",
+                    _served_hi,
+                )
+            else:
+                _cu_max_m = cs_cu.active_max_m() if hasattr(cs_cu, "active_max_m") else 16
+                logger.info(
+                    "INKLING_CERT_HEAD_CUDA_ONLY=1: skipped 117.4 MiB Triton MXINT8 table; "
+                    "CUDA cert_head serves M=2..%d, stock fp32 head serves M=1 & M>%d",
+                    _cu_max_m, _cu_max_m,
+                )
             return cs
 
         t = ch.get_table(W, valid)
@@ -1211,13 +1779,14 @@ def compact_logits(lp, head, st, local: torch.Tensor):
         local, st["valid"], st["vstart"], st["cap"], st["split"], st["fuse"],
         fp32_divmode=st.get("fp32_divmode", -1),
     )
+    eff_split = max(1, int(pair.shape[0]) // M)
     gathered = tensor_model_parallel_all_gather(pair, dim=0)
     if not _S.get("logged"):
         _S["logged"] = True
         logger.info("INKLING_SYNC_FREE: first armed step (M=%d): %d B/row all-gather replaces the "
                     "%d x %d bf16 logits all-gather + 4 full-vocab elementwise kernels",
-                    M, 16 * st["split"], M, local.shape[1])
-    return sf_onehot(gathered.contiguous(), M, st["tp"], st["org"], st["split"], st.get("dt", torch.bfloat16))
+                    M, 16 * eff_split, M, local.shape[1])
+    return sf_onehot(gathered.contiguous(), M, st["tp"], st["org"], eff_split, st.get("dt", torch.bfloat16))
 
 
 def _audit(model, st, local: torch.Tensor, hidden_states: torch.Tensor):
@@ -1289,7 +1858,7 @@ def target_logits(model, hidden_states: torch.Tensor):
         and 2 <= M <= _cu_max_m
     ):
         nlive = None
-        if M <= 16:
+        if M <= _cu_max_m:
             try:
                 nlive = cs.ch._nlive_for(M, hidden_states.device, num_tokens=_S.get("num_tokens", 0))
             except TypeError:
@@ -1300,10 +1869,23 @@ def target_logits(model, hidden_states: torch.Tensor):
             from . import cert_head_cuda as chc
             pair = chc.certified_local_pairs(cs_cu, hidden_states, nlive=nlive)
         if pair is not None:
-            from vllm.distributed import tensor_model_parallel_all_gather
+            if FAST_V11:
+                tp_ag = _fast_tp_all_gather()
+            else:
+                from vllm.distributed import tensor_model_parallel_all_gather as tp_ag
             _stats_tick(True)
-            gathered = tensor_model_parallel_all_gather(pair, dim=0)
-            if FUSE_REJECT and not is_k0:
+            if not is_k0 and M <= 16:
+                if FAST_V11:
+                    _fast_l2pf_fork_cb("draft_l0")
+                else:
+                    try:
+                        from . import l2pf as _l2pf_cb
+                        if hasattr(_l2pf_cb, "fork_cross_boundary"):
+                            _l2pf_cb.fork_cross_boundary("draft_l0")
+                    except Exception:
+                        pass
+            gathered = tp_ag(pair, dim=0)
+            if (FUSE_REJECT and not is_k0) or (is_k0 and _sf_v7_ok(hidden_states.device)):
                 _S["gathered"] = (gathered.contiguous(), M, st["tp"], 1)
                 _S["tok"] = None
             else:
@@ -1314,7 +1896,10 @@ def target_logits(model, hidden_states: torch.Tensor):
                 _S["logged"] = True
                 logger.info("INKLING_SYNC_FREE: first armed CUDA cert_head step (M=%d, k0=%d, fuse_reject=%d): 16 B/row (SPLIT=1) AG + direct greedy",
                             M, int(is_k0), int(FUSE_REJECT and not is_k0))
-            return torch.empty((M, 1), dtype=st.get("dt", torch.bfloat16), device=hidden_states.device)
+            dt_out = st.get("dt", torch.bfloat16)
+            if FAST_V11:
+                return _fast_dummy_logits(M, dt_out, hidden_states.device)
+            return torch.empty((M, 1), dtype=dt_out, device=hidden_states.device)
     local = _head_local(model, st, lp, head, hidden_states)
     if local.dtype != st.get("dt", torch.bfloat16) or local.stride(1) != 1 or local.shape[1] != st["V"]:
         return None
@@ -1323,24 +1908,41 @@ def target_logits(model, hidden_states: torch.Tensor):
         return _audit(model, st, local, hidden_states)
     direct_ok = _S.get("sp_hooked") if is_k0 else _S.get("rs_hooked")
     if DIRECT and direct_ok and armed and not _S.get("force"):
-        from vllm.distributed import tensor_model_parallel_all_gather
+        if FAST_V11:
+            tp_ag = _fast_tp_all_gather()
+        else:
+            from vllm.distributed import tensor_model_parallel_all_gather as tp_ag
         M_l = int(local.shape[0])
         pair = sf_local_pairs(
             local, st["valid"], st["vstart"], st["cap"], st["split"], st["fuse"],
             fp32_divmode=st.get("fp32_divmode", -1),
         )
-        gathered = tensor_model_parallel_all_gather(pair, dim=0)
-        if FUSE_REJECT and not is_k0:
-            _S["gathered"] = (gathered.contiguous(), M_l, st["tp"], st["split"])
+        eff_split = max(1, int(pair.shape[0]) // M_l)
+        if not is_k0 and M_l <= 16:
+            if FAST_V11:
+                _fast_l2pf_fork_cb("draft_l0")
+            else:
+                try:
+                    from . import l2pf as _l2pf_cb2
+                    if hasattr(_l2pf_cb2, "fork_cross_boundary"):
+                        _l2pf_cb2.fork_cross_boundary("draft_l0")
+                except Exception:
+                    pass
+        gathered = tp_ag(pair, dim=0)
+        if (FUSE_REJECT and not is_k0) or (is_k0 and _sf_v7_ok(local.device)):
+            _S["gathered"] = (gathered.contiguous(), M_l, st["tp"], eff_split)
             _S["tok"] = None
         else:
-            tok = sf_tok_only(gathered.contiguous(), M_l, st["tp"], st["split"], pdl=True)
+            tok = sf_tok_only(gathered.contiguous(), M_l, st["tp"], eff_split, pdl=True)
             _S["tok"] = tok
             _S["gathered"] = None
         if not _S.get("logged"):
             _S["logged"] = True
             logger.info("INKLING_SYNC_FREE: first armed direct step (M=%d, k0=%d, fuse_reject=%d): %d B/row all-gather + direct greedy %s (no [M,V] one-hot)",
-                        M_l, int(is_k0), int(FUSE_REJECT and not is_k0), 16 * st["split"], "sample" if is_k0 else "reject")
-        return torch.empty((M_l, 1), dtype=st.get("dt", torch.bfloat16), device=local.device)
+                        M_l, int(is_k0), int(FUSE_REJECT and not is_k0), 16 * eff_split, "sample" if is_k0 else "reject")
+        dt_out = st.get("dt", torch.bfloat16)
+        if FAST_V11:
+            return _fast_dummy_logits(M_l, dt_out, local.device)
+        return torch.empty((M_l, 1), dtype=dt_out, device=local.device)
     out, _tok = compact_logits(lp, head, st, local)
     return out

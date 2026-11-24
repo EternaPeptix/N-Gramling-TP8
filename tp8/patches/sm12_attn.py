@@ -46,6 +46,7 @@ _DRAFT_PDL = os.environ.get("INKLING_DRAFT_PDL", "0").strip().lower() not in (
 )
 _PENDING = None  # (out, lse, op, lp, num_splits) of a deferred merge
 _PENDING_PREFILL = None  # deferred 0-ULP prefill+gate_sink launch args (num_splits == 1)
+_PENDING_S1 = None  # deferred 0-ULP decode S=1 fused attn+gate_sink launch args
 _PREFILL_OPT = os.environ.get("INKLING_ATTN_PREFILL_OPT", "1").strip().lower() not in ("0", "", "off", "false", "no")
 # Host-side flag: True between consume_pending() having launched the PDL-triggering
 # _merge_gate_sink_kernel and the very next wo_ud skinny launch (linear._pdl_site), which
@@ -66,6 +67,85 @@ _MGS_CUDA = os.environ.get("INKLING_MGS_CUDA", "0") == "1"
 # INKLING_ATTN_T16_SPLITK=1: fix T=16 decode cliff (rows=96 > 64 drops to num_splits=1);
 # default OFF since changing num_splits from 1->8/16 on T=16 changes fp32 split order.
 _T16_SPLITK = os.environ.get("INKLING_ATTN_T16_SPLITK", "0") == "1"
+_TREE_ATTN_FAST_EXIT = os.environ.get("INKLING_TREE_ATTN_FAST_EXIT", "0").strip().lower() in (
+    "1", "true", "on", "yes"
+)
+# INKLING_SM12_FUSE_GS_S1=1: 0-ULP fused Gate+Sink epilogue inside `_attn_kernel` when
+# `NUM_SPLITS == 1 and not DRAFT` (all C=32 decode batches B >= 5), eliminating 48 separate
+# `_gate_sink_kernel` launches + up to 96 `zero_()` launches + 37.7 MiB/step FP32 out/lse traffic!
+_FUSE_GS_S1 = os.environ.get("INKLING_SM12_FUSE_GS_S1", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+) and _FUSE_GS
+# Wave-V7 C=2..8 Target & Drafter Attention Split Policy (opt-in, default OFF; 0 change at B=1 and B>=9!):
+#   - Eliminates B=3..4 SWA-1024 over-splitting (S=8 -> S=1 + _PENDING_S1 fused Gate+Sink + stages=2)
+#     while keeping B=2 SWA at S=8 (48 CTAs exact + CUDA MGS) to prevent 6-CTA SM starvation.
+#   - Eliminates B=5..8 Global Attention S=1 cliff (50-69% idle SMs -> 84..96 CTAs = 1.75-2.0 CTAs/SM + stages=2).
+#   - Wave-balances drafter_attn_v5 across B=2..8 (42..48 CTAs = 0 double-loaded SM tail).
+_C48_SPLIT_POLICY = os.environ.get("INKLING_ATTN_C48_SPLIT_POLICY", "0").strip().lower() in (
+    "1", "true", "on", "yes"
+)
+_C48_LOCAL_SPLITS = max(1, min(16, int(os.environ.get("INKLING_ATTN_C48_LOCAL_SPLITS", "1") or "1")))
+_C48_LOCAL_SPLITS_B2 = max(1, min(16, int(os.environ.get("INKLING_ATTN_C48_LOCAL_SPLITS_B2", "8") or "8")))
+_C48_GLOBAL_TARGET_CTAS = max(
+    24, min(192, int(os.environ.get("INKLING_ATTN_C48_GLOBAL_TARGET_CTAS", "96") or "96"))
+)
+
+
+def _parse_c48_split_overrides(raw: str) -> dict[int, int]:
+    out: dict[int, int] = {}
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        b_s, s_s = item.split(":", 1)
+        out[int(b_s.strip())] = max(1, min(16, int(s_s.strip())))
+    return out
+
+
+_C48_GLOBAL_SPLITS_MAP = _parse_c48_split_overrides(
+    os.environ.get("INKLING_ATTN_C48_GLOBAL_SPLITS", "")
+)
+
+
+def _plan_target_splits(
+    num_reqs: int,
+    rows: int,
+    mtiles: int,
+    window: int,
+    split_row_cap: int,
+    *,
+    draft: bool = False,
+) -> int:
+    """CUDA-graph-safe static split planner (depends ONLY on static capture args).
+    Guarantees 0 behavior change when INKLING_ATTN_C48_SPLIT_POLICY=0, and 0 change
+    at B == 1 (exact_ink 0-ULP invariant) and B >= 9 even when enabled."""
+    if not _C48_SPLIT_POLICY:
+        if rows <= split_row_cap and num_reqs <= 4:
+            return 8 if window >= 0 else 16
+        if _DRAFT_SPLIT_CONC and draft and rows <= split_row_cap and num_reqs > 4:
+            return 2 if (num_reqs <= 16 or window < 0) else 1
+        return 1
+    if rows > split_row_cap:
+        return 1
+    if draft:
+        if num_reqs <= 1:
+            return 8 if window >= 0 else 16
+        if num_reqs <= 8:
+            return 1 if window >= 0 else 2
+        if _DRAFT_SPLIT_CONC:
+            return 2 if (num_reqs <= 16 or window < 0) else 1
+        return 1
+    # Target attention (draft == False):
+    if num_reqs <= 1:
+        return 8 if window >= 0 else 16
+    if 2 <= num_reqs <= 8:
+        if window >= 0:
+            return _C48_LOCAL_SPLITS_B2 if num_reqs == 2 else _C48_LOCAL_SPLITS
+        if num_reqs in _C48_GLOBAL_SPLITS_MAP:
+            return _C48_GLOBAL_SPLITS_MAP[num_reqs]
+        base = max(1, mtiles * num_reqs)
+        return max(2, min(16, _C48_GLOBAL_TARGET_CTAS // base))
+    return 1
 _TARGET_ATTN_LIB_PATH = os.environ.get(
     "INKLING_TARGET_ATTN_LIB", "/rdma/libinkling_target_attn_exact.so"
 )
@@ -134,7 +214,15 @@ def _attn_kernel(
     TreeMetaPtr=None,
     HAS_TREE: tl.constexpr = False,
     HAS_TREE_2B: tl.constexpr = False,
+    TREE_FAST_EXIT: tl.constexpr = False,
     TREE_MAX_M: tl.constexpr = 8,
+    GATE=None,
+    SINK=None,
+    Y=None,
+    sg_t=0,
+    ssk_t=0,
+    sy_t=0,
+    FUSE_GS: tl.constexpr = False,
 ):
     if PDL:
         if DRAFT:
@@ -142,13 +230,25 @@ def _attn_kernel(
             # before reading Q/K/V, then trigger _merge_kernel / o_proj early.
             tl.extra.cuda.gdc_wait()
             tl.extra.cuda.gdc_launch_dependents()
+        elif FUSE_GS:
+            # NUM_SPLITS == 1 fused Gate+Sink writes Y directly; downstream C=32 wo_ud
+            # does not gdc_wait(), so NEVER launch dependents before Y is written!
+            tl.extra.cuda.gdc_wait()
         else:
             # Trigger BEFORE the wait: the dependent (merge+gate_sink, then wo_ud behind it)
             # becomes resident while we run.  Legal because every dependent gdc_waits for
             # our full completion before reading anything we write; we wait for the
             # prologue (q / bias / new K,V) before reading anything it writes.
             tl.extra.cuda.gdc_launch_dependents()
+            if HAS_TREE_2B and TREE_FAST_EXIT:
+                if tl.program_id(0) == 3:
+                    if (tl.load(TreeMetaPtr + 0) == 0) | (tl.load(TreeMetaPtr + 2) <= 0):
+                        return
             tl.extra.cuda.gdc_wait()
+    elif HAS_TREE_2B and TREE_FAST_EXIT and not DRAFT:
+        if tl.program_id(0) == 3:
+            if (tl.load(TreeMetaPtr + 0) == 0) | (tl.load(TreeMetaPtr + 2) <= 0):
+                return
     mt = tl.program_id(0)
     r = tl.program_id(1)
     kvh = tl.program_id(2) // NUM_SPLITS
@@ -317,6 +417,15 @@ def _attn_kernel(
 
     l_safe = tl.where(l_i > 0, l_i, 1.0)
     out = acc / l_safe[:, None]
+    if FUSE_GS:
+        lse = tl.where(l_i > 0, (m_i + tl.log2(l_safe)) * 0.6931471805599453, float("-inf"))
+        col_g = h[:, None] * D + dd[None, :]
+        g_val = tl.load(GATE + tok[:, None] * sg_t + col_g, mask=row_ok[:, None], other=0.0).to(tl.float32)
+        sk_val = tl.load(SINK + tok * ssk_t + h, mask=row_ok, other=0.0).to(tl.float32)
+        res = out * _sigmoid(g_val)
+        res = res * _sigmoid(lse - sk_val)[:, None]
+        tl.store(Y + tok[:, None] * sy_t + col_g, res, mask=row_ok[:, None])
+        return
     tl.store(O + split * so_s + tok[:, None] * so_t + h[:, None] * so_h + dd[None, :],
              out, mask=row_ok[:, None])
     if not (DRAFT and NUM_SPLITS == 1):
@@ -328,6 +437,7 @@ def _attn_kernel(
 def _merge_kernel(OP, LP, O, L, so_s, so_t, so_h, sl_s, sl_t, sl_h,
                   O_t, O_h, L_h, L_t,
                   H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, S: tl.constexpr,
+                  SP: tl.constexpr,
                   SKIP_LSE: tl.constexpr = False, PDL: tl.constexpr = False):
     if PDL:
         tl.extra.cuda.gdc_wait()
@@ -335,9 +445,10 @@ def _merge_kernel(OP, LP, O, L, so_s, so_t, so_h, sl_s, sl_t, sl_h,
     t = tl.program_id(0)
     hh = tl.arange(0, HP)
     hm = hh < H
-    ss = tl.arange(0, S)
+    ss = tl.arange(0, SP)
+    sm = ss < S
     dd = tl.arange(0, D)
-    lse = tl.load(LP + ss[:, None] * sl_s + t * sl_t + hh[None, :] * sl_h, mask=hm[None, :], other=float("-inf"))  # [S, HP]
+    lse = tl.load(LP + ss[:, None] * sl_s + t * sl_t + hh[None, :] * sl_h, mask=sm[:, None] & hm[None, :], other=float("-inf"))  # [SP, HP]
     mx = tl.max(lse, 0)
     mx_safe = tl.where(mx == float("-inf"), 0.0, mx)
     w = tl.exp(lse - mx_safe[None, :])
@@ -368,6 +479,7 @@ def _sigmoid(x):
 def _merge_gate_sink_kernel(OP, LP, GATE, SINK, Y, so_s, so_t, so_h, sl_s, sl_t, sl_h,
                             sg_t, ssk_t, NT,
                             H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, S: tl.constexpr,
+                            SP: tl.constexpr,
                             TRIG: tl.constexpr = False,
                             NLivePtr=None, HAS_NLIVE: tl.constexpr = False):
     """_merge_kernel followed by attention_ops._gate_sink_kernel, one program per
@@ -384,9 +496,10 @@ def _merge_gate_sink_kernel(OP, LP, GATE, SINK, Y, so_s, so_t, so_h, sl_s, sl_t,
     tv = t < NT
     hh = tl.arange(0, HP)
     hm = hh < H
-    ss = tl.arange(0, S)
+    ss = tl.arange(0, SP)
+    sm = ss < S
     dd = tl.arange(0, D)
-    lse = tl.load(LP + ss[:, None] * sl_s + t * sl_t + hh[None, :] * sl_h, mask=hm[None, :] & tv, other=float("-inf"))
+    lse = tl.load(LP + ss[:, None] * sl_s + t * sl_t + hh[None, :] * sl_h, mask=sm[:, None] & hm[None, :] & tv, other=float("-inf"))
     mx = tl.max(lse, 0)
     mx_safe = tl.where(mx == float("-inf"), 0.0, mx)
     w = tl.exp(lse - mx_safe[None, :])
@@ -647,6 +760,11 @@ _PF_GLOBAL_MODE = os.environ.get("INKLING_PF_GLOBAL_MODE", "off").strip().lower(
 _PF_GLOBAL_ENABLED = _PF_GLOBAL_MODE not in ("", "0", "off", "false", "no")
 _PF_GLOBAL_MIN_QLEN = int(os.environ.get("INKLING_PF_GLOBAL_MIN_QLEN", "1024") or 1024)
 _PF_GLOBAL_MIN_PAST = int(os.environ.get("INKLING_PF_GLOBAL_MIN_PAST", "4096") or 4096)
+# Warm long-context prefill gate (default 0 = disabled; e.g. 64 lets warm 1M Turn-2 queries with
+# qlen=436 < 1024 use Sage2+TopK instead of 42-CTA dense BF16 over 1M tokens -> -1.42s Warm TTFT!
+# Strictly >= 64 and !capturing so decode M <= 36 is 100% 0-ULP untouched).
+_PF_GLOBAL_WARM_MIN_QLEN = int(os.environ.get("INKLING_PF_GLOBAL_WARM_MIN_QLEN", "0") or 0)
+_PF_GLOBAL_WARM_MIN_PAST = int(os.environ.get("INKLING_PF_GLOBAL_WARM_MIN_PAST", "32768") or 32768)
 _PF_GLOBAL_TAU = float(
     os.environ.get("INKLING_PF_GLOBAL_TAU", os.environ.get("INKLING_PF_PVSKIP_TAU", "24.0")) or 24.0
 )
@@ -715,6 +833,8 @@ def _prepare_fp8_shadow_k_ex(
     with_kmax: bool = False,
     seq_lens_cpu=None,
     query_lens_cpu=None,
+    kv_bf12_cache=None,
+    kv_bf12_emerg=None,
 ) -> tuple[
     torch.Tensor | None,
     torch.Tensor | None,
@@ -732,8 +852,12 @@ def _prepare_fp8_shadow_k_ex(
     VRAM under `set_per_process_memory_fraction` and unlocking 5x-8x simultaneous 1M KV sessions!
     """
     global _PF_SHADOW_K_WARNED
-    ptr = int(key_cache.data_ptr())
-    kc_shape = tuple(key_cache.shape)
+    use_kv_bf12 = kv_bf12_cache is not None
+    ptr = int(kv_bf12_cache.data_ptr()) if use_kv_bf12 else int(key_cache.data_ptr())
+    if use_kv_bf12:
+        kc_shape = (int(kv_bf12_cache.shape[0]), 256, int(kv_bf12_cache.shape[1]), 128)
+    else:
+        kc_shape = tuple(key_cache.shape)
     st = _PF_SHADOW_K_CACHE.get(ptr)
     if st is None or st.get("shape") != kc_shape:
         nblk, bs_k, hkv, d = kc_shape
@@ -772,8 +896,16 @@ def _prepare_fp8_shadow_k_ex(
             _PF_SHADOW_K_CACHE[ptr] = {"disabled": True, "shape": kc_shape}
             return None, None, None, None, None, 0
         if is_v3:
+            _alloc_ref = (
+                torch.empty((nblk, bs_k, hkv, d), dtype=torch.bfloat16, device="meta")
+                if use_kv_bf12
+                else key_cache
+            )
             k_fp8, k_scale, k_mid, k_rad = gmod.alloc_fp8_shadow_k_v3(
-                key_cache, with_kmax=with_kmax, cap_blks=cap_blks if use_compact else None
+                _alloc_ref,
+                with_kmax=with_kmax,
+                cap_blks=cap_blks if use_compact else None,
+                device=kv_bf12_cache.device if use_kv_bf12 else None,
             )
             if use_compact and len(_PF_SHADOW_K_CACHE) == 0:
                 print(
@@ -783,7 +915,14 @@ def _prepare_fp8_shadow_k_ex(
                     flush=True,
                 )
         else:
-            k_fp8, k_scale = gmod.alloc_fp8_shadow_k(key_cache)
+            _alloc_ref = (
+                torch.empty((nblk, bs_k, hkv, d), dtype=torch.bfloat16, device="meta")
+                if use_kv_bf12
+                else key_cache
+            )
+            k_fp8, k_scale = gmod.alloc_fp8_shadow_k(
+                _alloc_ref, device=kv_bf12_cache.device if use_kv_bf12 else None
+            )
             k_mid = k_rad = None
         st = {
             "disabled": False,
@@ -815,6 +954,45 @@ def _prepare_fp8_shadow_k_ex(
     cap_blks = int(st.get("cap_blks", kc_shape[0]))
 
     def _quant_blocks(blk_ids: torch.Tensor, out_offset: int = 0) -> None:
+        if use_kv_bf12:
+            from . import sm12_attn_fused as _sm12_f
+            ids_flat = blk_ids.reshape(-1)
+            total_b = int(ids_flat.numel())
+            # Chunk unpack <= 512 blocks (32 MiB peak) even on Warm-1M full Shadow-K build!
+            chunk_b = 512
+            for off_i in range(0, total_b, chunk_b):
+                sub_ids = ids_flat[off_i : off_i + chunk_b]
+                n_sub = int(sub_ids.numel())
+                k_stage, _ = _sm12_f.kv_bf12_unpack_blocks(
+                    kv_bf12_cache, kv_bf12_emerg, sub_ids, unpack_k=True, unpack_v=False
+                )
+                local_ids = torch.arange(n_sub, dtype=torch.int32, device=sub_ids.device)
+                if st["is_v3"]:
+                    if compact:
+                        gmod.quantize_k_to_fp8_blocks_v3(
+                            k_stage, k_fp8, k_scale, k_mid, k_rad, local_ids,
+                            with_kmax=st["with_kmax"], out_offset=out_offset + off_i, compact_out=True,
+                        )
+                    else:
+                        t_fp8, t_sc, t_mid, t_rad = gmod.alloc_fp8_shadow_k_v3(
+                            k_stage, with_kmax=st["with_kmax"], cap_blks=n_sub
+                        )
+                        gmod.quantize_k_to_fp8_blocks_v3(
+                            k_stage, t_fp8, t_sc, t_mid, t_rad, local_ids,
+                            with_kmax=st["with_kmax"], out_offset=0, compact_out=True,
+                        )
+                        dst_idx = sub_ids.to(dtype=torch.long)
+                        k_fp8.index_copy_(0, dst_idx, t_fp8)
+                        k_scale.index_copy_(0, dst_idx, t_sc)
+                        if st["with_kmax"] and k_mid is not None and t_mid is not None:
+                            k_mid.index_copy_(0, dst_idx, t_mid)
+                            k_rad.index_copy_(0, dst_idx, t_rad)
+                else:
+                    t_fp8, t_sc = gmod.quantize_k_to_fp8_blocks(k_stage)
+                    dst_idx = sub_ids.to(dtype=torch.long)
+                    k_fp8.index_copy_(0, dst_idx, t_fp8)
+                    k_scale.index_copy_(0, dst_idx, t_sc)
+            return
         if st["is_v3"]:
             gmod.quantize_k_to_fp8_blocks_v3(
                 key_cache, k_fp8, k_scale, k_mid, k_rad, blk_ids,
@@ -844,7 +1022,7 @@ def _prepare_fp8_shadow_k_ex(
         if nblks <= 0:
             return k_fp8, k_scale, k_mid, k_rad, k_bt_out, k_bt_mode
         prev_nblks = st["last_nblks"]
-        if _PF_GLOBAL_ZERO_SYNC and block_table.is_cuda:
+        if _PF_GLOBAL_ZERO_SYNC and block_table.is_cuda and not use_kv_bf12:
             bt_state = st.get("gpu_bt_state")
             if bt_state is None:
                 bt_state = torch.full((2,), -1, dtype=torch.int32, device=key_cache.device)
@@ -864,6 +1042,61 @@ def _prepare_fp8_shadow_k_ex(
                     key_cache, k_fp8, k_scale, bt_row, bt_state,
                     nblks, start_blk, prev_idx, cpu_contig,
                 )
+            st["last_seqlen"] = seqlen
+            st["last_nblks"] = nblks
+            return k_fp8, k_scale, k_mid, k_rad, k_bt_out, k_bt_mode
+        if _PF_GLOBAL_ZERO_SYNC and block_table.is_cuda and use_kv_bf12 and st["is_v3"] and nblks <= int(block_table.shape[1]):
+            from . import sm12_attn_fused as _sm12_f
+            bt_state = st.get("gpu_bt_state")
+            if bt_state is None:
+                bt_state = torch.full((2,), -1, dtype=torch.int32, device=key_cache.device)
+                st["gpu_bt_state"] = bt_state
+            cpu_contig = (st["last_seqlen"] == past) and (0 < prev_nblks <= nblks)
+            start_blk = (past // bs) if cpu_contig else 0
+            prev_idx = (prev_nblks - 1) if cpu_contig else 0
+            bt_row = block_table[0] if block_table[0].is_contiguous() else block_table[0].contiguous()
+            bt_2d = block_table[:1]
+            max_bt_cols = int(block_table.shape[1])
+            hkv_bf12 = int(kv_bf12_cache.shape[1])
+            chunk_b = min(512, nblks)
+            k_stage_buf = torch.empty((chunk_b, bs, hkv_bf12, 128), dtype=torch.bfloat16, device=kv_bf12_cache.device)
+            try:
+                # Contiguous prefix chunks [0, start_blk): GPU-guarded 1-cycle no-op (0 D2H sync, 0 DRAM reads);
+                # automatically unpacks & rebuilds Shadow-K on GPU if a different request reused `past`!
+                if cpu_contig and start_blk > 0:
+                    for off_i in range(0, start_blk, chunk_b):
+                        n_sub = min(chunk_b, start_blk - off_i)
+                        k_sub = k_stage_buf[:n_sub]
+                        _sm12_f.kv_bf12_unpack_bt_range(
+                            kv_bf12_cache, kv_bf12_emerg, bt_2d,
+                            num_reqs=1, max_bt_cols=max_bt_cols,
+                            b_beg=off_i, n_blks_per_req=n_sub,
+                            guard_bt_state=bt_state, guard_prev_idx=prev_idx,
+                            k_out=k_sub, unpack_k=True, unpack_v=False,
+                        )
+                        gmod.quantize_k_to_fp8_blocks_v3_local_syncfree(
+                            k_sub, k_fp8, k_scale, k_mid, k_rad, bt_row, bt_state,
+                            n_sub, off_i, prev_idx, check_contig=True,
+                            with_kmax=st["with_kmax"], compact_out=compact,
+                        )
+                # Newly appended chunks [start_blk, nblks): unconditional unpack + FP8 quant (0 D2H sync!)
+                for off_i in range(start_blk, nblks, chunk_b):
+                    n_sub = min(chunk_b, nblks - off_i)
+                    k_sub = k_stage_buf[:n_sub]
+                    _sm12_f.kv_bf12_unpack_bt_range(
+                        kv_bf12_cache, kv_bf12_emerg, bt_2d,
+                        num_reqs=1, max_bt_cols=max_bt_cols,
+                        b_beg=off_i, n_blks_per_req=n_sub,
+                        k_out=k_sub, unpack_k=True, unpack_v=False,
+                    )
+                    gmod.quantize_k_to_fp8_blocks_v3_local_syncfree(
+                        k_sub, k_fp8, k_scale, k_mid, k_rad, bt_row, bt_state,
+                        n_sub, off_i, prev_idx, check_contig=False,
+                        with_kmax=st["with_kmax"], compact_out=compact,
+                    )
+                gmod.update_bt_state_gpu(bt_row, bt_state, nblks - 1)
+            finally:
+                del k_stage_buf
             st["last_seqlen"] = seqlen
             st["last_nblks"] = nblks
             return k_fp8, k_scale, k_mid, k_rad, k_bt_out, k_bt_mode
@@ -974,14 +1207,22 @@ def _launch_prefill_opt(args, gate=None, sinks=None, result=None, seq_lens_cpu=N
     else:
         if (
             _PF_GLOBAL_ENABLED
-            and max_seqlen_q >= _PF_GLOBAL_MIN_QLEN
             and not torch.cuda.is_current_stream_capturing()
+            and (
+                max_seqlen_q >= _PF_GLOBAL_MIN_QLEN
+                or (_PF_GLOBAL_WARM_MIN_QLEN >= 64 and max_seqlen_q >= _PF_GLOBAL_WARM_MIN_QLEN)
+            )
         ):
             if seq_lens_cpu is not None and len(seq_lens_cpu) >= num_reqs and num_reqs > 0:
                 max_seq = int(max(seq_lens_cpu[:num_reqs]))
             else:
                 max_seq = int(cache_seqlens[:num_reqs].max().item()) if num_reqs > 0 else 0
-            if (max_seq - max_seqlen_q) >= _PF_GLOBAL_MIN_PAST:
+            eff_min_past = (
+                _PF_GLOBAL_MIN_PAST
+                if max_seqlen_q >= _PF_GLOBAL_MIN_QLEN
+                else max(_PF_GLOBAL_MIN_PAST, _PF_GLOBAL_WARM_MIN_PAST)
+            )
+            if (max_seq - max_seqlen_q) >= eff_min_past:
                 from . import global_attn_1m as _gmod
                 k_fp8 = k_scale = k_scale64 = k_mid = k_rad = k_bt = None
                 k_bt_mode = 0
@@ -997,6 +1238,12 @@ def _launch_prefill_opt(args, gate=None, sinks=None, result=None, seq_lens_cpu=N
                         is_v3=False, with_kmax=False,
                         seq_lens_cpu=seq_lens_cpu, query_lens_cpu=query_lens_cpu,
                     )
+                _use_v6_lp = (
+                    _PF_FP8_ATTN_V6
+                    and _PF_GLOBAL_MODE == "fp8_sage2_cuda_v3"
+                    and int(max_seqlen_q) >= _PF_FP8_ATTN_V6_MIN_Q
+                    and os.path.exists(_PF_FP8_ATTN_V6_LIB_PATH)
+                )
                 if _gmod.launch_global_prefill(
                     args,
                     gate=gate,
@@ -1007,7 +1254,9 @@ def _launch_prefill_opt(args, gate=None, sinks=None, result=None, seq_lens_cpu=N
                     bn=_PF_GLOBAL_BN if _PF_GLOBAL_MODE == "fp8_sage2_cuda_v3" else None,
                     min_ctas=_PF_GLOBAL_MIN_CTAS if _PF_GLOBAL_MODE == "fp8_sage2_cuda_v3" else None,
                     topk_tokens=_PF_GLOBAL_TOPK if _PF_GLOBAL_MODE == "fp8_sage2_cuda_v3" else None,
-                    cuda_lib_path=_resolve_pf_global_lib(),
+                    cuda_lib_path=_PF_FP8_ATTN_V6_LIB_PATH if _use_v6_lp else _resolve_pf_global_lib(),
+                    use_v6_fp8=_use_v6_lp,
+                    pv_f16_acc=_PF_FP8_PV_F16_ACC,
                     k_fp8_cache=k_fp8,
                     k_scale_cache=k_scale,
                     k_scale64_cache=k_scale64,
@@ -1043,16 +1292,105 @@ def _merge(op, lp, out, lse, num_splits, H, D, skip_lse: bool = False, pdl: bool
         lp.stride(0), lp.stride(1), lp.stride(2),
         out.stride(0), out.stride(1), lse.stride(0), lse.stride(1),
         H=H, HP=triton.next_power_of_2(H),
-        D=D, S=num_splits, SKIP_LSE=skip_lse, PDL=pdl,
+        D=D, S=num_splits, SP=triton.next_power_of_2(num_splits),
+        SKIP_LSE=skip_lse, PDL=pdl,
         num_warps=4, launch_pdl=pdl,
     )
 
 
 def consume_pending(output, gate, lse_t, sinks, result) -> bool:
-    """Called by attention_ops.gate_sink.  True if a deferred merge or prefill
-    attention was fused into the gate/sink launch; otherwise any pending work is
-    flushed into out/lse first and False is returned."""
-    global _PENDING, _PENDING_PREFILL, _PENDING_PREFILL_CPU_LENS, _WO_ARMED
+    """Called by attention_ops.gate_sink.  True if a deferred merge, S=1 decode
+    attention, or prefill attention was fused into the gate/sink launch; otherwise
+    any pending work is flushed into out/lse first and False is returned."""
+    global _PENDING, _PENDING_PREFILL, _PENDING_PREFILL_CPU_LENS, _PENDING_S1, _WO_ARMED
+    ps1, _PENDING_S1 = _PENDING_S1, None
+    if ps1 is not None:
+        _WO_ARMED = False
+        (
+            q_s, kc_s, vc_s, bt_s, seq_s, cuq_s, bias_s, out_s, lse_s,
+            _max_q_s, scale_s, win_s, E_s, EW_s, G_s, BS_s, H_s, Hkv_s, D_s,
+            nreqs_s, bm_s, bn_s, warps_s, stages_s, mtiles_s, nl_s,
+        ) = ps1
+        nt = out_s.shape[0]
+        T = output.shape[0]
+        if (
+            out_s.data_ptr() == output.data_ptr()
+            and lse_s.data_ptr() == lse_t.data_ptr()
+            and output.shape[1:] == (H_s, D_s)
+            and nt <= T
+            and gate.stride(1) == 1
+            and sinks.stride(1) == 1
+            and result.is_contiguous()
+            and result.shape == gate.shape
+        ):
+            y_sub = result[:nt]
+            g_sub = gate[:nt]
+            sk_sub = sinks[:nt]
+            _attn_kernel[(mtiles_s, nreqs_s, Hkv_s)](
+                q_s, kc_s, vc_s, bt_s, seq_s, cuq_s,
+                bias_s, y_sub, y_sub,
+                q_s.stride(0), q_s.stride(1),
+                kc_s.stride(0), kc_s.stride(1), kc_s.stride(2),
+                vc_s.stride(0), vc_s.stride(1), vc_s.stride(2),
+                bt_s.stride(0),
+                bias_s.stride(0), bias_s.stride(1),
+                0, 0, 0,
+                0, 0, 0,
+                scale_s * LOG2E,
+                WINDOW=win_s, E=E_s, EW=EW_s, G=G_s, BS=BS_s, D=D_s,
+                BLOCK_M=bm_s, BLOCK_N=bn_s, NUM_SPLITS=1, DRAFT=False,
+                REQ_BOUNDS=mtiles_s > 1,
+                PDL=_PDL,
+                NLivePtr=nl_s if nl_s is not None else cuq_s,
+                HAS_NLIVE=nl_s is not None,
+                TreeDepthPtr=cuq_s,
+                TreePathPtr=cuq_s,
+                TreeMetaPtr=cuq_s,
+                HAS_TREE=False,
+                HAS_TREE_2B=False,
+                TREE_FAST_EXIT=False,
+                TREE_MAX_M=8,
+                GATE=g_sub,
+                SINK=sk_sub,
+                Y=y_sub,
+                sg_t=g_sub.stride(0),
+                ssk_t=sk_sub.stride(0),
+                sy_t=y_sub.stride(0),
+                FUSE_GS=True,
+                num_warps=warps_s, num_stages=stages_s, launch_pdl=_PDL,
+            )
+            if nt < T:
+                result[nt:].zero_()
+            return True
+        # Fallback flush into out_s / lse_s if caller tensors did not match
+        op_f, lp_f = out_s.unsqueeze(0), lse_s.t().unsqueeze(0)
+        _attn_kernel[(mtiles_s, nreqs_s, Hkv_s)](
+            q_s, kc_s, vc_s, bt_s, seq_s, cuq_s,
+            bias_s, op_f, lp_f,
+            q_s.stride(0), q_s.stride(1),
+            kc_s.stride(0), kc_s.stride(1), kc_s.stride(2),
+            vc_s.stride(0), vc_s.stride(1), vc_s.stride(2),
+            bt_s.stride(0),
+            bias_s.stride(0), bias_s.stride(1),
+            op_f.stride(0), op_f.stride(1), op_f.stride(2),
+            lp_f.stride(0), lp_f.stride(1), lp_f.stride(2),
+            scale_s * LOG2E,
+            WINDOW=win_s, E=E_s, EW=EW_s, G=G_s, BS=BS_s, D=D_s,
+            BLOCK_M=bm_s, BLOCK_N=bn_s, NUM_SPLITS=1, DRAFT=False,
+            REQ_BOUNDS=mtiles_s > 1,
+            PDL=_PDL,
+            NLivePtr=nl_s if nl_s is not None else cuq_s,
+            HAS_NLIVE=nl_s is not None,
+            TreeDepthPtr=cuq_s,
+            TreePathPtr=cuq_s,
+            TreeMetaPtr=cuq_s,
+            HAS_TREE=False,
+            HAS_TREE_2B=False,
+            TREE_FAST_EXIT=False,
+            TREE_MAX_M=8,
+            num_warps=warps_s, num_stages=stages_s, launch_pdl=_PDL,
+        )
+        return False
     pp, _PENDING_PREFILL = _PENDING_PREFILL, None
     cpu_lens, _PENDING_PREFILL_CPU_LENS = _PENDING_PREFILL_CPU_LENS, (None, None)
     if pp is not None:
@@ -1114,7 +1452,7 @@ def consume_pending(output, gate, lse_t, sinks, result) -> bool:
             op.stride(0), op.stride(1), op.stride(2),
             lp.stride(0), lp.stride(1), lp.stride(2),
             gate.stride(0), sinks.stride(0), nt,
-            H=H, HP=triton.next_power_of_2(H), D=D, S=S, TRIG=_PDL,
+            H=H, HP=triton.next_power_of_2(H), D=D, S=S, SP=triton.next_power_of_2(S), TRIG=_PDL,
             NLivePtr=nl_buf if nl_buf is not None else op,
             HAS_NLIVE=nl_buf is not None,
             num_warps=4, launch_pdl=True,
@@ -1128,13 +1466,14 @@ def consume_pending(output, gate, lse_t, sinks, result) -> bool:
 def rel_attention(q, key_cache, value_cache, *, block_table, cache_seqlens,
                   cu_seqlens_q, max_seqlen_q, softmax_scale, window_size,
                   sheared_bias, out, lse, num_splits=None, draft=False):
-    global _PENDING, _PENDING_PREFILL, _PENDING_PREFILL_CPU_LENS, _PREFILL_CPU_LENS, _WO_ARMED
+    global _PENDING, _PENDING_PREFILL, _PENDING_PREFILL_CPU_LENS, _PENDING_S1, _PREFILL_CPU_LENS, _WO_ARMED
     from torch._subclasses.fake_tensor import is_fake
     if is_fake(q):
         return
     cpu_lens, _PREFILL_CPU_LENS = _PREFILL_CPU_LENS, (None, None)
     _PENDING = None
     _PENDING_PREFILL = None
+    _PENDING_S1 = None
     _PENDING_PREFILL_CPU_LENS = (None, None)
     _WO_ARMED = False
     T, H, D = q.shape
@@ -1162,16 +1501,18 @@ def rel_attention(q, key_cache, value_cache, *, block_table, cache_seqlens,
         bm, bn, warps, stages = 64, 64, 4, 2
     mtiles = triton.cdiv(rows, bm)
     if num_splits is None:
-        if rows <= split_row_cap and num_reqs <= 4:
-            num_splits = 8 if window >= 0 else 16
-        elif _DRAFT_SPLIT_CONC and draft and rows <= split_row_cap and num_reqs > 4:
-            num_splits = 2 if (num_reqs <= 16 or window < 0) else 1
-        else:
-            num_splits = 1
-    if _C32_STAGES2 and num_splits == 1 and rows <= split_row_cap and bm == 16 and stages < 2:
-        # C=1 sets INKLING_ATTN_BM16_STAGES=1 (short 1-2 tile splits); at B>=5 num_splits==1 runs
-        # 16..64 K-tiles/CTA and needs stages=2 cp.async pipelining (100% 0-ULP bit-exact!).
-        stages = 2
+        num_splits = _plan_target_splits(
+            num_reqs, rows, mtiles, window, split_row_cap, draft=draft
+        )
+    if rows <= split_row_cap and bm == 16 and stages < 2:
+        if _C32_STAGES2 and num_splits == 1:
+            # C=1 sets INKLING_ATTN_BM16_STAGES=1 (short 1-2 tile splits); S=1 runs
+            # 16..64+ K-tiles/CTA and needs stages=2 cp.async pipelining (100% 0-ULP!).
+            stages = 2
+        elif _C48_SPLIT_POLICY and not draft and 2 <= num_reqs <= 8 and window < 0:
+            # Wave-V7 C=2..8 Global Attention (S=4..16, 84..96 CTAs <= 2 CTAs/SM) runs
+            # 8..4096 K-tiles/CTA and needs stages=2 cp.async pipelining!
+            stages = 2
     if (_PREFILL_OPT and not draft and num_splits == 1 and rows > 64
             and E > 0 and (T + 128) * H * EW < (1 << 30)):
         prefill_args = (
@@ -1210,6 +1551,23 @@ def rel_attention(q, key_cache, value_cache, *, block_table, cache_seqlens,
     grid_m = 4 if has_tree_2b else (max_seqlen_q if has_tree else mtiles)
     grid = (grid_m, num_reqs, Hkv * num_splits)
     nl_buf = _rowar_nlive_buf(T) if (not draft) else None
+    if (
+        _FUSE_GS_S1
+        and _C48_SPLIT_POLICY
+        and not draft
+        and num_splits == 1
+        and rows <= split_row_cap
+        and not has_tree
+        and D == 128
+    ):
+        # Defer S=1 decode launch to consume_pending() for true single-launch 0-ULP
+        # fused Gate+Sink (bypasses attention.py:958 `not use_scheduler` dead-code guard!).
+        _PENDING_S1 = (
+            q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q,
+            sheared_bias, out, lse, max_seqlen_q, softmax_scale, window, E, EW, G, BS,
+            H, Hkv, D, num_reqs, bm, bn, warps, stages, mtiles, nl_buf,
+        )
+        return
     use_pdl = _DRAFT_PDL if draft else _PDL
     _attn_kernel[grid](
         q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q,
@@ -1234,6 +1592,7 @@ def rel_attention(q, key_cache, value_cache, *, block_table, cache_seqlens,
         TreeMetaPtr=tree_st.tree_meta if has_tree_2b else cu_seqlens_q,
         HAS_TREE=has_tree and (not has_tree_2b),
         HAS_TREE_2B=has_tree_2b,
+        TREE_FAST_EXIT=has_tree_2b and _TREE_ATTN_FAST_EXIT,
         TREE_MAX_M=tree_st.max_m if has_tree else 8,
         num_warps=warps, num_stages=stages, launch_pdl=use_pdl,
     )
@@ -1247,11 +1606,436 @@ def rel_attention(q, key_cache, value_cache, *, block_table, cache_seqlens,
             )
 
 
+def can_fuse_gs_s1(
+    *,
+    num_reqs: int,
+    max_seqlen_q: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    num_splits: int | None,
+) -> bool:
+    """True when Target `_attention` will run `NUM_SPLITS == 1` `_attn_kernel` and can
+    fuse `Gate + Sink` directly in registers at literal 0-ULP (`nd == 0`)."""
+    if not _FUSE_GS_S1 or num_reqs <= 0 or num_kv_heads <= 0 or head_dim != 128:
+        return False
+    G = num_heads // num_kv_heads
+    rows = max_seqlen_q * G
+    split_row_cap = 96 if (_T16_SPLITK and num_reqs == 1) else 64
+    if rows > split_row_cap:
+        return False
+    if _C48_SPLIT_POLICY and 2 <= num_reqs <= 8:
+        # C=2..8 uses S=1 for local SWA and S>1 for global; defer via rel_attention->_PENDING_S1
+        # where window_size is known instead of hardcoding S=1 across both layer types.
+        return False
+    if num_splits is None:
+        eff_splits = 1 if num_reqs > 4 else 8
+    else:
+        eff_splits = int(num_splits)
+    return eff_splits == 1
+
+
+def rel_attention_fused_s1(
+    q, key_cache, value_cache, *, block_table, cache_seqlens,
+    cu_seqlens_q, max_seqlen_q, softmax_scale, window_size,
+    sheared_bias, gate, sinks, y_out,
+):
+    """0-ULP single-launch Target Attention + Gate + Sink for `NUM_SPLITS == 1` (`B >= 5` C=32).
+    Eliminates FP32 `out`/`lse` allocations, `zero_()` launches, and `_gate_sink_kernel`!"""
+    T, H, D = q.shape
+    if T == 0:
+        return
+    Hkv = key_cache.shape[2]
+    G = H // Hkv
+    BS = key_cache.shape[1]
+    num_reqs = cache_seqlens.shape[0]
+    window = window_size[0]
+    EW = sheared_bias.shape[2]
+    E = EW - 256
+    bm = _BM if _BM16 else 64
+    bn = _BM16_BN if _BM16 else 64
+    warps = _BM16_WARPS if _BM16 else 4
+    stages = 2 if (_C32_STAGES2 and bm == 16) else (_BM16_STAGES if _BM16 else 2)
+    mtiles = triton.cdiv(max_seqlen_q * G, bm)
+    nl_buf = _rowar_nlive_buf(T)
+    use_pdl = _PDL
+    _attn_kernel[(mtiles, num_reqs, Hkv)](
+        q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q,
+        sheared_bias, y_out, y_out,
+        q.stride(0), q.stride(1),
+        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+        block_table.stride(0),
+        sheared_bias.stride(0),
+        sheared_bias.stride(1),
+        0, 0, 0,
+        0, 0, 0,
+        softmax_scale * LOG2E,
+        WINDOW=window, E=E, EW=EW, G=G, BS=BS, D=D,
+        BLOCK_M=bm, BLOCK_N=bn, NUM_SPLITS=1, DRAFT=False,
+        REQ_BOUNDS=mtiles > 1,
+        PDL=use_pdl,
+        NLivePtr=nl_buf if nl_buf is not None else cu_seqlens_q,
+        HAS_NLIVE=nl_buf is not None,
+        TreeDepthPtr=cu_seqlens_q,
+        TreePathPtr=cu_seqlens_q,
+        TreeMetaPtr=cu_seqlens_q,
+        HAS_TREE=False,
+        HAS_TREE_2B=False,
+        TREE_FAST_EXIT=False,
+        TREE_MAX_M=8,
+        GATE=gate,
+        SINK=sinks,
+        Y=y_out,
+        sg_t=gate.stride(0),
+        ssk_t=sinks.stride(0),
+        sy_t=y_out.stride(0),
+        FUSE_GS=True,
+        num_warps=warps, num_stages=stages, launch_pdl=use_pdl,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave-V5 Generalized 6-Warp Fused Drafter Block-Attention (`B = 1..32, T_req <= 8`)
+# Cuts C=32 (`B = 2..32`) drafter KV DRAM reads 3.0x -> 1.0x (`251.7 -> 83.9 MB` @ B=32),
+# eliminates all 5 `_merge_kernel` launches across ALL `B = 1..32`, and overlaps tile-0
+# historical KV fetches before `gdc_wait()`. Falls back cleanly to C=1 v4 or Triton.
+# ---------------------------------------------------------------------------
+_DRAFT_ATTN_V5 = os.environ.get("INKLING_DRAFT_ATTN_V5", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_DRAFT_ATTN_V5_LIB_PATH = os.environ.get(
+    "INKLING_DRAFT_ATTN_V5_LIB", "/rdma/libdrafter_attn_v5.so"
+)
+_DRAFT_ATTN_V5_MAX_REQS = max(
+    1, min(32, int(os.environ.get("INKLING_DRAFT_ATTN_V5_MAX_REQS", "32") or "32"))
+)
+_DRAFT_ATTN_V5_B32_SPLITS = max(
+    1, min(4, int(os.environ.get("INKLING_DRAFT_ATTN_V5_B32_SPLITS", "2") or "2"))
+)
+_DRAFT_ATTN_V10_S48 = os.environ.get("INKLING_DRAFT_ATTN_V10_S48", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_DRAFT_ATTN_V10_VER = 0
+_DRAFT_ATTN_V5_LIB = None
+_DRAFT_ATTN_V5_TRIED = False
+_DRAFT_ATTN_V5_WS: dict[int, tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]] = {}
+_DRAFT_ATTN_V5_BANK: dict[int, int] = {}
+
+
+def _get_draft_attn_v5_lib():
+    global _DRAFT_ATTN_V5_LIB, _DRAFT_ATTN_V5_TRIED, _DRAFT_ATTN_V10_VER
+    if not _DRAFT_ATTN_V5_TRIED:
+        _DRAFT_ATTN_V5_TRIED = True
+        if _DRAFT_ATTN_V5 and os.path.isfile(_DRAFT_ATTN_V5_LIB_PATH):
+            try:
+                lib = ctypes.CDLL(_DRAFT_ATTN_V5_LIB_PATH)
+                lib.drafter_attn_v5_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int64,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_float,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                lib.drafter_attn_v5_fwd.restype = ctypes.c_int
+                ver_fn = getattr(lib, "drafter_attn_v10_version", None)
+                if ver_fn is not None:
+                    ver_fn.argtypes = []
+                    ver_fn.restype = ctypes.c_int
+                    _DRAFT_ATTN_V10_VER = int(ver_fn())
+                    print(
+                        f"[inkling-draft-attn-v10] loaded {_DRAFT_ATTN_V5_LIB_PATH} "
+                        f"(ver={_DRAFT_ATTN_V10_VER}, max_reqs={_DRAFT_ATTN_V5_MAX_REQS}, "
+                        f"b32_splits={_DRAFT_ATTN_V5_B32_SPLITS}, s48={int(_DRAFT_ATTN_V10_S48)})",
+                        flush=True,
+                    )
+                else:
+                    _DRAFT_ATTN_V10_VER = 5
+                    print(
+                        f"[inkling-draft-attn-v5] loaded {_DRAFT_ATTN_V5_LIB_PATH} "
+                        f"(max_reqs={_DRAFT_ATTN_V5_MAX_REQS}, b32_splits={_DRAFT_ATTN_V5_B32_SPLITS})",
+                        flush=True,
+                    )
+                _DRAFT_ATTN_V5_LIB = lib
+            except OSError:
+                _DRAFT_ATTN_V5_LIB = None
+                _DRAFT_ATTN_V10_VER = 0
+    return _DRAFT_ATTN_V5_LIB
+
+
+def prewarm_draft_attn_v5(device: torch.device) -> bool:
+    if not _DRAFT_ATTN_V5:
+        return False
+    lib = _get_draft_attn_v5_lib()
+    if lib is None:
+        return False
+    idx = int(device.index or 0)
+    if idx not in _DRAFT_ATTN_V5_WS:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        # 2-bank ping-pong [512, 6, 128] fp32 (1.50 MiB/bank): covers S*q_cap <= 512 across ALL B=1..32!
+        _DRAFT_ATTN_V5_WS[idx] = (
+            [
+                torch.empty((512, 6, 128), dtype=torch.float32, device=device),
+                torch.empty((512, 6, 128), dtype=torch.float32, device=device),
+            ],
+            [
+                torch.empty((512, 6), dtype=torch.float32, device=device),
+                torch.empty((512, 6), dtype=torch.float32, device=device),
+            ],
+            torch.zeros((32,), dtype=torch.int32, device=device),
+        )
+        _DRAFT_ATTN_V5_BANK[idx] = 0
+    return True
+
+
+_DRAFT_ATTN_V9_SPLITS = os.environ.get("INKLING_DRAFT_ATTN_V9_SPLITS", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+
+
+def _plan_draft_attn_v5_splits(num_reqs: int, is_local: bool) -> tuple[int, int]:
+    """Return `(num_splits, q_cap)` guaranteeing `num_splits * q_cap <= 512` and `num_reqs * 8 <= q_cap`."""
+    if num_reqs <= 1:
+        if _DRAFT_ATTN_V10_S48 and _DRAFT_ATTN_V10_VER >= 10 and not is_local:
+            # Wave-V10: full 48/48 GB10 SM saturation for B=1 Global drafter attention (48*8 = 384 <= 512 scratch!)
+            return 48, 8
+        if _DRAFT_ATTN_V9_SPLITS and is_local and _DRAFT_ATTN_C1_V4_SPLITS_LOCAL == 16:
+            # window=1032 has 17 KV tiles (64 tok/tile): S=17 gives 1 tile/CTA exact (eliminates S=16 2-tile straggler!)
+            return 17, 8
+        s = _DRAFT_ATTN_C1_V4_SPLITS_LOCAL if is_local else _DRAFT_ATTN_C1_V4_SPLITS_GLOBAL
+        return s, 8
+    if _C48_SPLIT_POLICY and 2 <= num_reqs <= 8:
+        # Exact 48-SM wave-balanced C=2..8 drafter splits (42..48 CTAs = 0 double-loaded SM tail,
+        # S * q_cap <= 384 <= 512 for every B=2..8!).
+        q_cap = num_reqs * 8
+        if num_reqs == 2:
+            return ((17 if _DRAFT_ATTN_V9_SPLITS else 16) if is_local else 24), q_cap
+        if num_reqs == 3:
+            return 16, q_cap
+        if num_reqs == 4:
+            return 12, q_cap
+        if num_reqs == 5:
+            return 9, q_cap
+        if num_reqs == 6:
+            # S=6 has same max 3 tiles/CTA as S=8 on window=1032 (17 tiles) with 25% less OP/LP merge traffic!
+            return (6 if _DRAFT_ATTN_V9_SPLITS else 8), q_cap
+        # B=7 (42 CTAs) and B=8 (48 CTAs exact): eliminates v5 S=8 56/64-CTA 2-CTA/SM wave tail!
+        return 6, q_cap
+    if num_reqs == 2:
+        return (8 if is_local else 16), 16
+    if num_reqs <= 4:
+        return (8 if is_local else 16), 32
+    if num_reqs <= 8:
+        return 8, 64
+    if num_reqs <= 16:
+        return 4, 128
+    return _DRAFT_ATTN_V5_B32_SPLITS, 256
+
+
+def _try_draft_block_attention_v5(
+    q, key_cache, value_cache, out, *, block_table, cache_seqlens, cu_seqlens_q, block, window
+) -> bool:
+    lib = _get_draft_attn_v5_lib()
+    if lib is None:
+        return False
+    num_reqs = int(cu_seqlens_q.shape[0] - 1)
+    if num_reqs <= 0 or num_reqs > _DRAFT_ATTN_V5_MAX_REQS or int(cache_seqlens.shape[0]) < num_reqs:
+        return False
+    T, H, D = q.shape
+    if (
+        T <= 0 or T > num_reqs * 8 or block <= 0 or block > 8 or H != 6 or D != 128
+        or key_cache.ndim != 4 or value_cache.ndim != 4
+        or key_cache.shape[2] != 1 or value_cache.shape[2] != 1
+        or q.dtype != torch.bfloat16 or key_cache.dtype != torch.bfloat16
+        or value_cache.dtype != torch.bfloat16 or out.dtype != torch.bfloat16
+        or block_table.dtype != torch.int32 or cache_seqlens.dtype != torch.int32
+        or cu_seqlens_q.dtype != torch.int32
+    ):
+        return False
+    out_3d = out.view(T, H, D)
+    if (
+        q.stride(2) != 1 or key_cache.stride(3) != 1
+        or value_cache.stride(3) != 1 or out_3d.stride(2) != 1
+    ):
+        return False
+    idx = int(q.device.index or 0)
+    ws = _DRAFT_ATTN_V5_WS.get(idx)
+    if ws is None:
+        if not prewarm_draft_attn_v5(q.device):
+            return False
+        ws = _DRAFT_ATTN_V5_WS[idx]
+    ops, lps, split_done = ws
+    bank = _DRAFT_ATTN_V5_BANK.get(idx, 0)
+    _DRAFT_ATTN_V5_BANK[idx] = bank ^ 1
+    is_local = bool(window and 0 < int(window) <= 2048)
+    n_splits, q_cap = _plan_draft_attn_v5_splits(num_reqs, is_local)
+    if T > q_cap:
+        return False
+    rc = lib.drafter_attn_v5_fwd(
+        q.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
+        block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+        ops[bank].data_ptr(), lps[bank].data_ptr(), split_done.data_ptr(), out_3d.data_ptr(),
+        q.stride(0), q.stride(1),
+        key_cache.stride(0), key_cache.stride(1),
+        value_cache.stride(0), value_cache.stride(1),
+        block_table.stride(0),
+        out_3d.stride(0), out_3d.stride(1),
+        float(D ** -0.5),
+        int(window or 0), int(key_cache.shape[1]), int(num_reqs), int(n_splits), int(q_cap),
+        1 if _DRAFT_PDL else 0,
+        int(torch.cuda.current_stream(q.device).cuda_stream),
+    )
+    return rc == 0
+
+
+# ---------------------------------------------------------------------------
+# C=1 v4 Single-Launch 6-Warp Fused Drafter Block-Attention (B == 1, T <= 8 ONLY)
+# Eliminates 3x KV reads (BM=16 -> mtiles=3) and all 5 separate `_merge_kernel`s.
+# Strictly opt-in via INKLING_DRAFT_ATTN_C1_V4=1; ZERO change to B >= 2 / C=32!
+# ---------------------------------------------------------------------------
+_DRAFT_ATTN_C1_V4 = os.environ.get("INKLING_DRAFT_ATTN_C1_V4", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_DRAFT_ATTN_C1_V4_LIB_PATH = os.environ.get(
+    "INKLING_DRAFT_ATTN_C1_V4_LIB", "/rdma/libdrafter_attn_c1_v4.so"
+)
+_DRAFT_ATTN_C1_V4_SPLITS_LOCAL = max(
+    1, min(32, int(os.environ.get("INKLING_DRAFT_ATTN_C1_V4_SPLITS_LOCAL", "16") or "16"))
+)
+_DRAFT_ATTN_C1_V4_SPLITS_GLOBAL = max(
+    1, min(32, int(os.environ.get("INKLING_DRAFT_ATTN_C1_V4_SPLITS_GLOBAL", "32") or "32"))
+)
+_DRAFT_ATTN_C1_V4_LIB = None
+_DRAFT_ATTN_C1_V4_TRIED = False
+_DRAFT_ATTN_C1_V4_WS: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_draft_attn_c1_v4_lib():
+    global _DRAFT_ATTN_C1_V4_LIB, _DRAFT_ATTN_C1_V4_TRIED
+    if not _DRAFT_ATTN_C1_V4_TRIED:
+        _DRAFT_ATTN_C1_V4_TRIED = True
+        if _DRAFT_ATTN_C1_V4 and os.path.isfile(_DRAFT_ATTN_C1_V4_LIB_PATH):
+            try:
+                lib = ctypes.CDLL(_DRAFT_ATTN_C1_V4_LIB_PATH)
+                lib.drafter_attn_c1_v4_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_float,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                lib.drafter_attn_c1_v4_fwd.restype = ctypes.c_int
+                _DRAFT_ATTN_C1_V4_LIB = lib
+                print(
+                    f"[inkling-draft-attn-c1-v4] loaded {_DRAFT_ATTN_C1_V4_LIB_PATH} "
+                    f"(splits local={_DRAFT_ATTN_C1_V4_SPLITS_LOCAL}, global={_DRAFT_ATTN_C1_V4_SPLITS_GLOBAL})",
+                    flush=True,
+                )
+            except OSError:
+                _DRAFT_ATTN_C1_V4_LIB = None
+    return _DRAFT_ATTN_C1_V4_LIB
+
+
+def prewarm_draft_attn_c1_v4(device: torch.device) -> bool:
+    if not _DRAFT_ATTN_C1_V4:
+        return False
+    lib = _get_draft_attn_c1_v4_lib()
+    if lib is None:
+        return False
+    idx = int(device.index or 0)
+    if idx not in _DRAFT_ATTN_C1_V4_WS:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        _DRAFT_ATTN_C1_V4_WS[idx] = (
+            torch.empty((32, 8, 6, 128), dtype=torch.float32, device=device),
+            torch.empty((32, 8, 6), dtype=torch.float32, device=device),
+            torch.zeros((1,), dtype=torch.int32, device=device),
+        )
+    return True
+
+
+def _try_draft_block_attention_c1_v4(
+    q, key_cache, value_cache, out, *, block_table, cache_seqlens, cu_seqlens_q, block, window
+) -> bool:
+    lib = _get_draft_attn_c1_v4_lib()
+    if lib is None:
+        return False
+    if int(cu_seqlens_q.shape[0] - 1) != 1:
+        return False
+    T, H, D = q.shape
+    if (
+        T <= 0 or T > 8 or block <= 0 or block > 8 or H != 6 or D != 128
+        or key_cache.ndim != 4 or value_cache.ndim != 4
+        or key_cache.shape[2] != 1 or value_cache.shape[2] != 1
+        or q.dtype != torch.bfloat16 or key_cache.dtype != torch.bfloat16
+        or value_cache.dtype != torch.bfloat16 or out.dtype != torch.bfloat16
+        or block_table.dtype != torch.int32 or cache_seqlens.dtype != torch.int32
+        or cu_seqlens_q.dtype != torch.int32
+    ):
+        return False
+    out_3d = out.view(T, H, D)
+    if (
+        q.stride(2) != 1 or key_cache.stride(3) != 1
+        or value_cache.stride(3) != 1 or out_3d.stride(2) != 1
+    ):
+        return False
+    idx = int(q.device.index or 0)
+    ws = _DRAFT_ATTN_C1_V4_WS.get(idx)
+    if ws is None:
+        if not prewarm_draft_attn_c1_v4(q.device):
+            return False
+        ws = _DRAFT_ATTN_C1_V4_WS[idx]
+    op, lp, split_done = ws
+    n_splits = (
+        _DRAFT_ATTN_C1_V4_SPLITS_LOCAL
+        if (window and 0 < int(window) <= 2048)
+        else _DRAFT_ATTN_C1_V4_SPLITS_GLOBAL
+    )
+    rc = lib.drafter_attn_c1_v4_fwd(
+        q.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
+        block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+        op.data_ptr(), lp.data_ptr(), split_done.data_ptr(), out_3d.data_ptr(),
+        q.stride(0), q.stride(1),
+        key_cache.stride(0), key_cache.stride(1),
+        value_cache.stride(0), value_cache.stride(1),
+        out_3d.stride(0), out_3d.stride(1),
+        float(D ** -0.5),
+        int(window or 0), int(key_cache.shape[1]), int(n_splits),
+        0,  # Legacy c1_v4 has pre-V9 #206 PDL launch-at-entry hazard; force pdl=0!
+        int(torch.cuda.current_stream(q.device).cuda_stream),
+    )
+    return rc == 0
+
+
 def draft_block_attention(q, key_cache, value_cache, out, *, block_table,
                           cache_seqlens, cu_seqlens_q, block, window, num_splits):
     """SM12x drop-in for ops.attention.block_decode_attention: bf16 ``out``
     ``(T, H * D)``; each ``block``-token request sees its keys up to the last
     one, or the last ``window`` of them if ``window``."""
+    if _DRAFT_ATTN_V5 and _try_draft_block_attention_v5(
+        q, key_cache, value_cache, out,
+        block_table=block_table, cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q, block=block, window=window,
+    ):
+        return
+    if _DRAFT_ATTN_C1_V4 and _try_draft_block_attention_c1_v4(
+        q, key_cache, value_cache, out,
+        block_table=block_table, cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q, block=block, window=window,
+    ):
+        return
     T, H, D = q.shape
     lse = torch.empty((H, T), dtype=torch.float32, device=q.device)
     rel_attention(
@@ -1278,6 +2062,149 @@ _PF_LOCAL_OTF_LIB_PATH = os.environ.get(
 )
 _PF_LOCAL_OTF_LIB = None
 _PF_LOCAL_OTF_TRIED = False
+
+# Wave-V10 opt-in FP8 P@V attention v6 (`libpf_fp8_attn_v6.so`, default OFF!)
+# Strictly gated to eager prefill `max_seqlen_q >= 1024` & `!capturing` so Warm-1M
+# (`qlen=436`) stays on `v5_zspill` + BF16 OTF and decode (`M <= 128`) is 100% untouched.
+_PF_FP8_ATTN_V6 = os.environ.get("INKLING_PF_FP8_ATTN_V6", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
+_PF_FP8_ATTN_V6_LIB_PATH = os.environ.get(
+    "INKLING_PF_FP8_ATTN_V6_LIB", "/rdma/libpf_fp8_attn_v6.so"
+).strip()
+_PF_FP8_PV_F16_ACC = os.environ.get("INKLING_PF_FP8_PV_F16_ACC", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
+_PF_FP8_ATTN_V6_MIN_Q = max(
+    int(os.environ.get("INKLING_PF_FP8_ATTN_V6_MIN_Q", "1024") or "1024"), 1024
+)
+_PF_FP8_ATTN_V6_LIB = None
+_PF_FP8_ATTN_V6_TRIED = False
+_KV_BF12_PREFILL_RESOLVER = None
+
+
+def register_kv_bf12_prefill_resolver(fn) -> None:
+    """Register a KV-BF12 prefill unpack hook (e.g. `libkv_bf12_paged_v10.so`):
+    `fn(key_cache, value_cache, block_table, cache_seqlens, *, need_k, need_v, window, cu_seqlens_q, max_seqlen_q)`
+    returning `(bf16_k_or_none, bf16_v_or_none, resolved_bt)`."""
+    global _KV_BF12_PREFILL_RESOLVER
+    _KV_BF12_PREFILL_RESOLVER = fn
+
+
+def get_kv_bf12_prefill_resolver():
+    return _KV_BF12_PREFILL_RESOLVER
+
+
+def is_kv_bf12_cache(cache: torch.Tensor | None) -> bool:
+    """Detect single-pool KV-BF12 cache tensors: `(NBLK, Hkv, 256, 198)` bf16 or `uint8` `shape[-1]==396`."""
+    if cache is None:
+        return False
+    if bool(getattr(cache, "_inkling_kv_bf12", False)):
+        return True
+    if cache.dtype == torch.uint8:
+        return True
+    return cache.ndim >= 2 and int(cache.shape[-1]) in (198, 396)
+
+
+def _ensure_kv_bf12_prefill_resolver() -> None:
+    if _KV_BF12_PREFILL_RESOLVER is not None:
+        return
+    try:
+        from . import sm12_attn_fused as _sm12_f
+        if hasattr(_sm12_f, "ensure_kv_bf12_prefill_resolver_registered"):
+            _sm12_f.ensure_kv_bf12_prefill_resolver_registered()
+    except Exception:
+        pass
+
+
+def resolve_kv_bf12_for_prefill(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    need_k: bool = True,
+    need_v: bool = True,
+    window: int = -1,
+    cu_seqlens_q: torch.Tensor | None = None,
+    max_seqlen_q: int = 0,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    if not (is_kv_bf12_cache(key_cache) or is_kv_bf12_cache(value_cache)):
+        return key_cache, value_cache, block_table
+    _ensure_kv_bf12_prefill_resolver()
+    resolver = _KV_BF12_PREFILL_RESOLVER
+    if resolver is None:
+        return None, None, None
+    return resolver(
+        key_cache,
+        value_cache,
+        block_table,
+        cache_seqlens,
+        need_k=need_k,
+        need_v=need_v,
+        window=window,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+    )
+
+
+def get_pf_fp8_attn_v6_lib():
+    """Lazily load compiled SM121a `libpf_fp8_attn_v6.so` (strictly opt-in via INKLING_PF_FP8_ATTN_V6=1)."""
+    global _PF_FP8_ATTN_V6_LIB, _PF_FP8_ATTN_V6_TRIED
+    if not _PF_FP8_ATTN_V6:
+        return None
+    if not _PF_FP8_ATTN_V6_TRIED:
+        _PF_FP8_ATTN_V6_TRIED = True
+        if _PF_FP8_ATTN_V6_LIB_PATH and os.path.exists(_PF_FP8_ATTN_V6_LIB_PATH):
+            lib = ctypes.CDLL(_PF_FP8_ATTN_V6_LIB_PATH)
+            lib.pf_fp8_attn_v6_version.argtypes = []
+            lib.pf_fp8_attn_v6_version.restype = ctypes.c_int
+            lib.local_swa_fp8_otf_rel_v6_sm121_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                ctypes.c_uint64,
+            ]
+            lib.local_swa_fp8_otf_rel_v6_sm121_fwd.restype = ctypes.c_int
+            lib.global_tail_fp8_otf_rel_v6_sm121_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                ctypes.c_uint64,
+            ]
+            lib.global_tail_fp8_otf_rel_v6_sm121_fwd.restype = ctypes.c_int
+            _PF_FP8_ATTN_V6_LIB = lib
+            print(
+                f"[inkling-pf-fp8-v6] loaded {_PF_FP8_ATTN_V6_LIB_PATH} "
+                f"(ver={lib.pf_fp8_attn_v6_version()}, pv_f16={int(_PF_FP8_PV_F16_ACC)}, "
+                f"min_q={_PF_FP8_ATTN_V6_MIN_Q})",
+                flush=True,
+            )
+    return _PF_FP8_ATTN_V6_LIB
 
 
 def get_local_otf_rel_lib():
@@ -1331,8 +2258,21 @@ def local_swa_otf_rel_prefill(
     rel_threshold: float,
     clip_eps: float = 1e-6,
 ) -> bool:
+    use_v6 = (
+        _PF_FP8_ATTN_V6
+        and int(max_seqlen_q) >= _PF_FP8_ATTN_V6_MIN_Q
+        and not torch.cuda.is_current_stream_capturing()
+    )
+    v6_lib = get_pf_fp8_attn_v6_lib() if use_v6 else None
     lib = get_local_otf_rel_lib()
-    if lib is None:
+    if v6_lib is None and lib is None:
+        return False
+    key_cache, value_cache, block_table = resolve_kv_bf12_for_prefill(
+        key_cache, value_cache, block_table, cache_seqlens,
+        need_k=True, need_v=True, window=window,
+        cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q,
+    )
+    if key_cache is None or value_cache is None or block_table is None:
         return False
     T, H, D = q.shape
     Hkv = key_cache.shape[2]
@@ -1348,6 +2288,27 @@ def local_swa_otf_rel_prefill(
     ):
         return False
     num_reqs = int(cu_seqlens_q.shape[0] - 1)
+    stream_u64 = int(torch.cuda.current_stream(q.device).cuda_stream)
+    if v6_lib is not None:
+        rc6 = v6_lib.local_swa_fp8_otf_rel_v6_sm121_fwd(
+            q.data_ptr(), r.data_ptr(), r_scale.data_ptr(), rel_proj_t.data_ptr(),
+            key_cache.data_ptr(), value_cache.data_ptr(),
+            block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+            gate.data_ptr(), sinks.data_ptr(), result.data_ptr(), 0, 0,
+            q.stride(0), q.stride(1), r.stride(0), r.stride(1),
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+            block_table.stride(0), gate.stride(0), sinks.stride(0), result.stride(0),
+            0, 0, 0, 0,
+            num_reqs, int(max_seqlen_q), int(H), int(H // Hkv),
+            int(BS), int(window), int(E), int(_PF_FP8_PV_F16_ACC),
+            float(softmax_scale * LOG2E), float(rel_threshold), float(clip_eps),
+            stream_u64,
+        )
+        if rc6 == 0:
+            return True
+    if lib is None:
+        return False
     rc = lib.local_swa_otf_rel_bf16_sm121_fwd(
         q.data_ptr(), r.data_ptr(), r_scale.data_ptr(), rel_proj_t.data_ptr(),
         key_cache.data_ptr(), value_cache.data_ptr(),
@@ -1431,20 +2392,16 @@ def can_global_otf_rel_prefill(
     gate: torch.Tensor,
     sinks: torch.Tensor,
     result: torch.Tensor,
+    *, kv_bf12: bool = False,
 ) -> bool:
     """Fast shape/alignment check BEFORE skipping rel_logits in attention_prologue."""
-    BS = key_cache.shape[1]
-    return (
+    base_ok = (
         q.shape[2] == 128
         and r.shape[2] == 16
-        and BS >= 64
-        and (BS % 64) == 0
         and q.dtype == torch.bfloat16
         and r.dtype == torch.bfloat16
         and rel_proj_t.dtype == torch.bfloat16
         and rel_proj_t.is_contiguous()
-        and key_cache.dtype == torch.bfloat16
-        and value_cache.dtype == torch.bfloat16
         and gate.dtype == torch.bfloat16
         and sinks.dtype == torch.bfloat16
         and result.dtype == torch.bfloat16
@@ -1454,9 +2411,27 @@ def can_global_otf_rel_prefill(
         and gate.stride(1) == 1
         and sinks.stride(1) == 1
         and result.stride(1) == 1
+        and (q.data_ptr() & 15) == 0
+    )
+    if not base_ok:
+        return False
+    if kv_bf12 or is_kv_bf12_cache(key_cache) or is_kv_bf12_cache(value_cache):
+        _ensure_kv_bf12_prefill_resolver()
+        if _KV_BF12_PREFILL_RESOLVER is not None:
+            return True
+        from . import sm12_attn_fused as _sm12_f
+        return (
+            (_sm12_f.is_kv_bf12_cache(key_cache) or _sm12_f.is_kv_bf12_cache(value_cache))
+            and _sm12_f.get_kv_bf12_paged_lib() is not None
+        )
+    BS = key_cache.shape[1]
+    return (
+        BS >= 64
+        and (BS % 64) == 0
+        and key_cache.dtype == torch.bfloat16
+        and value_cache.dtype == torch.bfloat16
         and key_cache.stride(3) == 1
         and value_cache.stride(3) == 1
-        and (q.data_ptr() & 15) == 0
         and (key_cache.data_ptr() & 15) == 0
         and (value_cache.data_ptr() & 15) == 0
     )
@@ -1483,22 +2458,42 @@ def global_otf_rel_prefill(
     clip_eps: float = 1e-6,
     seq_lens_cpu=None,
     query_lens_cpu=None,
+    kv_bf12_cache=None,
+    kv_bf12_emerg=None,
 ) -> bool:
     """Full global prefill path with ZERO rel_logits allocation and ZERO _rel_prefill_kernel:
-      - When past >= MIN_PAST and Sage2 v3/v4 is active: runs Sage2 prefix -> CUDA OTF tail merge.
-      - When past < MIN_PAST (e.g. chunk 0) or Sage2 unavailable: runs CUDA OTF full causal BF16!"""
+      - When past >= MIN_PAST and Sage2 v3/v4/v6 is active: runs Sage2 prefix -> CUDA OTF tail merge.
+      - When past < MIN_PAST (e.g. chunk 0) or Sage2 unavailable: runs CUDA OTF full causal (v6 FP8 or BF16)!
+      - Composes seamlessly with KV-BF12 (both explicit `kv_bf12_cache` 3-stage minimal-VRAM staging
+        and registered `resolve_kv_bf12_for_prefill` for 198-bf16 / 396-u8 views)."""
+    use_v6 = (
+        _PF_FP8_ATTN_V6
+        and int(max_seqlen_q) >= _PF_FP8_ATTN_V6_MIN_Q
+        and not torch.cuda.is_current_stream_capturing()
+    )
+    v6_lib = get_pf_fp8_attn_v6_lib() if use_v6 else None
     tail_lib = get_global_tail_otf_rel_lib()
-    if tail_lib is None:
+    if v6_lib is None and tail_lib is None:
         return False
+    use_kv_bf12 = kv_bf12_cache is not None and kv_bf12_emerg is not None
+    if not use_kv_bf12 and (is_kv_bf12_cache(key_cache) or is_kv_bf12_cache(value_cache)):
+        key_cache, value_cache, block_table = resolve_kv_bf12_for_prefill(
+            key_cache, value_cache, block_table, cache_seqlens,
+            need_k=True, need_v=True, window=-1,
+            cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q,
+        )
+        if key_cache is None or value_cache is None or block_table is None:
+            return False
     if not can_global_otf_rel_prefill(
-        q, r, tau, rel_proj_t, key_cache, value_cache, gate, sinks, result
+        q, r, tau, rel_proj_t, key_cache, value_cache, gate, sinks, result,
+        kv_bf12=use_kv_bf12,
     ):
         return False
 
     T, H, D = q.shape
-    Hkv = key_cache.shape[2]
+    Hkv = int(kv_bf12_cache.shape[1]) if use_kv_bf12 else int(key_cache.shape[2])
     G = H // Hkv
-    BS = key_cache.shape[1]
+    BS = 256 if use_kv_bf12 else int(key_cache.shape[1])
     E = rel_proj_t.shape[0]
     num_reqs = int(cu_seqlens_q.shape[0] - 1)
     if seq_lens_cpu is not None and len(seq_lens_cpu) >= num_reqs and num_reqs > 0:
@@ -1510,9 +2505,15 @@ def global_otf_rel_prefill(
     prefix_bm = 64
     prefix_bn = _PF_GLOBAL_TAIL_OTF_BN
 
+    _warm_q_ok = (
+        _PF_GLOBAL_WARM_MIN_QLEN >= 64
+        and max_seqlen_q >= _PF_GLOBAL_WARM_MIN_QLEN
+        and (max_seq - max_seqlen_q) >= max(_PF_GLOBAL_MIN_PAST, _PF_GLOBAL_WARM_MIN_PAST)
+        and not torch.cuda.is_current_stream_capturing()
+    )
     if (
         _PF_GLOBAL_ENABLED
-        and max_seqlen_q >= _PF_GLOBAL_MIN_QLEN
+        and (max_seqlen_q >= _PF_GLOBAL_MIN_QLEN or _warm_q_ok)
         and (max_seq - max_seqlen_q) >= _PF_GLOBAL_MIN_PAST
         and _PF_GLOBAL_MODE == "fp8_sage2_cuda_v3"
     ):
@@ -1522,23 +2523,95 @@ def global_otf_rel_prefill(
             key_cache, block_table, cache_seqlens, cu_seqlens_q, num_reqs, BS, _gmod,
             is_v3=True, with_kmax=(_PF_GLOBAL_TOPK > 0),
             seq_lens_cpu=seq_lens_cpu, query_lens_cpu=query_lens_cpu,
+            kv_bf12_cache=kv_bf12_cache if use_kv_bf12 else None,
+            kv_bf12_emerg=kv_bf12_emerg if use_kv_bf12 else None,
         )
-        prefix_res = _gmod.launch_global_sage2_prefix_v3_only(
-            q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q,
-            max_seqlen_q, softmax_scale, E, G, BS, H, D, num_reqs,
-            pv_skip_tau=_PF_GLOBAL_TAU,
-            bn=_PF_GLOBAL_BN,
-            min_ctas=_PF_GLOBAL_MIN_CTAS,
-            topk_tokens=_PF_GLOBAL_TOPK,
-            cuda_lib_path=_resolve_pf_global_lib(),
-            k_fp8_cache=k_fp8,
-            k_scale64_cache=k_scale64,
-            k_mid_cache=k_mid,
-            k_rad_cache=k_rad,
-            max_seq=max_seq,
-            k_bt=k_bt,
-            k_bt_mode=k_bt_mode,
-        )
+        prefix_res = None
+        if use_kv_bf12:
+            from . import sm12_attn_fused as _sm12_f
+            _, v_prefix_stage, bt_prefix_v = _sm12_f.kv_bf12_stage_active_blocks(
+                kv_bf12_cache, kv_bf12_emerg, block_table, cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q, window=-1, unpack_k=False, unpack_v=True,
+                seq_lens_cpu=seq_lens_cpu, query_lens_cpu=query_lens_cpu,
+            )
+            # If non-compact Shadow-K (k_bt_mode==0), pass original physical block_table via k_bt_mode=2
+            # so v5/v6 reads K from physical block IDs and V from dense remapped `bt_prefix_v`!
+            eff_k_bt = block_table if (k_bt_mode == 0 and k_fp8 is not None) else k_bt
+            eff_k_bt_mode = 2 if (k_bt_mode == 0 and k_fp8 is not None) else k_bt_mode
+            if v6_lib is not None:
+                prefix_res = _gmod.launch_global_sage2_prefix_v3_only(
+                    q, key_cache, v_prefix_stage, bt_prefix_v, cache_seqlens, cu_seqlens_q,
+                    max_seqlen_q, softmax_scale, E, G, BS, H, D, num_reqs,
+                    pv_skip_tau=_PF_GLOBAL_TAU,
+                    bn=_PF_GLOBAL_BN,
+                    min_ctas=_PF_GLOBAL_MIN_CTAS,
+                    topk_tokens=_PF_GLOBAL_TOPK,
+                    cuda_lib_path=_PF_FP8_ATTN_V6_LIB_PATH,
+                    k_fp8_cache=k_fp8,
+                    k_scale64_cache=k_scale64,
+                    k_mid_cache=k_mid,
+                    k_rad_cache=k_rad,
+                    max_seq=max_seq,
+                    k_bt=eff_k_bt,
+                    k_bt_mode=eff_k_bt_mode,
+                    use_v6_fp8=True,
+                    pv_f16_acc=_PF_FP8_PV_F16_ACC,
+                )
+            if prefix_res is None:
+                prefix_res = _gmod.launch_global_sage2_prefix_v3_only(
+                    q, key_cache, v_prefix_stage, bt_prefix_v, cache_seqlens, cu_seqlens_q,
+                    max_seqlen_q, softmax_scale, E, G, BS, H, D, num_reqs,
+                    pv_skip_tau=_PF_GLOBAL_TAU,
+                    bn=_PF_GLOBAL_BN,
+                    min_ctas=_PF_GLOBAL_MIN_CTAS,
+                    topk_tokens=_PF_GLOBAL_TOPK,
+                    cuda_lib_path=_resolve_pf_global_lib(),
+                    k_fp8_cache=k_fp8,
+                    k_scale64_cache=k_scale64,
+                    k_mid_cache=k_mid,
+                    k_rad_cache=k_rad,
+                    max_seq=max_seq,
+                    k_bt=eff_k_bt,
+                    k_bt_mode=eff_k_bt_mode,
+                )
+            del v_prefix_stage, bt_prefix_v
+        else:
+            if v6_lib is not None:
+                prefix_res = _gmod.launch_global_sage2_prefix_v3_only(
+                    q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q,
+                    max_seqlen_q, softmax_scale, E, G, BS, H, D, num_reqs,
+                    pv_skip_tau=_PF_GLOBAL_TAU,
+                    bn=_PF_GLOBAL_BN,
+                    min_ctas=_PF_GLOBAL_MIN_CTAS,
+                    topk_tokens=_PF_GLOBAL_TOPK,
+                    cuda_lib_path=_PF_FP8_ATTN_V6_LIB_PATH,
+                    k_fp8_cache=k_fp8,
+                    k_scale64_cache=k_scale64,
+                    k_mid_cache=k_mid,
+                    k_rad_cache=k_rad,
+                    max_seq=max_seq,
+                    k_bt=k_bt,
+                    k_bt_mode=k_bt_mode,
+                    use_v6_fp8=True,
+                    pv_f16_acc=_PF_FP8_PV_F16_ACC,
+                )
+            if prefix_res is None:
+                prefix_res = _gmod.launch_global_sage2_prefix_v3_only(
+                    q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q,
+                    max_seqlen_q, softmax_scale, E, G, BS, H, D, num_reqs,
+                    pv_skip_tau=_PF_GLOBAL_TAU,
+                    bn=_PF_GLOBAL_BN,
+                    min_ctas=_PF_GLOBAL_MIN_CTAS,
+                    topk_tokens=_PF_GLOBAL_TOPK,
+                    cuda_lib_path=_resolve_pf_global_lib(),
+                    k_fp8_cache=k_fp8,
+                    k_scale64_cache=k_scale64,
+                    k_mid_cache=k_mid,
+                    k_rad_cache=k_rad,
+                    max_seq=max_seq,
+                    k_bt=k_bt,
+                    k_bt_mode=k_bt_mode,
+                )
         if prefix_res is not None:
             acc_buf, m_buf, l_buf, prefix_bm, prefix_bn = prefix_res
 
@@ -1546,15 +2619,64 @@ def global_otf_rel_prefill(
     if tail_bn not in (32, 64) or (prefix_bn % tail_bn) != 0:
         tail_bn = 64 if (prefix_bn % 64) == 0 else 32
 
+    if use_kv_bf12:
+        from . import sm12_attn_fused as _sm12_f
+        tail_win = (int(E) + int(BS)) if acc_buf is not None else -1
+        k_tail, v_tail, bt_tail = _sm12_f.kv_bf12_stage_active_blocks(
+            kv_bf12_cache, kv_bf12_emerg, block_table, cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q, window=tail_win, unpack_k=True, unpack_v=True,
+            seq_lens_cpu=seq_lens_cpu, query_lens_cpu=query_lens_cpu,
+        )
+    else:
+        k_tail, v_tail, bt_tail = key_cache, value_cache, block_table
+
+    stream_u64 = int(torch.cuda.current_stream(q.device).cuda_stream)
+    if v6_lib is not None:
+        rc6 = v6_lib.global_tail_fp8_otf_rel_v6_sm121_fwd(
+            q.data_ptr(),
+            r.data_ptr(),
+            r_scale.data_ptr(),
+            tau.data_ptr() if tau is not None else 0,
+            rel_proj_t.data_ptr(),
+            k_tail.data_ptr(),
+            v_tail.data_ptr(),
+            bt_tail.data_ptr(),
+            cache_seqlens.data_ptr(),
+            cu_seqlens_q.data_ptr(),
+            acc_buf.data_ptr() if acc_buf is not None else 0,
+            m_buf.data_ptr() if m_buf is not None else 0,
+            l_buf.data_ptr() if l_buf is not None else 0,
+            gate.data_ptr(),
+            sinks.data_ptr(),
+            result.data_ptr(),
+            0,
+            0,
+            q.stride(0), q.stride(1),
+            r.stride(0), r.stride(1),
+            k_tail.stride(0), k_tail.stride(1), k_tail.stride(2),
+            v_tail.stride(0), v_tail.stride(1), v_tail.stride(2),
+            bt_tail.stride(0),
+            gate.stride(0), sinks.stride(0), result.stride(0),
+            0, 0, 0, 0,
+            num_reqs, int(max_seqlen_q), int(H), int(G),
+            int(BS), int(E),
+            int(prefix_bm), int(prefix_bn), int(tail_bn), int(_PF_FP8_PV_F16_ACC),
+            float(softmax_scale * LOG2E), float(rel_threshold), float(clip_eps),
+            stream_u64,
+        )
+        if rc6 == 0:
+            return True
+    if tail_lib is None:
+        return False
     rc = tail_lib.global_tail_otf_rel_bf16_sm121_fwd(
         q.data_ptr(),
         r.data_ptr(),
         r_scale.data_ptr(),
         tau.data_ptr() if tau is not None else 0,
         rel_proj_t.data_ptr(),
-        key_cache.data_ptr(),
-        value_cache.data_ptr(),
-        block_table.data_ptr(),
+        k_tail.data_ptr(),
+        v_tail.data_ptr(),
+        bt_tail.data_ptr(),
         cache_seqlens.data_ptr(),
         cu_seqlens_q.data_ptr(),
         acc_buf.data_ptr() if acc_buf is not None else 0,
@@ -1567,15 +2689,15 @@ def global_otf_rel_prefill(
         0,
         q.stride(0), q.stride(1),
         r.stride(0), r.stride(1),
-        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
-        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-        block_table.stride(0),
+        k_tail.stride(0), k_tail.stride(1), k_tail.stride(2),
+        v_tail.stride(0), v_tail.stride(1), v_tail.stride(2),
+        bt_tail.stride(0),
         gate.stride(0), sinks.stride(0), result.stride(0),
         0, 0, 0, 0,
         num_reqs, int(max_seqlen_q), int(H), int(G),
         int(BS), int(E),
         int(prefix_bm), int(prefix_bn), int(tail_bn),
         float(softmax_scale * LOG2E), float(rel_threshold), float(clip_eps),
-        int(torch.cuda.current_stream(q.device).cuda_stream),
+        stream_u64,
     )
     return rc == 0

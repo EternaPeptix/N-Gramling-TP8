@@ -160,11 +160,21 @@ _DRAFT_FP8_HIGH_M = os.environ.get("INKLING_DRAFT_FP8_HIGH_M", "0").strip().lowe
     "0", "", "off", "false", "no"
 )
 _DRAFT_FP8_HIGH_M_MIN = int(os.environ.get("INKLING_DRAFT_FP8_HIGH_M_MIN", "96") or "96")
+# Decoupled lm_head high-M FP8 threshold (default = _DRAFT_FP8_HIGH_M_MIN; set to 65 in V5):
+# At B=22..31 (`k_run=3`), `hidden_in` has `M_head = 66..93 < 96`, where `_u4_panel_mt_kernel`
+# (`BM=64, m_tiles=2`) read `2 x 72.4 = 144.7 MB` vs 1-pass FP8 TC `115.8 MB`!
+_DRAFT_FP8_HIGH_M_HEAD_MIN = int(
+    os.environ.get("INKLING_DRAFT_FP8_HIGH_M_HEAD_MIN", str(_DRAFT_FP8_HIGH_M_MIN))
+    or str(_DRAFT_FP8_HIGH_M_MIN)
+)
 _DRAFT_FP8_HIGH_M_HEAD = os.environ.get("INKLING_DRAFT_FP8_HIGH_M_HEAD", "1").strip().lower() not in (
     "0", "", "off", "false", "no"
 )
 _L2PF_DRAFT_MAX_M = int(os.environ.get("INKLING_L2PF_DRAFT_MAX_M", "32") or "32")
 _L2PF_DRAFT_ATTN_MAX_M = int(os.environ.get("INKLING_L2PF_DRAFT_ATTN_MAX_M", "16") or "16")
+_PF_TRIM_DRAFT_CTXKV = os.environ.get("INKLING_PF_TRIM_DRAFT_CTXKV", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
 _DRAFT_FP8_HI_CAP: tuple[str, bool] | None = None
 
 
@@ -208,27 +218,18 @@ def _can_fp8_high_m(x: torch.Tensor, module: nn.Module) -> bool:
     )
 
 
-def _fp8_high_m_linear(
-    x: torch.Tensor,
+def _fp8_high_m_from_quant(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    m: int,
     w_fp8_t: torch.Tensor,
     w_scale: torch.Tensor,
     n_orig: int,
+    supports_out: bool,
     out: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    cap = _DRAFT_FP8_HI_CAP
-    if cap is None:
-        if torch.cuda.is_current_stream_capturing():
-            return None
-        cap = _ensure_draft_fp8_hi_cap(x.device)
-    mode, supports_out = cap
-    if mode != "rowwise":
-        return None
-    from .ops.linear import quantize_fp8_rowwise
-
-    m = int(x.shape[0])
-    m_pad = (m + 15) & ~15
+) -> torch.Tensor:
+    m_pad = int(x_fp8.shape[0])
     n_pad = int(w_fp8_t.shape[1])
-    x_fp8, x_scale = quantize_fp8_rowwise(x, pad_m16=True)
     can_direct_out = (
         out is not None
         and supports_out
@@ -255,8 +256,52 @@ def _fp8_high_m_linear(
     return res
 
 
+def _fp8_high_m_linear(
+    x: torch.Tensor,
+    w_fp8_t: torch.Tensor,
+    w_scale: torch.Tensor,
+    n_orig: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    cap = _DRAFT_FP8_HI_CAP
+    if cap is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        cap = _ensure_draft_fp8_hi_cap(x.device)
+    mode, supports_out = cap
+    if mode != "rowwise":
+        return None
+    m = int(x.shape[0])
+    q_v7 = (
+        dspark_ops.quantize_fp8_rowwise_v7(x, pad_m16=True, pdl=_DRAFT_PDL)
+        if dspark_ops.v7_fp8_quant_ready(x.device)
+        else None
+    )
+    if q_v7 is not None:
+        x_fp8, x_scale = q_v7
+    else:
+        from .ops.linear import quantize_fp8_rowwise
+        x_fp8, x_scale = quantize_fp8_rowwise(x, pad_m16=True)
+    return _fp8_high_m_from_quant(
+        x_fp8, x_scale, m, w_fp8_t, w_scale, n_orig, supports_out, out=out
+    )
+
+
+_RAR_MOD_CACHE = None
+
+
+def _get_rar_mod():
+    global _RAR_MOD_CACHE
+    m = _RAR_MOD_CACHE
+    if m is None:
+        from vllm.distributed.device_communicators import rdma_all_reduce as m
+
+        _RAR_MOD_CACHE = m
+    return m
+
+
 def _draft_sbuf(shape, dtype: torch.dtype):
-    from vllm.distributed.device_communicators.rdma_all_reduce import get_send_buffer
+    get_send_buffer = _get_rar_mod().get_send_buffer
     try:
         return get_send_buffer(shape, dtype, domain=1)
     except TypeError:
@@ -318,13 +363,21 @@ _DRAFT_AR_MODE = os.environ.get(
     "INKLING_DRAFT_AR_MODE", "int8" if _DRAFT_AR_INT8 else "bf16"
 ).strip().lower()
 _DRAFT_AR_C32_MODE = os.environ.get("INKLING_DRAFT_AR_C32_MODE", "off").strip().lower()
+# Wave-V12 opt-in (default OFF): optional low-M drafter AR mode override (e.g. h64_q4 @ M=16 for 1-shot Dual-QP!)
+_DRAFT_AR_C18_MODE = os.environ.get("INKLING_DRAFT_AR_C18_MODE", "").strip().lower()
+_DRAFT_AR_C18_MAX_M = max(8, min(64, int(os.environ.get("INKLING_DRAFT_AR_C18_MAX_M", "16") or "16")))
 
 
 def all_reduce_add_rmsnorm(
     x: torch.Tensor, residual: torch.Tensor, norm: _RMSNorm, out_h64: bool = False,
 ) -> torch.Tensor:
     """In place: ``residual += all_reduce(x); x = norm(residual)``."""
-    if _DRAFT_FUSED_AR_NORM or (_DRAFT_AR_C32_MODE not in ("", "0", "off", "false", "no", "bf16") and x.shape[0] >= 16):
+    _eff_c32_mode = (
+        _DRAFT_AR_C18_MODE
+        if (_DRAFT_AR_C18_MODE not in ("", "0", "off", "false", "no") and 16 <= x.shape[0] <= _DRAFT_AR_C18_MAX_M)
+        else _DRAFT_AR_C32_MODE
+    )
+    if _DRAFT_FUSED_AR_NORM or (_eff_c32_mode not in ("", "0", "off", "false", "no", "bf16") and x.shape[0] >= 16):
         rdma_comm = getattr(get_tp_group().device_communicator, "rdma_comm", None)
         if rdma_comm is not None and hasattr(rdma_comm, "all_reduce_add_rmsnorm"):
             try:
@@ -333,7 +386,7 @@ def all_reduce_add_rmsnorm(
                     use_int8=(_DRAFT_AR_MODE == "int8"),
                     ar_mode=_DRAFT_AR_MODE,
                     out_h64=out_h64,
-                    c32_mode=_DRAFT_AR_C32_MODE,
+                    c32_mode=_eff_c32_mode,
                 )
             except TypeError:
                 out = (
@@ -680,7 +733,29 @@ class Inkling2DraftMLP(nn.Module):
                 pdl=_DRAFT_PDL,
             )
         else:
-            x = silu_and_mul(_dlinear(x, self.gate_up_proj))
+            gu = _dlinear(x, self.gate_up_proj)
+            if (
+                use_fp8_hi
+                and getattr(self.down_proj, "fp8_hi_wt", None) is not None
+                and gu.dim() == 2
+                and gu.shape[0] >= _DRAFT_FP8_HIGH_M_MIN
+                and ((gu.shape[1] // 2) & 15) == 0
+                and dspark_ops.v7_fp8_quant_ready(gu.device)
+            ):
+                cap = _DRAFT_FP8_HI_CAP
+                if cap is None and not torch.cuda.is_current_stream_capturing():
+                    cap = _ensure_draft_fp8_hi_cap(gu.device)
+                if cap is not None and cap[0] == "rowwise":
+                    q_fused = dspark_ops.silu_mul_quant_fp8_v7(gu, pad_m16=True, pdl=_DRAFT_PDL)
+                    if q_fused is not None:
+                        sbuf = _draft_sbuf((gu.shape[0], self.down_proj.weight.shape[0]), gu.dtype)
+                        y_dp = _fp8_high_m_from_quant(
+                            q_fused[0], q_fused[1], int(gu.shape[0]),
+                            self.down_proj.fp8_hi_wt, self.down_proj.fp8_hi_sc,
+                            self.down_proj.fp8_hi_n, cap[1], out=sbuf,
+                        )
+                        return y_dp
+            x = silu_and_mul(gu)
         sbuf = _draft_sbuf((x.shape[0], self.down_proj.weight.shape[0]), x.dtype)
         return _dlinear(x, self.down_proj, out=sbuf)
 
@@ -910,6 +985,7 @@ class _CtxOverlapSchedule:
         "n_layers",
         "forked",
         "joined",
+        "_ctx_5l",
     )
 
     def __init__(
@@ -934,6 +1010,7 @@ class _CtxOverlapSchedule:
         self.n_layers = len(decoder.layers)
         self.forked = [False] * (self.n_layers + 1)
         self.joined = [False] * (self.n_layers + 1)
+        self._ctx_5l: torch.Tensor | None = None
 
     def fork_layer(self, idx: int) -> None:
         if self.forked[idx]:
@@ -944,7 +1021,22 @@ class _CtxOverlapSchedule:
         self.stream.wait_event(self.ev_in[idx])
         with torch.cuda.stream(self.stream):
             layer = self.decoder.layers[idx]
-            context = self.decoder.mix(self.context_states, idx, layer.dflare_norm)
+            if idx == 0 and self._ctx_5l is None and self.n_layers == 5 and dspark_ops.v7_mix5_ready(self.context_states.device):
+                sm0 = self.context_slots[0] if len(self.context_slots) == 5 else None
+                sm_shared = (
+                    sm0
+                    if (
+                        sm0 is not None
+                        and all(s is not None and s.data_ptr() == sm0.data_ptr() for s in self.context_slots)
+                    )
+                    else None
+                )
+                self._ctx_5l = self.decoder.mix_5layer(self.context_states, slot_map=sm_shared)
+            context = (
+                self._ctx_5l[idx]
+                if self._ctx_5l is not None
+                else self.decoder.mix(self.context_states, idx, layer.dflare_norm)
+            )
             layer.self_attn.store_context_kv(
                 context,
                 self.context_positions,
@@ -1034,6 +1126,18 @@ class Inkling2DSparkDecoder(nn.Module):
         targets = features.view(features.shape[0], -1, self.config.hidden_size)
         return mix_rmsnorm(targets, self.fuse_alpha[row], norm.weight, norm.eps, pdl=_DRAFT_PDL)
 
+    def mix_5layer(
+        self, features: torch.Tensor, slot_map: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
+        w5 = getattr(self, "_dflare_w5", None)
+        a5 = getattr(self, "_fuse_alpha_5", None)
+        if w5 is None or a5 is None or len(self.layers) != 5:
+            return None
+        targets = features.view(features.shape[0], -1, self.config.hidden_size)
+        return dspark_ops.mix_rmsnorm_5layer(
+            targets, a5, w5, self.layers[0].dflare_norm.eps, slot_map=slot_map, pdl=_DRAFT_PDL
+        )
+
     def embed_block(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Normalized target embedding of each block's anchor, then masks."""
         assert self.embed_tokens is not None and self.embed_norm is not None
@@ -1044,11 +1148,17 @@ class Inkling2DSparkDecoder(nn.Module):
         return x.view(-1, self.config.hidden_size)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        if input_ids.shape[0] > 16 and torch.cuda.is_current_stream_capturing():
-            from vllm.distributed.device_communicators import rdma_all_reduce as _rar_mod
-            _reset_ring = getattr(_rar_mod, "reset_send_buffer_ring", None)
-            if _reset_ring is not None:
-                _reset_ring(1)
+        if torch.cuda.is_current_stream_capturing():
+            _rar_mod = _get_rar_mod()
+            _ring_min_m = (
+                getattr(_rar_mod, "_SBUF_RING_MIN_M", 17)
+                if getattr(_rar_mod, "_SBUF_RING_V10", False)
+                else 17
+            )
+            if input_ids.shape[0] >= _ring_min_m:
+                _reset_ring = getattr(_rar_mod, "reset_send_buffer_ring", None)
+                if _reset_ring is not None:
+                    _reset_ring(1)
         sched = getattr(self, "_ctx_sched", None)
         if sched is not None and len(self.layers) > 0:
             # Overlap L0.ctx_kv (~17.6 us) behind embed_block_ln_fused + L0.qkv_proj (~29.4 us).
@@ -1361,8 +1471,52 @@ class Inkling2DSparkModel(nn.Module):
             l2pf.prewarm(fold_pf, kind="draft")
         if self.lm_head.weight.is_cuda:
             dev = self.lm_head.weight.device
+            if len(self.model.layers) == 5:
+                self.model._dflare_w5 = tuple(l.dflare_norm.weight for l in self.model.layers)
+                self.model._fuse_alpha_5 = self.model.fuse_alpha[:5].contiguous()
             prealloc_stream_scratch(dev)
             dspark_ops.prealloc_fold_sem(dev)
+            try:
+                from .ops import skinny_int4 as _si4_v5
+                _si4_v5._get_draft_u4_v9_lib()
+                _si4_v5._get_draft_u4_v7_lib()
+                _si4_v5._get_draft_u4_v5_lib()
+            except Exception:
+                pass
+            try:
+                dspark_ops.qualify_dspark_v7(
+                    dev, max_rows=max(256, self.max_num_reqs * self.config.draft_block_size)
+                )
+            except Exception:
+                pass
+            try:
+                from .ops import sm12_attn as _sm12_v5
+                _sm12_v5.prewarm_draft_attn_v5(dev)
+            except Exception:
+                pass
+            try:
+                if getattr(l2pf, "CROSS_BOUNDARY", False) and self.model.layers:
+                    _l0_sa = self.model.layers[0].self_attn
+                    _dl0_segs = (
+                        _draft_pf_weight(_l0_sa.qkv_proj),
+                        _draft_pf_weight(_l0_sa.o_proj),
+                    )
+                    l2pf.register_cross_target("draft_l0", _dl0_segs, kind="draft")
+                    _tl0 = target_model.model.layers[0]
+                    _wq0 = (
+                        _tl0.attn.qkvr.weight
+                        if _tl0.is_local
+                        else _tl0.attn.qkvr.weight[: sum(_tl0.attn.q_side_splits)]
+                    )
+                    from .ops import skinny_bf11, skinny_bf12
+                    _pf_wq0 = (
+                        skinny_bf11.l2pf_tensor(_wq0)
+                        if skinny_bf11.ENABLED
+                        else skinny_bf12.l2pf_tensor(_wq0)
+                    )
+                    l2pf.register_cross_target("target_l0", _pf_wq0, kind="moe")
+            except Exception:
+                pass
 
     @torch.no_grad()
     def _quantize_draft_dense_4bit(self, mode: str) -> None:
@@ -1555,13 +1709,53 @@ class Inkling2DSparkModel(nn.Module):
         context_positions: torch.Tensor,
         context_slot_mappings: list[torch.Tensor | None] | None = None,
     ) -> None:
+        m_tot = int(context_states.shape[0])
+        can_trim = (
+            _PF_TRIM_DRAFT_CTXKV
+            and bool(getattr(self, "_pf_single_req_chunk", False))
+            and m_tot > 2048
+            and context_slot_mappings is not None
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        ctx_5l = None
+        if (
+            not can_trim
+            and len(self.model.layers) == 5
+            and dspark_ops.v7_mix5_ready(context_states.device)
+        ):
+            sm0 = (
+                context_slot_mappings[0]
+                if (context_slot_mappings is not None and len(context_slot_mappings) == 5)
+                else None
+            )
+            sm_shared = (
+                sm0
+                if (
+                    sm0 is not None
+                    and all(s is not None and s.data_ptr() == sm0.data_ptr() for s in context_slot_mappings)
+                )
+                else None
+            )
+            ctx_5l = self.model.mix_5layer(context_states, slot_map=sm_shared)
         for i, layer in enumerate(self.model.layers):
-            context = self.model.mix(context_states, i, layer.dflare_norm)
+            sm_i = None if context_slot_mappings is None else context_slot_mappings[i]
+            cs_i = context_states
+            cp_i = context_positions
+            if can_trim and sm_i is not None and layer.self_attn._effective_is_local and layer.self_attn.window > 0:
+                # For a single-request prefill chunk, SlidingWindowManager sets slot_mapping = -1
+                # for all tokens older than (window + kv_page_size). Keeping window + 512 rows is
+                # 100% 0-ULP bit-identical while eliminating ~87% of mix_rmsnorm + kv_proj_ctx!
+                keep_i = int(layer.self_attn.window) + 512
+                if m_tot > keep_i:
+                    cs_i = context_states[m_tot - keep_i :]
+                    cp_i = context_positions[m_tot - keep_i :]
+                    sm_i = sm_i[m_tot - keep_i :]
+            context = ctx_5l[i] if ctx_5l is not None else self.model.mix(cs_i, i, layer.dflare_norm)
             layer.self_attn.store_context_kv(
                 context,
-                context_positions,
+                cp_i,
                 self.model.cos_sin_cache,
-                None if context_slot_mappings is None else context_slot_mappings[i],
+                sm_i,
             )
 
     def compute_f_rnn(self, features: torch.Tensor) -> torch.Tensor:
@@ -1583,7 +1777,7 @@ class Inkling2DSparkModel(nn.Module):
             _DRAFT_FP8_HIGH_M
             and self.head_fp8_hi_wt is not None
             and hidden_states.dim() == 2
-            and hidden_states.shape[0] >= _DRAFT_FP8_HIGH_M_MIN
+            and hidden_states.shape[0] >= _DRAFT_FP8_HIGH_M_HEAD_MIN
             and hidden_states.dtype == torch.bfloat16
             and hidden_states.stride(1) == 1
             and hidden_states.is_cuda
@@ -1629,7 +1823,8 @@ class Inkling2DSparkModel(nn.Module):
         head = self.model.markov_head
         assert head.fold_weight is not None and head.fold_bias is not None and head.rnn_w_rec is not None
         rows = base_logits.shape[0]
-        skip_dev = es_ctx[2][0] if (es_ctx is not None and rows == 1 and es_ctx[0] > 0) else None
+        _es_batch = es_ctx is not None and len(es_ctx) == 6 and es_ctx[5] == "batch"
+        skip_dev = es_ctx[2][0] if (es_ctx is not None and (rows == 1 or _es_batch) and es_ctx[0] > 0) else None
         state, latent = markov_rnn_step_fused(
             state, prev_tokens, context, head.markov_w1.weight, head.rnn_w_rec,
             skip_dev=skip_dev, pdl=_DRAFT_PDL, init_zero=(state is None),
@@ -1687,6 +1882,7 @@ class Inkling2DSparkModel(nn.Module):
             self.config.final_logit_softcapping,
             self.valid_vocab,
             self.vocab_offset,
+            id_map=self.draft_id_map,
         )
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:

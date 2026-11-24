@@ -39,6 +39,178 @@ _DRAFT_PDL = os.environ.get("INKLING_DRAFT_PDL", "0").strip().lower() not in (
 _U4_FUSE_REDUCE = os.environ.get("INKLING_DRAFT_U4_FUSE_REDUCE", "1").strip().lower() not in (
     "0", "", "off", "false", "no"
 )
+# INKLING_DRAFT_U4_CUDA_V5=1: native 0-spill SM121a CUDA 4-bit panel skinny GEMM (`M <= 16`)
+# with sub-panel BN_SUB=32 wave-tail elimination (`72 -> 144` CTAs = 3.0x48 exact waves on gate_up!)
+# + hardware-coherent `st.cg + __threadfence() + atom.acq_rel.gpu` last-CTA split-K finalize.
+_DRAFT_U4_CUDA_V5 = os.environ.get("INKLING_DRAFT_U4_CUDA_V5", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_DRAFT_U4_V5_LIB_PATH = os.environ.get(
+    "INKLING_DRAFT_U4_V5_LIB", "/rdma/libdrafter_u4_gemm_v5.so"
+)
+_DRAFT_U4_V5_LIB = None
+_DRAFT_U4_V5_TRIED = False
+
+# INKLING_DRAFT_U4_CUDA_V7=1: opt-in native SM121a 4-bit panel GEMM v7 (default OFF = 0).
+# Extends V5 (M<=16) to M=1..64 via multi-MT (BM=16/32/48/64) single-pass weight reuse,
+# coherent st.cg+__threadfence() split-K finalize (0 separate _u4_reduce_kernel launches!),
+# fused SiLU+Mul, and native FP32 + BF16 bias (unlocks rnn_ctx [768,9216]!).
+_DRAFT_U4_CUDA_V7 = os.environ.get("INKLING_DRAFT_U4_CUDA_V7", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_DRAFT_U4_V7_LIB_PATH = os.environ.get(
+    "INKLING_DRAFT_U4_V7_LIB", "/rdma/libdrafter_u4_gemm_v7.so"
+)
+_DRAFT_U4_V7_LIB = None
+_DRAFT_U4_V7_TRIED = False
+
+# Wave-V9 Path A: Native SM121a BF16 Tensor-Core 4-bit panel GEMM (default OFF = 0).
+# 2-stage cp.async + ldmatrix.x4 + zero-SMEM register WP + PRMT/LOP3/bf16x2 dequant.
+_DRAFT_U4_CUDA_V9 = os.environ.get("INKLING_DRAFT_U4_CUDA_V9", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_DRAFT_U4_V9_LIB_PATH = os.environ.get(
+    "INKLING_DRAFT_U4_V9_LIB", "/rdma/libdrafter_u4_tc_v9.so"
+)
+_DRAFT_U4_V9_SHAPES_RAW = os.environ.get("INKLING_DRAFT_U4_V9_SHAPES", "all").strip().lower()
+# Wave-V12: Opt-in minimum M gate for U4_CUDA_V9 (default 1 = unchanged; set 9 to keep B=1 M<=8
+# 100.000% 1dcfb306 bit-identical while unlocking full -253..-263 us/step Tensor-Core speedup at C=2..8!)
+_DRAFT_U4_V9_MIN_M = max(1, int(os.environ.get("INKLING_DRAFT_U4_V9_MIN_M", "1") or "1"))
+_DRAFT_U4_V9_LIB = None
+_DRAFT_U4_V9_TRIED = False
+
+# Wave-V9 Path B: GB10 48-SM Triton config tuning + coherent .cg FUSE_SPLIT (default OFF = 0).
+_U4_V9_CFG = os.environ.get("INKLING_U4_V9_CFG", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+
+# Wave-V10: Opt-in 5-alpha asymmetric MSE clipping for u4p32/u4p64 (default OFF = 0 for 1dcfb306 invariance).
+# Gains +0.22..+0.26 dB weight/logit SQNR (+0.25%..+0.37% E[acc]) at ZERO extra bytes and ZERO latency delta!
+_DRAFT_U4_MSE = os.environ.get("INKLING_DRAFT_U4_MSE", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+
+_V9_SHAPE_TAGS = {
+    (25128, 4608): "draft_head",
+    (12560, 4608): "draft_head",
+    (8192,  4608): "draft_head",
+    (4608,  4608): "gate_up",
+    (4608,  2304): "down_proj",
+    (4608,   768): "o_proj",
+    (1024,  4608): "qkv_proj",
+    (256,   4608): "kv_proj_ctx",
+    (768,   9216): "rnn_ctx",
+}
+
+
+def _v9_shape_enabled(n: int, k: int) -> bool:
+    sel = _DRAFT_U4_V9_SHAPES_RAW
+    if not sel or sel == "all":
+        return True
+    tag = _V9_SHAPE_TAGS.get((int(n), int(k)), f"{int(n)}x{int(k)}")
+    parts = {p.strip() for p in sel.split(",") if p.strip()}
+    if "all" in parts:
+        return True
+    if "head" in parts and tag == "draft_head":
+        return True
+    if "trunk" in parts and tag != "draft_head":
+        return True
+    return tag in parts or f"{int(n)}x{int(k)}" in parts
+
+
+def _get_draft_u4_v9_lib():
+    global _DRAFT_U4_V9_LIB, _DRAFT_U4_V9_TRIED
+    if not _DRAFT_U4_V9_TRIED:
+        _DRAFT_U4_V9_TRIED = True
+        if _DRAFT_U4_CUDA_V9 and os.path.isfile(_DRAFT_U4_V9_LIB_PATH):
+            try:
+                import ctypes
+                c_vp = ctypes.c_void_p
+                c_i = ctypes.c_int
+                c_i64 = ctypes.c_int64
+                c_u64 = ctypes.c_uint64
+                lib = ctypes.CDLL(_DRAFT_U4_V9_LIB_PATH)
+                lib.drafter_u4_tc_v9_version.argtypes = []
+                lib.drafter_u4_tc_v9_version.restype = c_i
+                lib.drafter_u4_tc_v9_fwd.argtypes = [
+                    c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp,
+                    c_i, c_i, c_i, c_i, c_i, c_i, c_i, c_i,
+                    c_i64, c_i64, c_i64,
+                    c_i, c_i, c_i, c_i, c_i, c_i, c_i, c_i, c_i, c_u64,
+                ]
+                lib.drafter_u4_tc_v9_fwd.restype = c_i
+                if lib.drafter_u4_tc_v9_version() == 9:
+                    _DRAFT_U4_V9_LIB = lib
+                    print(
+                        f"[inkling-draft-u4-v9] loaded {_DRAFT_U4_V9_LIB_PATH} "
+                        f"(SM121a BF16 TC 2-stage cp.async + ldmatrix.x4, shapes={_DRAFT_U4_V9_SHAPES_RAW})",
+                        flush=True,
+                    )
+            except (OSError, AttributeError):
+                _DRAFT_U4_V9_LIB = None
+    return _DRAFT_U4_V9_LIB
+
+
+def _get_draft_u4_v7_lib():
+    global _DRAFT_U4_V7_LIB, _DRAFT_U4_V7_TRIED
+    if not _DRAFT_U4_V7_TRIED:
+        _DRAFT_U4_V7_TRIED = True
+        if _DRAFT_U4_CUDA_V7 and os.path.isfile(_DRAFT_U4_V7_LIB_PATH):
+            try:
+                import ctypes
+                lib = ctypes.CDLL(_DRAFT_U4_V7_LIB_PATH)
+                lib.drafter_u4_panel_gemm_v7_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                lib.drafter_u4_panel_gemm_v7_fwd.restype = ctypes.c_int
+                _DRAFT_U4_V7_LIB = lib
+                print(
+                    f"[inkling-draft-u4-v7] loaded {_DRAFT_U4_V7_LIB_PATH} "
+                    f"(M=1..64 multi-MT + BN_SUB=32 + FP32/BF16 bias + coherent split-K)",
+                    flush=True,
+                )
+            except (OSError, AttributeError):
+                _DRAFT_U4_V7_LIB = None
+    return _DRAFT_U4_V7_LIB
+
+
+def _get_draft_u4_v5_lib():
+    global _DRAFT_U4_V5_LIB, _DRAFT_U4_V5_TRIED
+    if not _DRAFT_U4_V5_TRIED:
+        _DRAFT_U4_V5_TRIED = True
+        if _DRAFT_U4_CUDA_V5 and os.path.isfile(_DRAFT_U4_V5_LIB_PATH):
+            try:
+                import ctypes
+                lib = ctypes.CDLL(_DRAFT_U4_V5_LIB_PATH)
+                lib.drafter_u4_panel_gemm_v5_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                lib.drafter_u4_panel_gemm_v5_fwd.restype = ctypes.c_int
+                _DRAFT_U4_V5_LIB = lib
+                print(f"[inkling-draft-u4-v5] loaded {_DRAFT_U4_V5_LIB_PATH} (BN_SUB=32 + coherent split-K)", flush=True)
+            except OSError:
+                _DRAFT_U4_V5_LIB = None
+    return _DRAFT_U4_V5_LIB
 
 # Per-(device, bank) 2x ping-pong persistent scratch for fused split-K last-CTA reduction.
 # Bank 0 serves the main / CUDA-graph-capture stream (handles torch.cuda.graph's fresh capture
@@ -88,8 +260,10 @@ def prealloc_stream_scratch(
     """Pre-allocate fused split-K (PART, SEM) scratch outside CUDA graph capture.
     Pass stream=None for the main/capture bank (bank 0); pass a dedicated side stream
     to register and pre-allocate a disjoint bank (>= 1) for that stream."""
-    if not _U4_FUSE_REDUCE or device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+    if not (_U4_FUSE_REDUCE or _DRAFT_U4_CUDA_V5 or _DRAFT_U4_CUDA_V7) or device.type != "cuda" or torch.cuda.is_current_stream_capturing():
         return 0
+    if _DRAFT_U4_CUDA_V7:
+        min_part_elems = max(int(min_part_elems), 262144)
     d = _dev_idx(device)
     if stream is None:
         bank = 0
@@ -422,10 +596,11 @@ def _u4_panel_kernel(
             P + tile_base + ps.to(tl.int64) * (BM * BN) + off_mn,
             acc,
             mask=mm[:, None] & nm[None, :],
+            cache_modifier=".cg",
         )
         tl.debug_barrier()
         if tl.atomic_add(SEM + pn, 1, sem="acq_rel") == SPLIT - 1:
-            tl.store(SEM + pn, 0)
+            tl.store(SEM + pn, 0, cache_modifier=".cg")
             tot = tl.zeros([BM, BN], tl.float32)
             for s in tl.static_range(SPLIT):
                 tot += tl.load(
@@ -765,6 +940,9 @@ def quantize_u4_panel(
         assert K % bk == 0
     else:
         _, bn, bk, split, nw, ns = cfg
+    if _U4_V9_CFG and (N, K) == (4608, 4608):
+        # Wave-V9 Path B: exact 144 CTAs = 3.00x48 SM waves (eliminates 72-CTA 1.50-wave tail!)
+        bn, bk, split, nw, ns = 32, 256, 1, 4, 4
     if interleave_silu:
         # Fused silu requires DIRECT (split=1) and even BN
         assert split == 1 and bn % 2 == 0
@@ -802,8 +980,26 @@ def quantize_u4_panel(
         else:
             lo = g.amin(dim=-1)
             hi = g.amax(dim=-1)
-            sc = ((hi - lo) / 15.0).clamp_min(1e-7).to(torch.float16)
-            zp = lo.to(torch.float16)
+            if _DRAFT_U4_MSE:
+                mid = 0.5 * (lo + hi)
+                half = 0.5 * (hi - lo)
+                best_err = torch.full_like(lo, 1e30)
+                best_sc = ((hi - lo) / 15.0).clamp_min(1e-7).to(torch.float16)
+                best_zp = lo.to(torch.float16)
+                for alpha in (1.0, 0.94, 0.88, 0.82, 0.76):
+                    lt = (mid - alpha * half).to(torch.float16)
+                    ht = mid + alpha * half
+                    sct = ((ht - lt.float()) / 15.0).clamp_min(1e-7).to(torch.float16)
+                    qt = torch.round((g - lt.float()[..., None]) / sct.float()[..., None]).clamp(0, 15)
+                    err = (g - (lt.float()[..., None] + qt * sct.float()[..., None])).square().mean(dim=-1)
+                    better = err < best_err
+                    best_err = torch.where(better, err, best_err)
+                    best_sc = torch.where(better, sct, best_sc)
+                    best_zp = torch.where(better, lt, best_zp)
+                sc, zp = best_sc, best_zp
+            else:
+                sc = ((hi - lo) / 15.0).clamp_min(1e-7).to(torch.float16)
+                zp = lo.to(torch.float16)
             q = torch.round((g - zp.float()[..., None]) / sc.float()[..., None]).clamp(0, 15).to(torch.uint8)
             zpp[p0:p1].copy_(zp.view(p1 - p0, bn, k_steps, bkg).permute(0, 2, 3, 1))
         nib = q.view(rows, K // 2, 2)
@@ -858,12 +1054,181 @@ def skinny_u4_panel_linear(
     fuse_rnn = x2 is not None
     fuse_rnn_batch = bool(fuse_rnn and n_reqs > 1 and k_steps > 0)
     sx2 = 0 if (not fuse_rnn or x2.shape[0] == 1) else x2.stride(0)
+    if (
+        _DRAFT_U4_CUDA_V9
+        and _DRAFT_U4_V9_MIN_M <= M <= 64
+        and x.dtype == torch.bfloat16
+        and (not fuse_rnn or x2.dtype == torch.bfloat16)
+        and (not has_bias or (bias.dtype in (torch.bfloat16, torch.float32) and bias.is_contiguous()))
+        and out.dtype in (torch.bfloat16, torch.float32)
+        and bn in (16, 32, 64)
+        and bk in (128, 256)
+        and g in (32, 64)
+        and not (fuse_silu and out.dtype == torch.float32)
+        and not (bn == 16 and (fuse_silu or out.dtype == torch.float32))
+        and _v9_shape_enabled(N, K)
+    ):
+        lib_v9 = _get_draft_u4_v9_lib()
+        if lib_v9 is not None:
+            mt_v9 = (M + 15) // 16
+            out_f32_v9 = 1 if out.dtype == torch.float32 else 0
+            if bn == 16:
+                eff_bn_v9 = 16
+            elif bn == 64 and not fuse_silu and not out_f32_v9 and mt_v9 >= 3 and N >= 8192:
+                eff_bn_v9 = 64
+            else:
+                eff_bn_v9 = 32
+            ks_v9 = triton.cdiv(triton.cdiv(K, split), bk) * bk
+            split_v9 = triton.cdiv(K, ks_v9)
+            n_sub_v9 = triton.cdiv(N, eff_bn_v9)
+            bm_tile_v9 = mt_v9 * 16
+            p_ptr_v9, s_ptr_v9 = 0, 0
+            ok_v9 = True
+            if split_v9 > 1:
+                scr_v9 = _next_fuse_scratch(
+                    x.device, n_sub_v9 * split_v9 * bm_tile_v9 * eff_bn_v9, n_sub_v9
+                )
+                if scr_v9 is None:
+                    ok_v9 = False
+                else:
+                    p_ptr_v9, s_ptr_v9 = scr_v9[0].data_ptr(), scr_v9[1].data_ptr()
+            if ok_v9:
+                rnn_mode_v9 = 2 if fuse_rnn_batch else (1 if fuse_rnn else 0)
+                bias_f32_v9 = 1 if (has_bias and bias.dtype == torch.float32) else 0
+                rc_v9 = lib_v9.drafter_u4_tc_v9_fwd(
+                    x.data_ptr(),
+                    x2.data_ptr() if fuse_rnn else 0,
+                    wp.data_ptr(),
+                    scp.data_ptr(),
+                    0 if sym_i4 else zpp.data_ptr(),
+                    bias.data_ptr() if has_bias else 0,
+                    p_ptr_v9,
+                    s_ptr_v9,
+                    out.data_ptr(),
+                    int(M), int(N), int(K),
+                    int(bn), int(eff_bn_v9), int(bk), int(g), int(split_v9),
+                    int(x.stride(0)), int(sx2), int(out.stride(0)),
+                    1 if sym_i4 else 0,
+                    1 if fuse_silu else 0,
+                    int(out_f32_v9),
+                    int(rnn_mode_v9),
+                    int(n_reqs), int(k_steps),
+                    1 if has_bias else 0,
+                    int(bias_f32_v9),
+                    1 if use_pdl else 0,
+                    int(torch.cuda.current_stream(x.device).cuda_stream),
+                )
+                if rc_v9 == 0:
+                    return out
+    if (
+        _DRAFT_U4_CUDA_V7
+        and 0 < M <= 64
+        and x.dtype == torch.bfloat16
+        and (not fuse_rnn or x2.dtype == torch.bfloat16)
+        and (not has_bias or (bias.dtype in (torch.bfloat16, torch.float32) and bias.is_contiguous()))
+        and out.dtype in (torch.bfloat16, torch.float32)
+        and bn in (16, 32, 64)
+        and bk in (128, 256)
+        and g in (32, 64)
+    ):
+        lib_v7 = _get_draft_u4_v7_lib()
+        if lib_v7 is not None:
+            ks_v7 = triton.cdiv(triton.cdiv(K, split), bk) * bk
+            split_v7 = triton.cdiv(K, ks_v7)
+            bn_sub = 16 if bn == 16 else 32
+            n_sub = triton.cdiv(N, bn_sub)
+            bm_tile = ((M + 15) // 16) * 16
+            p_ptr, s_ptr = 0, 0
+            ok_v7 = True
+            if split_v7 > 1:
+                scr_v7 = _next_fuse_scratch(x.device, n_sub * split_v7 * bm_tile * bn_sub, n_sub)
+                if scr_v7 is None:
+                    ok_v7 = False
+                else:
+                    p_ptr, s_ptr = scr_v7[0].data_ptr(), scr_v7[1].data_ptr()
+            if ok_v7:
+                rnn_mode = 2 if fuse_rnn_batch else (1 if fuse_rnn else 0)
+                bias_is_f32 = 1 if (has_bias and bias.dtype == torch.float32) else 0
+                rc_v7 = lib_v7.drafter_u4_panel_gemm_v7_fwd(
+                    x.data_ptr(),
+                    x2.data_ptr() if fuse_rnn else 0,
+                    wp.data_ptr(),
+                    scp.data_ptr(),
+                    0 if sym_i4 else zpp.data_ptr(),
+                    bias.data_ptr() if has_bias else 0,
+                    p_ptr,
+                    s_ptr,
+                    out.data_ptr(),
+                    int(M), int(N), int(K),
+                    int(x.stride(0)), int(sx2), int(out.stride(0)),
+                    int(bn), int(bk), int(g), int(split_v7),
+                    1 if sym_i4 else 0,
+                    1 if fuse_silu else 0,
+                    int(rnn_mode),
+                    int(n_reqs), int(k_steps),
+                    1 if out.dtype == torch.float32 else 0,
+                    int(bias_is_f32),
+                    1 if use_pdl else 0,
+                    int(torch.cuda.current_stream(x.device).cuda_stream),
+                )
+                if rc_v7 == 0:
+                    return out
+    if (
+        _DRAFT_U4_CUDA_V5
+        and 0 < M <= 16
+        and x.dtype == torch.bfloat16
+        and (not fuse_rnn or x2.dtype == torch.bfloat16)
+        and (not has_bias or (bias.dtype == torch.bfloat16 and bias.is_contiguous()))
+        and out.dtype in (torch.bfloat16, torch.float32)
+        and bn in (16, 32, 64)
+        and bk in (128, 256)
+        and g in (32, 64)
+    ):
+        lib_v5 = _get_draft_u4_v5_lib()
+        if lib_v5 is not None:
+            ks_v5 = triton.cdiv(triton.cdiv(K, split), bk) * bk
+            split_v5 = triton.cdiv(K, ks_v5)
+            bn_sub = 16 if bn == 16 else 32
+            n_sub = triton.cdiv(N, bn_sub)
+            p_ptr, s_ptr = 0, 0
+            ok_v5 = True
+            if split_v5 > 1:
+                scr_v5 = _next_fuse_scratch(x.device, n_sub * split_v5 * 16 * bn_sub, n_sub)
+                if scr_v5 is None:
+                    ok_v5 = False
+                else:
+                    p_ptr, s_ptr = scr_v5[0].data_ptr(), scr_v5[1].data_ptr()
+            if ok_v5:
+                rnn_mode = 2 if fuse_rnn_batch else (1 if fuse_rnn else 0)
+                rc_v5 = lib_v5.drafter_u4_panel_gemm_v5_fwd(
+                    x.data_ptr(),
+                    x2.data_ptr() if fuse_rnn else 0,
+                    wp.data_ptr(),
+                    scp.data_ptr(),
+                    0 if sym_i4 else zpp.data_ptr(),
+                    bias.data_ptr() if has_bias else 0,
+                    p_ptr,
+                    s_ptr,
+                    out.data_ptr(),
+                    int(M), int(N), int(K),
+                    int(x.stride(0)), int(sx2), int(out.stride(0)),
+                    int(bn), int(bk), int(g), int(split_v5),
+                    1 if sym_i4 else 0,
+                    1 if fuse_silu else 0,
+                    int(rnn_mode),
+                    int(n_reqs), int(k_steps),
+                    1 if out.dtype == torch.float32 else 0,
+                    1 if use_pdl else 0,
+                    int(torch.cuda.current_stream(x.device).cuda_stream),
+                )
+                if rc_v5 == 0:
+                    return out
     fuse_split = False
     if M <= 32:
         bm = 16 if M <= 16 else 32
         if bm == 32:
             nw = max(nw, 4)
-            ns = min(ns, 2)
+            ns = min(ns, 3 if (_U4_V9_CFG and bn <= 32) else 2)
         ks = triton.cdiv(triton.cdiv(K, split), bk) * bk
         split = triton.cdiv(K, ks)
         direct = split == 1
@@ -895,11 +1260,20 @@ def skinny_u4_panel_linear(
             num_warps=nw, num_stages=ns, launch_pdl=use_pdl,
         )
     else:
-        bm = 64 if (_U4_MT_BM64 and M >= 64) else 32
-        m_tiles = triton.cdiv(M, bm)
         n_panels = triton.cdiv(N, bn)
-        if split > 1 and n_panels * m_tiles >= 48:
-            split = 1
+        if _U4_V9_CFG and _U4_MT_BM64 and (M >= 64 or (M >= 33 and n_panels * split >= 48)):
+            bm = 64
+        else:
+            bm = 64 if (_U4_MT_BM64 and M >= 64) else 32
+        m_tiles = triton.cdiv(M, bm)
+        if split > 1:
+            ctas_nosplit = n_panels * m_tiles
+            if _U4_V9_CFG:
+                # Only drop split-K when no-split fills >= 2 full 48-SM waves or an exact wave multiple!
+                if ctas_nosplit >= 96 or (ctas_nosplit >= 48 and (ctas_nosplit % 48) == 0):
+                    split = 1
+            elif ctas_nosplit >= 48:
+                split = 1
         ks = triton.cdiv(triton.cdiv(K, split), bk) * bk
         split = triton.cdiv(K, ks)
         direct = split == 1

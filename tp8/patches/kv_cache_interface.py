@@ -33,6 +33,11 @@ logger = init_logger(__name__)
 # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token blob,
 # so the page size is not derivable from head_size.
 DS_MLA_STATE_CONTENT_BYTES = {"fp8_ds_mla": 656, "nvfp4_ds_mla": 352}
+# Wave-V10 0-ULP Lossless KV-BF12 (BF12-G128-OVF-SAFE) fixed-page geometry:
+#   2 x KvBf12HalfBlock (50,688 B) = 101,376 B (99.000 KiB) = 256 states x 396 B/state.
+KV_BF12_STATE_CONTENT_BYTES = 396
+KV_BF12_HALF_BYTES = 50688
+KV_BF12_PAGE_BYTES = 101376
 
 _SpecT = TypeVar("_SpecT", bound="KVCacheSpec")
 
@@ -66,6 +71,7 @@ class KVQuantMode(IntEnum):
     OCTAVE_K3V4 = 12
     OCTAVE_K3V3 = 13
     OCTAVE_K3V3_COMPACT = 14
+    KV_BF12 = 15  # 0-ULP lossless BF12-G128-OVF-SAFE fixed 99 KiB paged KV
 
     # Backend self-manages kernel dispatch. Reads as quantized but matches no
     # generic kernel mode (is_per_token_head / is_nvfp4 / is_turboquant all
@@ -110,6 +116,11 @@ class KVQuantMode(IntEnum):
     def is_ultraquant(self) -> bool:
         """True for the UltraQuant 4-bit KV-cache format."""
         return self == KVQuantMode.ULTRAQUANT_4BIT
+
+    @property
+    def is_kv_bf12(self) -> bool:
+        """True for the 0-ULP lossless KV-BF12 paged KV-cache format."""
+        return self == KVQuantMode.KV_BF12
 
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
@@ -995,21 +1006,28 @@ class SlidingWindowSpec(AttentionSpec):
         else:
             periodic_blocks = cdiv(num_tokens, max(self.block_size, ret)) * need_max
         dbo_blocks = 0
-        if os.environ.get("INKLING_PREFILL_AR_OVERLAP", "0").strip().lower() not in (
-            "0", "", "off", "false", "no"
-        ):
+        if (not self.is_draft) and os.environ.get(
+            "INKLING_PREFILL_AR_OVERLAP", "0"
+        ).strip().lower() not in ("0", "", "off", "false", "no"):
             dbo_min_t = int(
                 os.environ.get("INKLING_PREFILL_AR_OVERLAP_MIN_T", "8192") or "8192"
             )
             if dbo_min_t > 0 and max_in_flight_tokens >= dbo_min_t:
                 # Up to 2 in-flight DBO chunks x (cdiv(sw-1, bs) + 2) midpoint blocks.
                 dbo_blocks = 2 * (cdiv(self.sliding_window - 1, self.block_size) + 2)
+        draft_warm_slack = 0
+        if self.is_draft:
+            draft_warm_slack = max(
+                0,
+                int(os.environ.get("INKLING_DRAFT_SWA_WARM_SLACK_BLKS", "8") or "8"),
+            )
         sparse_cap = (
             3 * tail_per_step
             + lookahead_slack
             + boundary_blocks
             + periodic_blocks
             + dbo_blocks
+            + draft_warm_slack
             + 1
         )
         return min(dense_cap, sparse_cap)
@@ -1659,7 +1677,9 @@ class KVCacheConfig:
 
     def __post_init__(self) -> None:
         self.needs_kv_cache_zeroing = (
-            self.has_mamba_layers or self.has_mixed_precision_kv_cache
+            self.has_mamba_layers
+            or self.has_mixed_precision_kv_cache
+            or self.has_kv_bf12_layers
         )
 
     @cached_property
@@ -1751,3 +1771,17 @@ class KVCacheConfig:
                 if isinstance(spec, AttentionSpec)
             )
         return len(kv_cache_precisions) > 1
+
+    @property
+    def has_kv_bf12_layers(self) -> bool:
+        """Whether any device attention cache uses 0-ULP lossless KV-BF12.
+        Enabling block zeroing resets `blk.ovf_used` on newly allocated/recycled
+        blocks cleanly before CUDA graph replay with zero parallel write races.
+        """
+        return any(
+            isinstance(spec, AttentionSpec)
+            and spec.kv_quant_mode == KVQuantMode.KV_BF12
+            for group in self.kv_cache_groups
+            if not group.host_resident
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )

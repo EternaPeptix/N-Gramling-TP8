@@ -5,6 +5,8 @@ expert GEMMs (``trtllm_bmm``) with the activations quantized into it, and the
 top-k combine.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
@@ -20,6 +22,56 @@ from .mxfp8 import _mxfp8_block, _store_mxfp8_block
 from .nvfp4 import FP32_MAX, _quantize_block, _quantize_columns, _store_block
 from .seq_parallel import HALO_ROWS, SeqParallel
 from .trtllm_bmm import ExpertPlan
+
+# Wave-V10: Hoist per-layer os.environ lookups out of _combine() and cache lazy hot-loop modules.
+_OFF_TOKENS = ("", "0", "off", "false", "no")
+_COMBINE_C32_V6_OR_V8_V9 = (
+    os.environ.get("INKLING_C32_COMBINE_V6", "").strip().lower() not in _OFF_TOKENS
+    or os.environ.get("INKLING_C48_MOE_V8", "").strip().lower() not in _OFF_TOKENS
+    or os.environ.get("INKLING_C48_MOE_V9", "").strip().lower() not in _OFF_TOKENS
+    or os.environ.get("INKLING_C48_MOE_V10", "").strip().lower() not in _OFF_TOKENS
+)
+_RAR_MOD_CACHE = None
+_RAR_MOD_TRIED = False
+_ROUTER_BF12_CACHE = None
+_C32_RT_CACHE = None
+_C32_RT_TRIED = False
+
+
+def _get_rar_mod():
+    global _RAR_MOD_CACHE, _RAR_MOD_TRIED
+    if not _RAR_MOD_TRIED:
+        _RAR_MOD_TRIED = True
+        try:
+            from vllm.distributed.device_communicators import rdma_all_reduce as m
+
+            _RAR_MOD_CACHE = m
+        except Exception:
+            _RAR_MOD_CACHE = None
+    return _RAR_MOD_CACHE
+
+
+def _get_router_bf12_mod():
+    global _ROUTER_BF12_CACHE
+    m = _ROUTER_BF12_CACHE
+    if m is None:
+        from . import router_bf12 as m
+
+        _ROUTER_BF12_CACHE = m
+    return m
+
+
+def _get_c32_rt_mod():
+    global _C32_RT_CACHE, _C32_RT_TRIED
+    if not _C32_RT_TRIED:
+        _C32_RT_TRIED = True
+        try:
+            from . import moe_c32_runtime as m
+
+            _C32_RT_CACHE = m
+        except Exception:
+            _C32_RT_CACHE = None
+    return _C32_RT_CACHE
 
 
 @triton.jit
@@ -920,15 +972,12 @@ def route(
             x_is_fp8 = False
             x_fp8_scale = None
         assert plan.tile >= tokens
-        from . import router_bf12
+        router_bf12 = _get_router_bf12_mod()
         if router_bf12.ENABLED:
             nlive_buf = None
-            try:
-                from vllm.distributed.device_communicators import rdma_all_reduce as _rar
-                if _rar.ROWAR.get("scope") == tokens:
-                    nlive_buf = _rar.ROWAR.get("buf")
-            except Exception:
-                nlive_buf = None
+            _rar = _get_rar_mod()
+            if _rar is not None and _rar.ROWAR.get("scope") == tokens:
+                nlive_buf = _rar.ROWAR.get("buf")
             res = router_bf12.route_bf12(
                 x, gate_weight, bias, counters, counts, topk, route_scale,
                 expert_bounds, plan, weight_amax, weight_denominator,
@@ -940,20 +989,14 @@ def route(
         tokens > FUSED_ROUTING_MAX_TOKENS
         and tokens <= 256
         and not x_is_fp8
-        and plan.tile in (16, 32)
+        and plan.tile in (8, 16, 32)
     ):
-        try:
-            from . import moe_c32_runtime as _c32
-        except Exception:
-            _c32 = None
+        _c32 = _get_c32_rt_mod()
         if _c32 is not None and _c32.C32_MASTER and _c32.C32_ROUTER_MODE != "off":
             _nlive_c32 = None
-            try:
-                from vllm.distributed.device_communicators import rdma_all_reduce as _rar
-                if _rar.ROWAR.get("scope") == tokens:
-                    _nlive_c32 = _rar.ROWAR.get("buf")
-            except Exception:
-                _nlive_c32 = None
+            _rar = _get_rar_mod()
+            if _rar is not None and _rar.ROWAR.get("scope") == tokens:
+                _nlive_c32 = _rar.ROWAR.get("buf")
             _res_c32 = _c32.route_c32(
                 x, gate_weight, bias, topk, route_scale, expert_bounds, plan,
                 weight_amax, weight_denominator, counts.numel(),
@@ -966,13 +1009,6 @@ def route(
     n = tokens * topk
     device = x.device
     rows = plan.rows
-    src2dst = torch.empty(n, dtype=torch.int32, device=device)
-    gammas = torch.empty(rows, dtype=torch.float32, device=device)
-    routed = torch.empty(n, dtype=torch.int32, device=device)
-    tiles = torch.empty(2 * plan.max_ctas + 3, dtype=torch.int32, device=device)
-    ids = torch.empty(n, dtype=torch.int32, device=device)
-    ranks = torch.empty(n, dtype=torch.int32, device=device)
-    weights = torch.empty(n, dtype=torch.float32, device=device)
     _pqf_lib = None
     _zero_scat = False
     _rowmaj_sc = False
@@ -993,18 +1029,43 @@ def route(
         except Exception:
             _pqf_lib = None
     qrows = tokens if _zero_scat else rows
-    if nvfp4:
-        quantized = (
-            torch.empty((qrows, hidden // 2), dtype=torch.uint8, device=device),
-            torch.empty((qrows, hidden // 16), dtype=torch.float8_e4m3fn, device=device),
-            torch.empty(rows, dtype=torch.float32, device=device),
+    _pf_mn = None
+    _use_pf_scratch = False
+    if (
+        tokens > 256
+        and plan.tile >= 64
+        and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    ):
+        try:
+            from . import pf_moe_native as _pf_mn_mod
+            _pf_mn = _pf_mn_mod
+            _use_pf_scratch = bool(_pf_mn.PF_MOE_SCRATCH_REUSE)
+        except Exception:
+            _pf_mn = None
+    if _use_pf_scratch and _pf_mn is not None:
+        src2dst, gammas, routed, tiles, ids, ranks, weights, quantized = (
+            _pf_mn.get_pf_route_scratch(device, n, rows, plan.max_ctas, qrows, hidden, nvfp4)
         )
     else:
-        quantized = (
-            torch.empty((qrows, hidden), dtype=torch.float8_e4m3fn, device=device),
-            torch.empty((qrows, hidden // 32), dtype=torch.uint8, device=device),
-            None,
-        )
+        src2dst = torch.empty(n, dtype=torch.int32, device=device)
+        gammas = torch.empty(rows, dtype=torch.float32, device=device)
+        routed = torch.empty(n, dtype=torch.int32, device=device)
+        tiles = torch.empty(2 * plan.max_ctas + 3, dtype=torch.int32, device=device)
+        ids = torch.empty(n, dtype=torch.int32, device=device)
+        ranks = torch.empty(n, dtype=torch.int32, device=device)
+        weights = torch.empty(n, dtype=torch.float32, device=device)
+        if nvfp4:
+            quantized = (
+                torch.empty((qrows, hidden // 2), dtype=torch.uint8, device=device),
+                torch.empty((qrows, hidden // 16), dtype=torch.float8_e4m3fn, device=device),
+                torch.empty(rows, dtype=torch.float32, device=device),
+            )
+        else:
+            quantized = (
+                torch.empty((qrows, hidden), dtype=torch.float8_e4m3fn, device=device),
+                torch.empty((qrows, hidden // 32), dtype=torch.uint8, device=device),
+                None,
+            )
     outputs = (src2dst, gammas, routed, tiles)
     # Rows are quantized in a power-of-two head and tail.
     head = 1 << (hidden.bit_length() - 1)
@@ -1012,6 +1073,12 @@ def route(
     assert tail & (tail - 1) == 0 and (tail == 0 or tail >= 32)
     if tokens <= FUSED_ROUTING_MAX_TOKENS:
         assert plan.tile >= tokens
+        if gate_weight.untyped_storage().size() == 0:
+            from . import router_bf12 as _rb12_fb
+
+            _unp = _rb12_fb.unpack_bf16(gate_weight)
+            if _unp is not None:
+                gate_weight = _unp
         groups = triton.cdiv(hidden, 1024)
         block_n = 32
         partials = torch.empty(
@@ -1061,35 +1128,59 @@ def route(
     router_out_dtype = torch.bfloat16 if x_is_fp8 else x.dtype
     partials = k_group_partials(x, gate_weight, out_dtype=router_out_dtype)
     local_pow2 = triton.next_power_of_2(num_local)
-    starts = torch.empty(3 * local_pow2, dtype=torch.int32, device=device)
-    _route_tokens_kernel[(tokens,)](
-        partials,
-        bias,
-        expert_bounds,
-        is_padding,
-        counts,
-        counters,
-        ids,
-        ranks,
-        weights,
-        starts,
-        tiles,
-        tokens,
-        route_scale,
-        E=experts,
-        E_POW2=triton.next_power_of_2(experts),
-        GROUPS=partials.shape[0],
-        TOPK=topk,
-        SORT=tokens <= 128,
-        NUM_LOCAL=num_local,
-        LOCAL_POW2=local_pow2,
-        TILE=plan.tile,
-        MAX_CTAS=plan.max_ctas,
-        num_warps=4 if tokens <= 128 else 1,
-        launch_pdl=True,
-    )
+    _r2t_cached = None
+    if _use_pf_scratch and _pf_mn is not None:
+        starts, _r2t_cached = _pf_mn.get_pf_route_starts_r2t(
+            device, local_pow2, rows, bool(_pqf_lib is not None and _zero_scat)
+        )
+    else:
+        starts = torch.empty(3 * local_pow2, dtype=torch.int32, device=device)
+    _routed_v6 = False
+    if (
+        _pf_mn is not None
+        and _pf_mn.PF_ROUTE_V6
+        and experts == 384
+        and topk == 8
+        and partials.shape[0] == 1
+    ):
+        _routed_v6 = _pf_mn.route_tokens_place_v6(
+            partials, bias, expert_bounds, is_padding, counts, counters,
+            ids, ranks, weights, starts, tiles,
+            tokens, route_scale, num_local, local_pow2, plan.tile, plan.max_ctas,
+        )
+    if not _routed_v6:
+        _route_tokens_kernel[(tokens,)](
+            partials,
+            bias,
+            expert_bounds,
+            is_padding,
+            counts,
+            counters,
+            ids,
+            ranks,
+            weights,
+            starts,
+            tiles,
+            tokens,
+            route_scale,
+            E=experts,
+            E_POW2=triton.next_power_of_2(experts),
+            GROUPS=partials.shape[0],
+            TOPK=topk,
+            SORT=tokens <= 128,
+            NUM_LOCAL=num_local,
+            LOCAL_POW2=local_pow2,
+            TILE=plan.tile,
+            MAX_CTAS=plan.max_ctas,
+            num_warps=4 if tokens <= 128 else 1,
+            launch_pdl=True,
+        )
     if _pqf_lib is not None:
-        _r2t = torch.empty(rows, dtype=torch.int32, device=device) if _zero_scat else src2dst
+        _r2t = (
+            _r2t_cached
+            if _r2t_cached is not None
+            else (torch.empty(rows, dtype=torch.int32, device=device) if _zero_scat else src2dst)
+        )
         _tile_sc = 0 if _rowmaj_sc else plan.tile
         _stream = int(torch.cuda.current_stream().cuda_stream)
         _rc = -1
@@ -1316,12 +1407,57 @@ def _combine(
     assert hidden % block == 0
     nlive_buf = None
     if sp is None:
-        try:
-            from vllm.distributed.device_communicators import rdma_all_reduce as _rar
-            if _rar.ROWAR.get("scope") == tokens:
-                nlive_buf = _rar.ROWAR.get("buf")
-        except Exception:
-            nlive_buf = None
+        _rar = _get_rar_mod()
+        if _rar is not None and _rar.ROWAR.get("scope") == tokens:
+            nlive_buf = _rar.ROWAR.get("buf")
+    if (
+        sp is None
+        and _COMBINE_C32_V6_OR_V8_V9
+        and 1 <= tokens <= 65535
+        and (tokens <= 256 or nlive_buf is not None)
+        and hidden == 4608
+        and topk == 8
+        and down.dtype == torch.bfloat16
+        and out is not None
+        and out.dtype == torch.bfloat16
+        and down.is_contiguous()
+        and out.is_contiguous()
+        and src2dst.dtype == torch.int32
+        and src2dst.is_contiguous()
+    ):
+        _comb_fn = None
+        _comb_pdl = 1
+        _c32rt = _get_c32_rt_mod()
+        if _c32rt is not None:
+            try:
+                _comb_pdl = 1 if _c32rt.C32_PDL else 0
+                _nvlib = _c32rt.get_nvfp4_lib()
+                if _nvlib is not None and hasattr(_nvlib, "nvfp4_combine_c32_v6_fwd"):
+                    _comb_fn = _nvlib.nvfp4_combine_c32_v6_fwd
+                else:
+                    _mx6lib = _c32rt.get_mx6_lib() if hasattr(_c32rt, "get_mx6_lib") else None
+                    if _mx6lib is not None and hasattr(_mx6lib, "mx6_combine_c48_v10_fwd"):
+                        _comb_fn = _mx6lib.mx6_combine_c48_v10_fwd
+                    else:
+                        _mxlib = _c32rt.get_mx7_lib()
+                        if _mxlib is not None and hasattr(_mxlib, "mx7_combine_c48_v7_fwd"):
+                            _comb_fn = _mxlib.mx7_combine_c48_v7_fwd
+            except Exception:
+                _comb_fn = None
+        if _comb_fn is not None:
+            _rc = _comb_fn(
+                down.data_ptr(),
+                src2dst.data_ptr(),
+                0 if nlive_buf is None else nlive_buf.data_ptr(),
+                out.data_ptr(),
+                tokens,
+                hidden,
+                _comb_pdl,
+                _comb_pdl if tokens <= LAUNCH_DEPENDENTS_MAX_TOKENS else 0,
+                int(torch.cuda.current_stream().cuda_stream),
+            )
+            if _rc == 0:
+                return
     if (
         sp is None
         and nlive_buf is None

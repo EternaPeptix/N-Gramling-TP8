@@ -40,6 +40,118 @@ _SCONV_NLIVE = os.environ.get("INKLING_SCONV_NLIVE", "1").strip().lower() not in
 )
 _SCONV_PDL = int(os.environ.get("INKLING_SCONV_PDL", "1"))
 _PROLOGUE_CUDA = os.environ.get("INKLING_PROLOGUE_CUDA", "0") == "1"
+# Wave-V5 0-ULP CUDA Target Attention Prologue (`M = 17..256` C=32, optional `M = 1..16`):
+# clips R ONCE per token (vs 5x), eliminates 75% wasted TILE=4 K/V conv rows at M=17..32,
+# and reads 32 KiB L1-hot `RelProjT [1024, 16]` at literal 0-ULP (`nd == 0`)!
+_PROLOGUE_C32_V5 = os.environ.get("INKLING_PROLOGUE_C32_V5", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_PROLOGUE_C1_V5 = os.environ.get("INKLING_PROLOGUE_C1_V5", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_TARGET_ATTN_V5_LIB_PATH = os.environ.get(
+    "INKLING_TARGET_ATTN_V5_LIB", "/rdma/libtarget_attn_v5.so"
+).strip()
+_TARGET_ATTN_V5_LIB = None
+_TARGET_ATTN_V5_TRIED = False
+
+
+def _get_target_attn_v5_lib():
+    global _TARGET_ATTN_V5_LIB, _TARGET_ATTN_V5_TRIED
+    if not _TARGET_ATTN_V5_TRIED:
+        _TARGET_ATTN_V5_TRIED = True
+        if (_PROLOGUE_C32_V5 or _PROLOGUE_C1_V5) and _TARGET_ATTN_V5_LIB_PATH and os.path.exists(_TARGET_ATTN_V5_LIB_PATH):
+            try:
+                lib = ctypes.CDLL(_TARGET_ATTN_V5_LIB_PATH)
+                lib.attn_prologue_v5_exact_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int,
+                    ctypes.c_int64, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                lib.attn_prologue_v5_exact_fwd.restype = ctypes.c_int
+                _TARGET_ATTN_V5_LIB = lib
+                print(
+                    f"[inkling-prologue-v5] loaded {_TARGET_ATTN_V5_LIB_PATH} "
+                    f"(c32={int(_PROLOGUE_C32_V5)}, c1={int(_PROLOGUE_C1_V5)})",
+                    flush=True,
+                )
+            except Exception:
+                _TARGET_ATTN_V5_LIB = None
+    return _TARGET_ATTN_V5_LIB
+
+
+def _resolve_rel_proj_v5_meta(
+    rel_proj: torch.Tensor,
+    rel_proj_rev: torch.Tensor | None,
+    rel_proj_t: torch.Tensor | None,
+    is_local: bool | None,
+) -> tuple[torch.Tensor | None, bool | None]:
+    if rel_proj_t is not None and is_local is not None:
+        return rel_proj_t, bool(is_local)
+    cached = getattr(rel_proj, "_inkling_v5_meta", None)
+    if cached is not None:
+        return cached
+    if torch.cuda.is_current_stream_capturing() or rel_proj_rev is None:
+        return None, None
+    rpt = rel_proj_t if rel_proj_t is not None else rel_proj_rev.flip(-1).t().contiguous()
+    # In `shift_rel_proj`, `rel_proj[0, 16, 0]` corresponds to `dist = 1280 >= 1024`:
+    # `-inf` (`!= 0`) iff `is_local == True`, `+0.0` iff `is_local == False`.
+    loc = bool(is_local) if is_local is not None else bool(float(rel_proj[0, -1, 0].item()) != 0.0)
+    meta = (rpt, loc)
+    rel_proj._inkling_v5_meta = meta
+    return meta
+_PF_KVQ_V4 = os.environ.get("INKLING_PF_KVQ_V4", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_PF_NONMOE_V4_LIB_PATH = os.environ.get(
+    "INKLING_PF_NONMOE_V4_LIB", "/rdma/libpf_attn_nonmoe_v4_sm121.so"
+).strip()
+_PF_KVQ_V4_LIB = None
+_PF_KVQ_V4_TRIED = False
+
+
+def _get_pf_kvq_v4_lib():
+    global _PF_KVQ_V4_LIB, _PF_KVQ_V4_TRIED
+    if _PF_KVQ_V4_TRIED:
+        return _PF_KVQ_V4_LIB
+    _PF_KVQ_V4_TRIED = True
+    if not _PF_NONMOE_V4_LIB_PATH or not os.path.exists(_PF_NONMOE_V4_LIB_PATH):
+        return None
+    try:
+        lib = ctypes.CDLL(_PF_NONMOE_V4_LIB_PATH)
+        lib.kvq_prologue_pf_v4_sm121_fwd.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int, ctypes.c_int64, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int64,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_uint64,
+        ]
+        lib.kvq_prologue_pf_v4_sm121_fwd.restype = ctypes.c_int
+        _PF_KVQ_V4_LIB = lib
+    except Exception:
+        _PF_KVQ_V4_LIB = None
+    return _PF_KVQ_V4_LIB
 _TARGET_ATTN_LIB = None
 _TARGET_ATTN_LIB_TRIED = False
 _TREE_SPEC = os.environ.get("INKLING_TREE_SPEC", "0").strip().lower() not in (
@@ -629,7 +741,7 @@ def short_conv(
         block_t, block_c = (4, 256) if prefill else (2, 512)
     block_c = min(triton.next_power_of_2(channels), block_c)
     if (
-        (num_tokens >= 1024 or (192 <= num_tokens <= 384) or (_SCONV_V2_C32 and 33 <= num_tokens <= 384))
+        (num_tokens >= 192 or (_SCONV_V2_C32 and num_tokens >= 33))
         and width == 4
         and num_heads == 1
         and channels % 512 == 0
@@ -1157,6 +1269,8 @@ def attention_prologue(
     norm_eps: float,
     clip_eps: float = 1e-6,
     rel_proj_rev: torch.Tensor | None = None,
+    rel_proj_t: torch.Tensor | None = None,
+    is_local: bool | None = None,
     skip_rel: bool = False,
 ) -> None:
     """Attention input processing in one launch.
@@ -1368,7 +1482,165 @@ def attention_prologue(
             )
             if rc == 0:
                 return
-    if _PROLOGUE_PREFILL_OPT and num_tokens >= 256 and num_heads == 1:
+    if (
+        tree_st is None
+        and not skip_rel
+        and rel_out is not None
+        and (
+            (_PROLOGUE_C32_V5 and 17 <= num_tokens <= 256)
+            or (_PROLOGUE_C1_V5 and 0 < num_tokens <= 16)
+        )
+        and num_q_heads == 6
+        and num_heads == 1
+        and head_dim == 128
+        and d_rel == 16
+        and extent == 1024
+        and width == 4
+        and cache.shape[1] == 1
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and k_weight.dtype == torch.bfloat16
+        and v_weight.dtype == torch.bfloat16
+        and q_scale.dtype == torch.bfloat16
+        and r_scale.dtype == torch.bfloat16
+        and cache.dtype == torch.bfloat16
+        and key_cache.dtype == torch.bfloat16
+        and q_out.dtype == torch.bfloat16
+        and rel_out.dtype == torch.bfloat16
+        and (tau is None or (tau.dtype == torch.float32 and tau.is_contiguous()))
+        and (
+            not dynamic
+            or (k_dynamic.dtype == torch.bfloat16 and v_dynamic.dtype == torch.bfloat16)
+        )
+    ):
+        v5_lib = _get_target_attn_v5_lib()
+        if v5_lib is not None:
+            rpt_v5, loc_v5 = _resolve_rel_proj_v5_meta(rel_proj, rel_proj_rev, rel_proj_t, is_local)
+            if rpt_v5 is not None and loc_v5 is not None and rpt_v5.shape == (1024, 16) and rpt_v5.is_contiguous():
+                nl_buf = _rowar_nlive_buf(num_tokens)
+                rc_v5p = v5_lib.attn_prologue_v5_exact_fwd(
+                    k.data_ptr(),
+                    v.data_ptr(),
+                    k_weight.data_ptr(),
+                    v_weight.data_ptr(),
+                    k_dynamic.data_ptr() if dynamic else 0,
+                    v_dynamic.data_ptr() if dynamic else 0,
+                    cache.data_ptr(),
+                    key_cache.data_ptr(),
+                    value_cache.data_ptr(),
+                    kv_slot_mapping.data_ptr(),
+                    positions.data_ptr(),
+                    seq_idx.data_ptr(),
+                    slot_mapping.data_ptr(),
+                    block_table.data_ptr(),
+                    query_start.data_ptr(),
+                    q.data_ptr(),
+                    r.data_ptr(),
+                    q_scale.data_ptr(),
+                    r_scale.data_ptr(),
+                    tau.data_ptr() if tau is not None else 0,
+                    rpt_v5.data_ptr(),
+                    q_out.data_ptr(),
+                    rel_out.data_ptr(),
+                    cu_seqlens_q.data_ptr(),
+                    seq_lens.data_ptr(),
+                    nl_buf.data_ptr() if nl_buf is not None else 0,
+                    int(num_tokens),
+                    k.stride(0),
+                    v.stride(0),
+                    k_weight.stride(0),
+                    k_weight.stride(1),
+                    dyn_strides[0],
+                    dyn_strides[1],
+                    cache.stride(0),
+                    cache.stride(2),
+                    key_cache.stride(0),
+                    key_cache.stride(1),
+                    key_cache.shape[1],
+                    block_table.stride(0),
+                    block_table.shape[1],
+                    cache.shape[2],
+                    q.stride(0),
+                    r.stride(0),
+                    float((width * (2 if dynamic else 1) + 1) ** -0.5),
+                    float(clip_threshold),
+                    float(rel_threshold),
+                    float(clip_eps),
+                    float(norm_eps),
+                    1 if loc_v5 else 0,
+                    1 if dynamic else 0,
+                    1 if tau is not None else 0,
+                    1 if nl_buf is not None else 0,
+                    1,
+                    int(torch.cuda.current_stream(q.device).cuda_stream),
+                )
+                if rc_v5p == 0:
+                    return
+    if ((_PROLOGUE_PREFILL_OPT and num_tokens >= 256) or skip_rel) and num_heads == 1:
+        if (
+            skip_rel
+            and _PF_KVQ_V4
+            and num_q_heads == 6
+            and head_dim == 128
+            and width == 4
+            and cache.shape[1] == 1
+            and q.dtype == torch.bfloat16
+            and k.dtype == torch.bfloat16
+            and v.dtype == torch.bfloat16
+            and k_weight.dtype == torch.bfloat16
+            and v_weight.dtype == torch.bfloat16
+            and q_scale.dtype == torch.bfloat16
+            and cache.dtype == torch.bfloat16
+            and key_cache.dtype == torch.bfloat16
+            and q_out.dtype == torch.bfloat16
+            and kv_slot_mapping.dtype == torch.int64
+            and positions.dtype == torch.int64
+            and seq_idx.dtype == torch.int32
+            and slot_mapping.dtype == torch.int64
+            and block_table.dtype == torch.int32
+            and query_start.dtype == torch.int32
+            and (tau is None or (tau.dtype == torch.float32 and tau.is_contiguous()))
+            and (not dynamic or (k_dynamic.dtype == torch.bfloat16 and v_dynamic.dtype == torch.bfloat16))
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            v4_lib = _get_pf_kvq_v4_lib()
+            if v4_lib is not None:
+                rc_v4 = v4_lib.kvq_prologue_pf_v4_sm121_fwd(
+                    k.data_ptr(),
+                    v.data_ptr(),
+                    k_weight.data_ptr(),
+                    v_weight.data_ptr(),
+                    k_dynamic.data_ptr() if dynamic else 0,
+                    v_dynamic.data_ptr() if dynamic else 0,
+                    cache.data_ptr(),
+                    key_cache.data_ptr(),
+                    value_cache.data_ptr(),
+                    kv_slot_mapping.data_ptr(),
+                    positions.data_ptr(),
+                    seq_idx.data_ptr(),
+                    slot_mapping.data_ptr(),
+                    block_table.data_ptr(),
+                    query_start.data_ptr(),
+                    q.data_ptr(),
+                    q_scale.data_ptr(),
+                    tau.data_ptr() if tau is not None else 0,
+                    q_out.data_ptr(),
+                    int(num_tokens),
+                    k.stride(0), v.stride(0), k_weight.stride(0), k_weight.stride(1),
+                    dyn_strides[0], dyn_strides[1],
+                    cache.stride(0), cache.stride(2),
+                    key_cache.stride(0), key_cache.stride(1),
+                    int(key_cache.shape[1]), block_table.stride(0), int(block_table.shape[1]),
+                    int(cache.shape[2]), q.stride(0),
+                    float((width * (2 if dynamic else 1) + 1) ** -0.5),
+                    float(clip_threshold), float(clip_eps), float(norm_eps),
+                    1 if dynamic else 0,
+                    1 if tau is not None else 0,
+                    int(torch.cuda.current_stream(q.device).cuda_stream),
+                )
+                if rc_v4 == 0:
+                    return
         _kvq_prefill_kernel[(triton.cdiv(num_tokens, 4), num_heads, 3)](
             k, v, k_weight, v_weight,
             k_dynamic if dynamic else k_weight, v_dynamic if dynamic else v_weight,

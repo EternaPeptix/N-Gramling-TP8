@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     HiSparseResidentSpec,
     KVCacheGroupRole,
     KVCacheSpec,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     RSWASpec,
@@ -46,6 +47,31 @@ from vllm.v1.request import Request
 
 if TYPE_CHECKING:
     from vllm.v1.hisparse.coordinator import HiSparseCoordinator
+
+_FAST_SPARSE_SW_BLOCKS = os.environ.get("INKLING_FAST_SPARSE_SW_BLOCKS", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+# Wave-V10: Hoist hot-path os.environ lookups out of _sparse_real_mask() and
+# reachable_block_mask(), plus opt-in O(1)/O(K_live) 1M pop_blocks_for_free.
+_FAST_KV_FREE = os.environ.get("INKLING_FAST_KV_FREE", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_KV_BF12_ZERO_BF12_ONLY = os.environ.get("INKLING_KV_BF12_ZERO_BF12_ONLY", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_PREFILL_AR_OVERLAP_RAW = (
+    os.environ.get("INKLING_PREFILL_AR_OVERLAP", "0").strip().lower()
+)
+_PREFILL_AR_OVERLAP_ON = _PREFILL_AR_OVERLAP_RAW not in (
+    "0", "", "off", "false", "no",
+)
+_PREFILL_AR_OVERLAP_MIN_T = int(
+    os.environ.get("INKLING_PREFILL_AR_OVERLAP_MIN_T", "8192") or "8192"
+)
+_DRAFT_SWA_WARM_SLACK_BLKS = max(
+    0,
+    int(os.environ.get("INKLING_DRAFT_SWA_WARM_SLACK_BLKS", "8") or "8"),
+)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -119,6 +145,10 @@ class SingleTypeKVCacheManager(ABC):
             needs_kv_cache_zeroing
             and isinstance(kv_cache_spec, AttentionSpec)
             and not isinstance(kv_cache_spec, CircularBufferSpec)
+            and (
+                not _KV_BF12_ZERO_BF12_ONLY
+                or getattr(kv_cache_spec, "kv_quant_mode", None) == KVQuantMode.KV_BF12
+            )
         )
         self.new_block_ids: list[int] = []
 
@@ -162,6 +192,8 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_boundary_state_offloads: list[
             tuple[str, int, KVCacheBlock, int]
         ] = []
+        # Wave-V10 (INKLING_FAST_KV_FREE=1): exact monotonic leading-null prefix length per request.
+        self._null_head_idx: dict[str, int] = {}
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -319,6 +351,8 @@ class SingleTypeKVCacheManager(ABC):
 
         # Skip blocks are padded with null blocks.
         req_blocks.extend([self._null_block] * num_skipped_blocks)
+        if _FAST_KV_FREE and num_skipped_blocks > 0:
+            self._null_head_idx[request_id] = num_skipped_blocks
         # Add the remaining computed blocks.
         req_blocks.extend(new_computed_blocks)
         # All cached hits (including skipped nulls) are already cached; mark
@@ -480,6 +514,10 @@ class SingleTypeKVCacheManager(ABC):
         assert req_blocks[block_idx] is source_block
         assert not source_block.is_null and source_block.ref_cnt > 0
         req_blocks[block_idx] = cow_block
+        if _FAST_KV_FREE:
+            cur_nhl = self._null_head_idx.get(request_id, 0)
+            if block_idx < cur_nhl:
+                self._null_head_idx[request_id] = block_idx
         self._pending_cow_copies.append((source_block, cow_block))
         cow_block.ref_cnt += 1
 
@@ -595,6 +633,16 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        nhl = self._null_head_idx.pop(request_id, 0)
+        if (
+            _FAST_KV_FREE
+            and nhl > 0
+            and self.has_positionally_stable_blocks
+            and not isinstance(self, MambaManager)
+        ):
+            if nhl >= len(req_blocks):
+                return []
+            return trim_null_head(req_blocks[nhl:])
         return trim_null_head(req_blocks)
 
     def free(self, request_id: str) -> None:
@@ -679,12 +727,19 @@ class SingleTypeKVCacheManager(ABC):
         blocks = self.req_to_blocks[request_id]
         last_block = min(last_block, len(blocks))
 
+        hit_null_at: int | None = None
         freed: list[KVCacheBlock] = []
         for i in range(last_block - 1, first_block - 1, -1):
             if blocks[i] == self._null_block:
+                hit_null_at = i
                 break
             freed.append(blocks[i])
             blocks[i] = self._null_block
+        if _FAST_KV_FREE:
+            cur_nhl = self._null_head_idx.get(request_id, 0)
+            if first_block <= cur_nhl and (hit_null_at is None or hit_null_at < cur_nhl):
+                if last_block > cur_nhl:
+                    self._null_head_idx[request_id] = last_block
         if freed:
             self.block_pool.free_blocks(freed)
 
@@ -961,6 +1016,71 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # cached blocks.
         self.extra_retained_tokens = kv_cache_spec.extra_retained_tokens
         self.sparse_prefill_discard = kv_cache_spec.sparse_prefill_discard
+        # Wave-V10 (INKLING_FAST_KV_FREE=1): sparse live real-block map {idx: block} in
+        # strictly ascending allocation order for O(K_live) 1M free / mid-prefill abort.
+        self._sparse_real_blocks: dict[str, dict[int, KVCacheBlock]] = {}
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int = 0,
+    ) -> None:
+        super().add_local_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if _FAST_KV_FREE and self.sparse_prefill_discard:
+            req_blocks = self.req_to_blocks[request_id]
+            nhl = self._null_head_idx.get(request_id, 0)
+            rmap: dict[int, KVCacheBlock] = {}
+            for idx in range(nhl, len(req_blocks)):
+                blk = req_blocks[idx]
+                if blk is not self._null_block and not blk.is_discard:
+                    rmap[idx] = blk
+            self._sparse_real_blocks[request_id] = rmap
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
+    ) -> None:
+        prev_len = len(self.req_to_blocks.get(request_id, ()))
+        super().allocate_external_computed_blocks(
+            request_id,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+            record_for_zeroing=record_for_zeroing,
+        )
+        if _FAST_KV_FREE and self.sparse_prefill_discard and request_id in self.req_to_blocks:
+            req_blocks = self.req_to_blocks[request_id]
+            if len(req_blocks) > prev_len:
+                rmap = self._sparse_real_blocks.setdefault(request_id, {})
+                for idx in range(prev_len, len(req_blocks)):
+                    blk = req_blocks[idx]
+                    if blk is not self._null_block and not blk.is_discard:
+                        rmap[idx] = blk
+
+    def _apply_cow(
+        self,
+        request_id: str,
+        block_idx: int,
+        source_block: KVCacheBlock,
+        cow_block: KVCacheBlock,
+    ) -> None:
+        super()._apply_cow(request_id, block_idx, source_block, cow_block)
+        if _FAST_KV_FREE and self.sparse_prefill_discard:
+            rmap = self._sparse_real_blocks.get(request_id)
+            if rmap is not None:
+                if not cow_block.is_null and not cow_block.is_discard:
+                    rmap[block_idx] = cow_block
+                else:
+                    rmap.pop(block_idx, None)
 
     def _has_pool_discard_block(self) -> bool:
         return getattr(self.block_pool, "_sparse_discard_block", None) is not None
@@ -1048,11 +1168,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # from conv_state.kv_cache. Preserve the 2 midpoint blocks covering all
         # possible p0 % block_size alignments so DBO never collides on the shared
         # discard block (0 extra blocks when INKLING_PREFILL_AR_OVERLAP is off).
-        dbo_raw = os.environ.get("INKLING_PREFILL_AR_OVERLAP", "0").strip().lower()
-        if dbo_raw not in ("0", "", "off", "false", "no"):
-            dbo_min_t = int(
-                os.environ.get("INKLING_PREFILL_AR_OVERLAP_MIN_T", "8192") or "8192"
-            )
+        if (not self.kv_cache_spec.is_draft) and _PREFILL_AR_OVERLAP_ON:
+            dbo_raw = _PREFILL_AR_OVERLAP_RAW
+            dbo_min_t = _PREFILL_AR_OVERLAP_MIN_T
             start_tok = start_block * self.block_size
             step_new_est = num_tokens_main_model - start_tok
             if dbo_min_t > 0 and step_new_est + (self.block_size - 1) >= dbo_min_t:
@@ -1081,13 +1199,18 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                     reachable_boundaries.append(
                         request.shared_prefix_boundary - self.block_size
                     )
+            eff_ret = (
+                self.kv_cache_spec.sparse_retention_interval
+                if (self.kv_cache_spec.is_draft and retention_interval is None)
+                else retention_interval
+            )
             pc_mask = self.reachable_block_mask(
                 start_block=start_block,
                 end_block=end_block,
                 alignment_tokens=self.cache_hit_alignment_tokens,
                 kv_cache_spec=self.kv_cache_spec,
                 use_eagle=self.use_eagle,
-                retention_interval=retention_interval,
+                retention_interval=eff_ret,
                 reachable_boundaries=reachable_boundaries,
                 dcp_world_size=self.dcp_world_size,
             )
@@ -1218,6 +1341,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         if mask is None:
             new_blocks = self.block_pool.get_new_blocks(num_required_blocks - prev_len)
             req_blocks.extend(new_blocks)
+            if _FAST_KV_FREE:
+                rmap = self._sparse_real_blocks.setdefault(request_id, {})
+                for off, blk in enumerate(new_blocks):
+                    if blk is not self._null_block and not blk.is_discard:
+                        rmap[prev_len + off] = blk
             if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return cow_blocks + new_blocks
@@ -1236,6 +1364,14 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             for keep in mask
         ]
         req_blocks.extend(appended)
+        if _FAST_KV_FREE:
+            rmap = self._sparse_real_blocks.setdefault(request_id, {})
+            if real_blocks:
+                ri = 0
+                for off, keep in enumerate(mask):
+                    if keep:
+                        rmap[prev_len + off] = real_blocks[ri]
+                        ri += 1
         if self._record_new_block_ids and real_blocks:
             self.new_block_ids.extend(b.block_id for b in real_blocks)
         return cow_blocks + appended
@@ -1255,21 +1391,43 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         blocks = self.req_to_blocks[request_id]
         last_block = min(last_block, len(blocks))
 
+        rmap = self._sparse_real_blocks.get(request_id) if _FAST_KV_FREE else None
+        hit_null_at: int | None = None
         freed: list[KVCacheBlock] = []
         for i in range(last_block - 1, first_block - 1, -1):
             blk = blocks[i]
             if blk == self._null_block:
+                hit_null_at = i
                 break
             blocks[i] = self._null_block
             if not blk.is_discard:
                 freed.append(blk)
+                if rmap is not None:
+                    rmap.pop(i, None)
+        if _FAST_KV_FREE:
+            cur_nhl = self._null_head_idx.get(request_id, 0)
+            if first_block <= cur_nhl and (hit_null_at is None or hit_null_at < cur_nhl):
+                if last_block > cur_nhl:
+                    self._null_head_idx[request_id] = last_block
         if freed:
             self.block_pool.free_blocks(freed)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
-        blocks = super().pop_blocks_for_free(request_id)
         if not self.sparse_prefill_discard:
-            return blocks
+            return super().pop_blocks_for_free(request_id)
+        if _FAST_KV_FREE and request_id in self._sparse_real_blocks:
+            self.req_to_blocks.pop(request_id, None)
+            self.num_cached_block.pop(request_id, None)
+            self._partial_hit_reqs.pop(request_id, None)
+            self._null_head_idx.pop(request_id, None)
+            rmap = self._sparse_real_blocks.pop(request_id)
+            real_blocks = list(rmap.values())
+            released_discard = self._release_discard_user(request_id)
+            if released_discard is not None:
+                real_blocks.append(released_discard)
+            return real_blocks
+        self._sparse_real_blocks.pop(request_id, None)
+        blocks = super().pop_blocks_for_free(request_id)
         real_blocks = [blk for blk in blocks if not blk.is_discard]
         released_discard = self._release_discard_user(request_id)
         if released_discard is not None:
@@ -1307,13 +1465,18 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                     request.shared_prefix_boundary - self.block_size
                 )
 
+        eff_ret = (
+            self.kv_cache_spec.sparse_retention_interval
+            if (self.kv_cache_spec.is_draft and retention_interval is None)
+            else retention_interval
+        )
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
             alignment_tokens=self.cache_hit_alignment_tokens,
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=self.use_eagle,
-            retention_interval=retention_interval,
+            retention_interval=eff_ret,
             reachable_boundaries=reachable_boundaries,
             dcp_world_size=self.dcp_world_size,
         )
@@ -1397,45 +1560,104 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # sliding_window_contiguous_blocks),
         # which is good for low cache hit rate scenarios.
         max_num_blocks = max_length // kv_cache_spec.block_size
-        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
-            [block_pool.null_block] * max_num_blocks
-            for _ in range(len(kv_cache_group_ids))
-        )
         block_size = kv_cache_spec.block_size
+        if not _FAST_SPARSE_SW_BLOCKS:
+            computed_blocks_orig: tuple[list[KVCacheBlock], ...] = tuple(
+                [block_pool.null_block] * max_num_blocks
+                for _ in range(len(kv_cache_group_ids))
+            )
+            num_contiguous_blocks = 0
+            match_found = False
+            for i in range(max_num_blocks - 1, -1, -1):
+                if cached_block := block_pool.get_cached_block(
+                    block_hashes[i], kv_cache_group_ids
+                ):
+                    if num_contiguous_blocks == 0 and block_size != alignment_tokens:
+                        post_pop_blocks = i if drop_eagle_block else i + 1
+                        if (post_pop_blocks * block_size) % alignment_tokens != 0:
+                            continue
+                    for computed, cached in zip(computed_blocks_orig, cached_block):
+                        computed[i] = cached
+                    num_contiguous_blocks += 1
+                    if num_contiguous_blocks >= sliding_window_contiguous_blocks:
+                        for computed in computed_blocks_orig:
+                            del computed[i + num_contiguous_blocks :]
+                        match_found = True
+                        break
+                else:
+                    num_contiguous_blocks = 0
+            if not match_found:
+                for computed in computed_blocks_orig:
+                    del computed[num_contiguous_blocks:]
+                while (
+                    block_size != alignment_tokens
+                    and len(computed_blocks_orig[0]) * block_size % alignment_tokens != 0
+                ):
+                    for computed in computed_blocks_orig:
+                        computed.pop()
+            if drop_eagle_block and computed_blocks_orig[0]:
+                for computed in computed_blocks_orig:
+                    computed.pop()
+                while (
+                    block_size != alignment_tokens
+                    and len(computed_blocks_orig[0]) * block_size % alignment_tokens != 0
+                ):
+                    for computed in computed_blocks_orig:
+                        computed.pop()
+            return computed_blocks_orig, len(computed_blocks_orig[0]) * block_size
+
+        n_groups = len(kv_cache_group_ids)
+        check_align = block_size != alignment_tokens
         num_contiguous_blocks = 0
         match_found = False
+        matched_right = -1
+        matched_bins: list[Sequence[KVCacheBlock]] = []
         # Search from right to left and early stop when a match is found.
+        # Pre-filter unaligned right-edge candidates BEFORE dict lookup (~64x fewer lookups on bs=4!)
+        # and defer allocating [null_block] * hit_blocks until a match is actually found!
         for i in range(max_num_blocks - 1, -1, -1):
+            if num_contiguous_blocks == 0 and check_align:
+                post_pop_blocks = i if drop_eagle_block else i + 1
+                if (post_pop_blocks * block_size) % alignment_tokens != 0:
+                    continue
             if cached_block := block_pool.get_cached_block(
                 block_hashes[i], kv_cache_group_ids
             ):
-                # Skip prefix matching check if the block is not aligned with
-                # `alignment_tokens`.
-                if num_contiguous_blocks == 0 and block_size != alignment_tokens:
-                    post_pop_blocks = i if drop_eagle_block else i + 1
-                    if (post_pop_blocks * block_size) % alignment_tokens != 0:
-                        continue
-                # Add the cached block to the computed blocks.
-                for computed, cached in zip(computed_blocks, cached_block):
-                    computed[i] = cached
+                if num_contiguous_blocks == 0:
+                    matched_right = i
+                    matched_bins.clear()
+                matched_bins.append(cached_block)
                 num_contiguous_blocks += 1
                 if num_contiguous_blocks >= sliding_window_contiguous_blocks:
-                    # Trim the trailing blocks.
-                    # E.g., [NULL, NULL, 8, 3, NULL, 9] -> [NULL, NULL, 8, 3]
-                    # when sliding_window_contiguous_blocks=2.
-                    for computed in computed_blocks:
-                        del computed[i + num_contiguous_blocks :]
                     match_found = True
                     break
             else:
                 num_contiguous_blocks = 0
-        if not match_found:
-            # The first `num_contiguous_blocks` is a cache hit even if
+                matched_bins.clear()
+        if match_found:
+            total_len = matched_right + 1
+            start_i = total_len - num_contiguous_blocks
+            computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+                [block_pool.null_block] * total_len for _ in range(n_groups)
+            )
+            for offset, cached_grp in enumerate(matched_bins):
+                pos_i = matched_right - offset
+                if pos_i >= start_i:
+                    for g_idx in range(n_groups):
+                        computed_blocks[g_idx][pos_i] = cached_grp[g_idx]
+        else:
+            # The first `num_contiguous_blocks` (ending at 0) is a cache hit even if
             # `num_contiguous_blocks < sliding_window_contiguous_blocks`.
-            for computed in computed_blocks:
-                del computed[num_contiguous_blocks:]
+            computed_blocks = tuple(
+                [block_pool.null_block] * num_contiguous_blocks for _ in range(n_groups)
+            )
+            for offset, cached_grp in enumerate(matched_bins):
+                pos_i = num_contiguous_blocks - 1 - offset
+                if 0 <= pos_i < num_contiguous_blocks:
+                    for g_idx in range(n_groups):
+                        computed_blocks[g_idx][pos_i] = cached_grp[g_idx]
             while (
-                block_size != alignment_tokens  # Faster for common case.
+                check_align
                 and len(computed_blocks[0]) * block_size % alignment_tokens != 0
             ):
                 for computed in computed_blocks:
@@ -1529,10 +1751,17 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # land before segments would cover them under sparse retention, so keep
         # the ``need``-block tail ending on each boundary explicitly.
         if retention_interval is not None:
+            extra_slack = (
+                _DRAFT_SWA_WARM_SLACK_BLKS
+                if (kv_cache_spec.is_draft and kv_cache_spec.sparse_prefill_discard)
+                else 0
+            )
             for boundary_tokens in reachable_boundaries:
                 aligned = boundary_tokens // alignment_tokens * alignment_tokens
                 end = aligned // block_size + shift
-                for j in range(max(start_block, end - need), min(end_block, end)):
+                for j in range(
+                    max(start_block, end - need - extra_slack), min(end_block, end)
+                ):
                     mask[j - start_block] = True
 
         return mask

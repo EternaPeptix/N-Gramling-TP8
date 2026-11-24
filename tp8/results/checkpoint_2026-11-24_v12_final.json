@@ -1,0 +1,91 @@
+{
+  "date": "2026-11-24",
+  "cluster": "8x NVIDIA DGX Spark (GB10 SM121a, 48 SMs, 244 GB/s UMA LPDDR5X, 24 MiB L2, 121.63 GiB UMA/node, 4x 200GbE ConnectX-7 RoCEv2)",
+  "model": "thinkingmachines/Inkling-2-Small (594B total / 17B active MoE, TP8, 40 NVFP4 local SWA W=1024 + 8 MXFP8 global, 5-layer DSpark drafter K=7)",
+  "promoted_config": {
+    "name": "V12-FINAL (Unified Wave-V12 Clean-UMA 6-for-6 Champion)",
+    "path": "tp8/config/live_champion_v12.env",
+    "sha256": "f028df17b5507f0b678214de1f8cd9048f95b44e57676b3698e8c7223d698d81",
+    "gmu": 0.85,
+    "max_num_batched_tokens": 24576,
+    "kv_cache_tokens": 7791866,
+    "kv_cache_1m_residency_x": 7.43,
+    "cuda_graph_gib": 1.84,
+    "cuda_graph_capture_s": 5.0
+  },
+  "optional_sam_variant": {
+    "name": "V12-B11 (GPU-SAM Hybrid Agentic Variant, Zero-Swap)",
+    "path": "tp8/config/live_champion_v12_sam.env",
+    "sha256": "8f2e30861c168a2347385016f59280f32cb80bdebb7e8e1f02e2b5f7f8853d28",
+    "gmu": 0.76,
+    "exact_ink_sha256": "1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3",
+    "warm_c1_exact_ink_tok_s": 155.69,
+    "c4_conc_exact_tok_s": 184.17
+  },
+  "rollback_baseline": {
+    "name": "EXP-6B (2026-11-22)",
+    "path": "tp8/config/best.env",
+    "sha256": "a4a8aa6235d000b0a6fa4eb38e4b3d34f7acc8a3413b0496ed80788ee7692cb5"
+  },
+  "clean_uma_verification": {
+    "contiguous_32mib_blocks_per_node": "3720-3724",
+    "gates": {
+      "bit_exact_decode": {
+        "status": "PASS",
+        "tool": "exact_ink.py (10 prompts, temp=0, 384 tok, serial)",
+        "matches": "10/10 cold and warm",
+        "sha256": "1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3"
+      },
+      "c1_decode": {
+        "exact_ink_tok_s": 151.66,
+        "exact_ink_wall_s": 21.74,
+        "bench_single_g1_gm_tok_s": 137.20,
+        "bench_single_breakdown_tok_s": {
+          "code": 131.0,
+          "prose": 106.2,
+          "math": 174.4
+        },
+        "exp7c_exact_ink_tok_s": 147.12,
+        "inc_p7_exact_ink_tok_s": 147.58
+      },
+      "c2_to_c8_middle_zone": {
+        "bench_c2_256t": {"agg_tok_s": 134.60, "mean_tok_s": 80.39, "min_tok_s": 72.46, "al": 2.33},
+        "conc_exact_c4_128t": {"warm_tok_s": 200.78, "cold_tok_s": 196.92, "wall_s": 2.55, "exp7c_tok_s": 186.86, "inc_p7_tok_s": 194.68},
+        "bench_c4_256t": {"agg_tok_s": 181.25, "mean_tok_s": 57.52, "min_tok_s": 48.20, "al": 2.50, "inc_p7_agg_tok_s": 176.55},
+        "conc_exact_c8_128t": {"cold_tok_s": 286.03, "warm_tok_s": 279.78, "wall_s": 3.58, "exp7c_tok_s": 265.97, "inc_p7_tok_s": 274.53},
+        "bench_c8_256t": {"agg_tok_s": 269.66, "mean_tok_s": 45.12, "min_tok_s": 36.36, "al": 2.62, "inc_p7_agg_tok_s": 215.95}
+      },
+      "c32_throughput": {
+        "conc_exact_c32_128t": {"warm_tok_s": 496.72, "cold_tok_s": 492.90, "wall_s": 8.24, "exp7c_tok_s": 463.87, "inc_p7_tok_s": 487.62},
+        "bench_c32_256t": {"agg_tok_s": 563.02, "mean_tok_s": 22.90, "min_tok_s": 18.88, "al": 2.35, "inc_p7_agg_tok_s": 494.44}
+      },
+      "long_context_prefill": {
+        "32k": {"cold_ttft_s": 4.30, "warm_ttft_s": 0.32, "decode_tok_s": 158.4, "needles": "3/3"},
+        "128k": {"cold_ttft_s": 14.45, "warm_ttft_s": 0.44, "decode_tok_s": 134.0, "needles": "3/3"},
+        "1m": {"cold_ttft_s": 112.07, "warm_ttft_s": 2.36, "prefill_tok_s": 9354.0, "decode_tok_s": 64.9, "needles": "3/3", "exp7c_cold_s": 118.86, "inc_p7_cold_s": 112.83}
+      },
+      "kv_residency_and_health": {
+        "simultaneous_1m_x": 7.43,
+        "kv_tokens": 7791866,
+        "cuda_graph_gib": 1.84,
+        "health": "HEALTH_200_OK"
+      }
+    }
+  },
+  "shipped_wave_v12_upgrades": [
+    "CertHead V12 (libcert_head_fast_v12.so, ref=b1_exact, 63/63 ok M=2..64; eliminates -717 us/step FP32 lm_head fallback at C=4..8)",
+    "Drafter U4 TC V9 (libdrafter_u4_tc_v9.so, MIN_M=9; -260 us/step at C=2..8, B=1 untouched)",
+    "DSpark V10 4-typo fix (dspark_ops.py: tc_skip=1/1, es_tc=1, top2_id=1; unlocks native Batch-ES at B=2..8)",
+    "L2PF v11 adaptive C=2..8 QKVR+tail + PDL_WO_BF11=1 + DTGraph/SyncFree Fast-Replay v11",
+    "C=4 (B=3..4) 48-CTA SWA 100% SM utilization (INKLING_FUSED_ATTN_V8_SWA_MIN_B=5, INKLING_FUSED_ATTN_C28_SWA_B34_SPLITS=4)",
+    "Context-Aware Tau (INKLING_CTX_ADAPTIVE_TAU=1, FLOOR=0.04)",
+    "Proven 1M Prefill stack (v4 MoE + V10 non-MoE + 8ch NCCL Ring + MAX_BATCHED=24576 -> 112.07s cold / 2.36s warm)"
+  ],
+  "rejected_live_candidates": [
+    {"name": "MX6-Huff7 V12 (libmxfp8_mx6_v12.so)", "verdict": "0-ULP PASS (1dcfb306 10/10) with MX7=0, but Huffman decode ALU overhead trailed MX7 v5"},
+    {"name": "BF11 V12 BM=48 (libbf11_flip_exact_v12.so)", "verdict": "Ran inside captured prefill graphs M=17..128 shifting exact_ink prompts 2..9 to 8625340b (2/10); needs decode-only capture gate"},
+    {"name": "INKLING_HETERO_BUDGET_SPEC=1", "verdict": "+11.1% bench C=4 mean at 1dcfb306, but deadlocked on drain across K=5->7 schedule transitions"},
+    {"name": "INKLING_MOE_S8=1 + c1_v12", "verdict": "+7.8 tok/s C=1 lift, but shifted exact_ink to 9859daa8 (0/10) / a5dc798c (2/10); needs S8 router/combine 1-ULP isolation"},
+    {"name": "c48_v12 (4 6 4 4 3) + FC=2", "verdict": "Section A proved 10/10 1dcfb306 (closing Wave-V10 dadc285c bug), but FC=2 and conservative 46443 occupancy trailed libnvfp4_ws5_c32.so"}
+  ]
+}

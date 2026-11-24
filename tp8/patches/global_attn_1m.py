@@ -69,6 +69,86 @@ _ENV_MIN_CTAS = int(os.environ.get("INKLING_PF_GLOBAL_MIN_CTAS", "2") or 2)
 _PF_GLOBAL_ZERO_SYNC = os.environ.get("INKLING_PF_GLOBAL_ZERO_SYNC", "0").strip().lower() in (
     "1", "on", "true", "yes",
 )
+_PF_TOPK_V4 = os.environ.get("INKLING_PF_TOPK_V4", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_PF_NONMOE_V4_LIB_ENV = os.environ.get(
+    "INKLING_PF_NONMOE_V4_LIB", "/rdma/libpf_attn_nonmoe_v4_sm121.so"
+).strip()
+# Wave-V10 opt-in FP8 P@V attention v6 library (`libpf_fp8_attn_v6.so`, default OFF;
+# strictly gated on `max_seqlen_q >= 1024` & `!capturing` so Warm-1M `qlen=436` stays on v5_zspill!)
+_PF_FP8_ATTN_V6 = os.environ.get("INKLING_PF_FP8_ATTN_V6", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_PF_FP8_ATTN_V6_LIB_ENV = os.environ.get(
+    "INKLING_PF_FP8_ATTN_V6_LIB", "/rdma/libpf_fp8_attn_v6.so"
+).strip()
+_PF_FP8_PV_F16_ACC = os.environ.get("INKLING_PF_FP8_PV_F16_ACC", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_NONMOE_V4_LIB = None
+_NONMOE_V4_TRIED = False
+_TOPK_SEL_SCRATCH: dict[object, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def get_nonmoe_v4_lib():
+    global _NONMOE_V4_LIB, _NONMOE_V4_TRIED
+    if _NONMOE_V4_TRIED:
+        return _NONMOE_V4_LIB
+    _NONMOE_V4_TRIED = True
+    if not _PF_NONMOE_V4_LIB_ENV or not os.path.exists(_PF_NONMOE_V4_LIB_ENV):
+        return None
+    try:
+        lib = ctypes.CDLL(_PF_NONMOE_V4_LIB_ENV)
+        lib.quantize_k_shadow_v4_sm121_fwd.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_uint64,
+        ]
+        lib.quantize_k_shadow_v4_sm121_fwd.restype = ctypes.c_int
+        lib.score_topk_sort_fp8_v4_sm121_fwd.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+        ]
+        lib.score_topk_sort_fp8_v4_sm121_fwd.restype = ctypes.c_int
+        _NONMOE_V4_LIB = lib
+    except Exception:
+        _NONMOE_V4_LIB = None
+    return _NONMOE_V4_LIB
+
+
+def _get_topk_sel_scratch(device, n_ctas: int, k_sel: int) -> tuple[torch.Tensor, torch.Tensor]:
+    pair = _TOPK_SEL_SCRATCH.get(device)
+    if pair is None or pair[0].shape[0] < n_ctas or pair[0].shape[1] < k_sel:
+        cap_c = max(n_ctas, 384)
+        cap_k = max(k_sel, 64)
+        pair = (
+            torch.empty((cap_c, cap_k), dtype=torch.int32, device=device),
+            torch.empty((cap_c,), dtype=torch.int32, device=device),
+        )
+        _TOPK_SEL_SCRATCH[device] = pair
+    return pair[0][:n_ctas, :k_sel], pair[1][:n_ctas]
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CUDA_LIB_ENV = os.environ.get("INKLING_PF_GLOBAL_LIB", "").strip()
@@ -104,6 +184,19 @@ def _get_topk_scores_scratch(device, n_ctas: int, max_pblks: int) -> torch.Tenso
 
 def _get_cuda_scratch(device, T: int, H: int, D: int):
     """Cached contiguous scratch (acc, m, l) for CUDA prefix -> Triton tail merge."""
+    try:
+        from . import linear as _lin_mod
+
+        if getattr(_lin_mod, "_SHARED_PF_SCRATCH", False):
+            acc_bytes = (T * H * D * 4 + 255) & ~255
+            ml_bytes = (T * H * 4 + 255) & ~255
+            buf = _lin_mod.get_shared_pf_scratch(device, acc_bytes + 2 * ml_bytes)
+            acc = buf[: T * H * D * 4].view(torch.float32).view(T, H, D)
+            m = buf[acc_bytes : acc_bytes + T * H * 4].view(torch.float32).view(T, H)
+            l = buf[acc_bytes + ml_bytes : acc_bytes + ml_bytes + T * H * 4].view(torch.float32).view(T, H)
+            return acc, m, l
+    except Exception:
+        pass
     key = (device, H, D)
     entry = _CUDA_SCRATCH.get(key)
     if entry is None or entry[0].shape[0] < T:
@@ -232,6 +325,38 @@ def get_cuda_lib(lib_path: str | None = None):
             ctypes.c_uint64,  # stream
         ]
         lib.global_sage2_prefix_v5_sm121_fwd.restype = ctypes.c_int
+    if hasattr(lib, "pf_fp8_attn_v6_version"):
+        lib.pf_fp8_attn_v6_version.argtypes = []
+        lib.pf_fp8_attn_v6_version.restype = ctypes.c_int
+    if hasattr(lib, "global_sage2_prefix_v6_sm121_fwd"):
+        lib.global_sage2_prefix_v6_sm121_fwd.argtypes = [
+            ctypes.c_void_p,  # Q [T, H, D] bf16
+            ctypes.c_void_p,  # K_fp8 [CAP, BS, Hkv, D] fp8_e4m3fn (uint8)
+            ctypes.c_void_p,  # KS64 [CAP, Hkv, BS//64] fp32
+            ctypes.c_void_p,  # V [NBLK, BS, Hkv, D] bf16
+            ctypes.c_void_p,  # BT [R, max_blks] int32
+            ctypes.c_void_p,  # SEQ [R] int32
+            ctypes.c_void_p,  # CUQ [R+1] int32
+            ctypes.c_void_p,  # SEL_BLOCKS
+            ctypes.c_void_p,  # SEL_COUNTS
+            ctypes.c_void_p,  # ACC_OUT [T, H, D] fp32
+            ctypes.c_void_p,  # M_OUT [T, H] fp32
+            ctypes.c_void_p,  # L_OUT [T, H] fp32
+            ctypes.c_int64, ctypes.c_int64,  # sq_t, sq_h
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,  # sk8_b, sk8_s, sk8_h
+            ctypes.c_int64, ctypes.c_int64,  # sks64_b, sks64_h
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,  # sv_b, sv_s, sv_h
+            ctypes.c_int64,  # sbt_r
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # num_reqs, max_seqlen_q, H, G
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # BS, E, bn, min_ctas, sel_stride
+            ctypes.c_float, ctypes.c_float,  # scale_log2, pv_skip_tau
+            ctypes.c_void_p,  # K_BT [R, max_kblks] int32
+            ctypes.c_int64,   # skbt_r
+            ctypes.c_int,     # k_bt_mode
+            ctypes.c_int,     # pv_f16_acc (0=f32 PV accum, 1=f16 PV accum)
+            ctypes.c_uint64,  # stream
+        ]
+        lib.global_sage2_prefix_v6_sm121_fwd.restype = ctypes.c_int
     if hasattr(lib, "score_kmax_blocks_fp8_sm121_fwd"):
         lib.score_kmax_blocks_fp8_sm121_fwd.argtypes = [
             ctypes.c_void_p,  # Q
@@ -336,13 +461,17 @@ def _quantize_k_slots_fp8_kernel(
     tl.store(K_SCALE_OUT + blk * sks_b + kvh * sks_h + slot, k_scale, mask=valid)
 
 
-def alloc_fp8_shadow_k(key_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def alloc_fp8_shadow_k(
+    key_cache: torch.Tensor,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate matching shadow FP8 E4M3 K cache & per-token FP32 scale buffer.
     Layout: k_fp8 [NBLK, BS, Hkv, D] float8_e4m3fn, k_scale [NBLK, Hkv, BS] float32.
     Memory at 1M tokens (4096 blocks x 256 x 1 x 128): 128 MiB + 4 MiB = 132 MiB per global layer!"""
     nblk, bs, hkv, d = key_cache.shape
-    k_fp8 = torch.empty((nblk, bs, hkv, d), dtype=torch.float8_e4m3fn, device=key_cache.device)
-    k_scale = torch.empty((nblk, hkv, bs), dtype=torch.float32, device=key_cache.device)
+    dev = device if device is not None else key_cache.device
+    k_fp8 = torch.empty((nblk, bs, hkv, d), dtype=torch.float8_e4m3fn, device=dev)
+    k_scale = torch.empty((nblk, hkv, bs), dtype=torch.float32, device=dev)
     return k_fp8, k_scale
 
 
@@ -461,6 +590,7 @@ def alloc_fp8_shadow_k_v3(
     key_cache: torch.Tensor,
     with_kmax: bool = False,
     cap_blks: int | None = None,
+    device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Allocate v3 FP8 shadow K + per-64-token FP32 scale (+ optional exact-Kmax bounding box).
     When `cap_blks` is provided (Compact Shadow K, e.g. 4096), allocates constant 1.016 GiB total
@@ -468,11 +598,17 @@ def alloc_fp8_shadow_k_v3(
     nblk, bs, hkv, d = key_cache.shape
     nblk_alloc = min(nblk, int(cap_blks)) if (cap_blks is not None and cap_blks > 0) else nblk
     assert bs % 64 == 0, f"v3 requires BS % 64 == 0, got {bs}"
-    k_fp8 = torch.empty((nblk_alloc, bs, hkv, d), dtype=torch.float8_e4m3fn, device=key_cache.device)
-    k_scale64 = torch.empty((nblk_alloc, hkv, bs // 64), dtype=torch.float32, device=key_cache.device)
+    dev = device if device is not None else key_cache.device
+    k_fp8 = torch.empty((nblk_alloc, bs, hkv, d), dtype=torch.float8_e4m3fn, device=dev)
+    k_scale64 = torch.empty((nblk_alloc, hkv, bs // 64), dtype=torch.float32, device=dev)
     if with_kmax:
-        k_mid = torch.empty((nblk_alloc, hkv, d), dtype=torch.bfloat16, device=key_cache.device)
-        k_rad = torch.empty((nblk_alloc, hkv, d), dtype=torch.bfloat16, device=key_cache.device)
+        k_mid = torch.empty((nblk_alloc, hkv, d), dtype=torch.bfloat16, device=dev)
+        k_rad = torch.empty((nblk_alloc, hkv, d), dtype=torch.bfloat16, device=dev)
+        if _PF_TOPK_V4 and d == 128 and get_nonmoe_v4_lib() is not None:
+            k_mid_fp8 = torch.empty((nblk_alloc, hkv, d), dtype=torch.float8_e4m3fn, device=dev)
+            k_rad_fp8 = torch.empty((nblk_alloc, hkv, d), dtype=torch.float8_e4m3fn, device=dev)
+            k_box_sc = torch.empty((nblk_alloc, hkv, 2), dtype=torch.float32, device=dev)
+            k_mid._v4_fp8_boxes = (k_mid_fp8, k_rad_fp8, k_box_sc)
     else:
         k_mid = k_rad = None
     return k_fp8, k_scale64, k_mid, k_rad
@@ -503,6 +639,44 @@ def quantize_k_to_fp8_blocks_v3(
     num_blks = int(ids.numel()) if has_ids else nblk
     if num_blks == 0:
         return k_fp8_cache, k_scale64_cache, k_mid_cache, k_rad_cache
+    v4_boxes = getattr(k_mid_cache, "_v4_fp8_boxes", None) if want_kmax else None
+    v4_lib = get_nonmoe_v4_lib() if (_PF_TOPK_V4 and v4_boxes is not None) else None
+    if (
+        v4_lib is not None
+        and has_ids
+        and int(out_offset) == 0
+        and d == 128
+        and bs % 64 == 0
+        and ids.dtype == torch.int32
+        and key_cache.dtype == torch.bfloat16
+        and key_cache.stride(3) == 1
+        and k_fp8_cache.stride(3) == 1
+    ):
+        km8, kr8, kb_sc = v4_boxes
+        rc = v4_lib.quantize_k_shadow_v4_sm121_fwd(
+            key_cache.data_ptr(),
+            k_fp8_cache.data_ptr(),
+            k_scale64_cache.data_ptr(),
+            k_mid_cache.data_ptr(),
+            k_rad_cache.data_ptr(),
+            km8.data_ptr(),
+            kr8.data_ptr(),
+            kb_sc.data_ptr(),
+            ids.data_ptr(),
+            0,
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+            k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
+            k_scale64_cache.stride(0), k_scale64_cache.stride(1),
+            k_mid_cache.stride(0), k_mid_cache.stride(1),
+            km8.stride(0), km8.stride(1),
+            kb_sc.stride(0) // 2, kb_sc.stride(1) // 2,
+            int(num_blks), 0, 0,
+            0, 1, 1 if compact_out else 0,
+            int(bs), int(hkv),
+            int(torch.cuda.current_stream(key_cache.device).cuda_stream),
+        )
+        if rc == 0:
+            return k_fp8_cache, k_scale64_cache, k_mid_cache, k_rad_cache
     dummy_m = k_mid_cache if want_kmax else key_cache
     dummy_r = k_rad_cache if want_kmax else key_cache
     smid_b = k_mid_cache.stride(0) if want_kmax else 0
@@ -517,6 +691,30 @@ def quantize_k_to_fp8_blocks_v3(
         HAS_IDS=has_ids, COMPUTE_KMAX=want_kmax, COMPACT_OUT=bool(compact_out), BS=bs, D=d,
         num_warps=4, num_stages=2,
     )
+    if v4_boxes is not None and want_kmax and k_mid_cache is not None and k_rad_cache is not None:
+        # Wave-V9 safety: keep pre-quantized FP8 Quest boxes synchronized when Triton fallback runs
+        # (e.g., out_offset > 0 under INKLING_PF_GLOBAL_ZERO_SYNC=0 or non-int32 ids).
+        km8, kr8, kb_sc = v4_boxes
+        if compact_out:
+            sl = slice(int(out_offset), int(out_offset) + num_blks)
+            km_sub = k_mid_cache[sl].float()
+            kr_sub = k_rad_cache[sl].float()
+            km_am = km_sub.abs().amax(dim=-1, keepdim=True).clamp(min=1.0e-12)
+            kr_am = kr_sub.abs().amax(dim=-1, keepdim=True).clamp(min=1.0e-12)
+            km8[sl].copy_((km_sub * (22.0 / km_am)).to(torch.float8_e4m3fn))
+            kr8[sl].copy_((kr_sub * (22.0 / kr_am)).to(torch.float8_e4m3fn))
+            kb_sc[sl, :, 0].copy_((km_am.squeeze(-1) * (1.0 / 22.0)))
+            kb_sc[sl, :, 1].copy_((kr_am.squeeze(-1) * (1.0 / 22.0)))
+        else:
+            sel_idx = ids.to(torch.int64) if has_ids else torch.arange(num_blks, device=key_cache.device)
+            km_sub = k_mid_cache.index_select(0, sel_idx).float()
+            kr_sub = k_rad_cache.index_select(0, sel_idx).float()
+            km_am = km_sub.abs().amax(dim=-1, keepdim=True).clamp(min=1.0e-12)
+            kr_am = kr_sub.abs().amax(dim=-1, keepdim=True).clamp(min=1.0e-12)
+            km8.index_copy_(0, sel_idx, (km_sub * (22.0 / km_am)).to(torch.float8_e4m3fn))
+            kr8.index_copy_(0, sel_idx, (kr_sub * (22.0 / kr_am)).to(torch.float8_e4m3fn))
+            sc_pair = torch.stack((km_am.squeeze(-1) * (1.0 / 22.0), kr_am.squeeze(-1) * (1.0 / 22.0)), dim=-1)
+            kb_sc.index_copy_(0, sel_idx, sc_pair)
     return k_fp8_cache, k_scale64_cache, k_mid_cache, k_rad_cache
 
 
@@ -585,6 +783,73 @@ def _quantize_k_blocks_fp8_v3_syncfree_kernel(
 
 
 @triton.jit
+def _quantize_k_blocks_fp8_v3_local_syncfree_kernel(
+    K_IN, K_FP8_OUT, KS64_OUT, K_MID_OUT, K_RAD_OUT,
+    KM8_OUT, KR8_OUT, KBSC_OUT, BT_ROW, BT_STATE,
+    sk_b, sk_s, sk_h,
+    sk8_b, sk8_s, sk8_h,
+    sks_b, sks_h,
+    smid_b, smid_h,
+    skm8_b, skm8_h,
+    skbsc_b, skbsc_h,
+    NUM_BLKS, OUT_OFFSET, PREV_IDX,
+    CHECK_CONTIG: tl.constexpr,
+    COMPUTE_KMAX: tl.constexpr,
+    COMPUTE_V4_BOXES: tl.constexpr,
+    COMPACT_OUT: tl.constexpr,
+    BS: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Zero-sync chunked Shadow-K quantizer for KV-BF12 unpacked `[NUM_BLKS, BS, Hkv, D]` staging.
+    Reads local index `b_idx` from `K_IN`; when `CHECK_CONTIG=True`, early-exits in 1 cycle if
+    `[BT_ROW[0], BT_ROW[PREV_IDX]] == BT_STATE` (0 DRAM reads on contiguous prefix chunks).
+    Updates `k_fp8`, `ks64`, `k_mid/k_rad`, AND pre-quantized FP8 Quest boxes (`km8/kr8/kb_sc`)."""
+    b_idx = tl.program_id(0)
+    kvh = tl.program_id(1)
+    if b_idx >= NUM_BLKS:
+        return
+    if CHECK_CONTIG:
+        if tl.load(BT_ROW) == tl.load(BT_STATE):
+            if tl.load(BT_ROW + PREV_IDX) == tl.load(BT_STATE + 1):
+                return
+    src_blk = b_idx.to(tl.int64)
+    log_blk = (OUT_OFFSET + b_idx).to(tl.int64)
+    out_blk = log_blk if COMPACT_OUT else tl.load(BT_ROW + log_blk).to(tl.int64)
+    dd = tl.arange(0, D)
+    s_off = tl.arange(0, 64)
+
+    if COMPUTE_KMAX:
+        b_min = tl.full([D], float("inf"), tl.float32)
+        b_max = tl.full([D], float("-inf"), tl.float32)
+
+    for g in range(0, BS // 64):
+        ss = g * 64 + s_off
+        k = tl.load(K_IN + src_blk * sk_b + ss[:, None] * sk_s + kvh * sk_h + dd[None, :]).to(tl.float32)
+        amax64 = tl.maximum(tl.max(tl.abs(k)), 1.0e-12)
+        k_fp8 = (k * (22.0 / amax64)).to(tl.float8e4nv)
+        tl.store(K_FP8_OUT + out_blk * sk8_b + ss[:, None] * sk8_s + kvh * sk8_h + dd[None, :], k_fp8)
+        tl.store(KS64_OUT + out_blk * sks_b + kvh * sks_h + g, amax64 * (1.0 / 22.0))
+        if COMPUTE_KMAX:
+            b_min = tl.minimum(b_min, tl.min(k, axis=0))
+            b_max = tl.maximum(b_max, tl.max(k, axis=0))
+
+    if COMPUTE_KMAX:
+        k_mid = (0.5 * (b_max + b_min)).to(tl.bfloat16)
+        k_rad = (0.5 * (b_max - b_min)).to(tl.bfloat16)
+        tl.store(K_MID_OUT + out_blk * smid_b + kvh * smid_h + dd, k_mid)
+        tl.store(K_RAD_OUT + out_blk * smid_b + kvh * smid_h + dd, k_rad)
+        if COMPUTE_V4_BOXES:
+            km_f = k_mid.to(tl.float32)
+            kr_f = k_rad.to(tl.float32)
+            km_am = tl.maximum(tl.max(tl.abs(km_f), axis=0), 1.0e-12)
+            kr_am = tl.maximum(tl.max(tl.abs(kr_f), axis=0), 1.0e-12)
+            tl.store(KM8_OUT + out_blk * skm8_b + kvh * skm8_h + dd, (km_f * (22.0 / km_am)).to(tl.float8e4nv))
+            tl.store(KR8_OUT + out_blk * skm8_b + kvh * skm8_h + dd, (kr_f * (22.0 / kr_am)).to(tl.float8e4nv))
+            tl.store(KBSC_OUT + out_blk * skbsc_b + kvh * skbsc_h + 0, km_am * (1.0 / 22.0))
+            tl.store(KBSC_OUT + out_blk * skbsc_b + kvh * skbsc_h + 1, kr_am * (1.0 / 22.0))
+
+
+@triton.jit
 def _quantize_k_blocks_fp8_v2_syncfree_kernel(
     K_IN, K_FP8_OUT, K_SCALE_OUT, BT_ROW, BT_STATE,
     sk_b, sk_s, sk_h,
@@ -642,6 +907,50 @@ def quantize_k_to_fp8_blocks_v3_syncfree(
         return
     _, bs, hkv, d = key_cache.shape
     want_kmax = with_kmax and (k_mid_cache is not None) and (k_rad_cache is not None)
+    v4_boxes = getattr(k_mid_cache, "_v4_fp8_boxes", None) if want_kmax else None
+    v4_lib = get_nonmoe_v4_lib() if _PF_TOPK_V4 else None
+    if (
+        v4_lib is not None
+        and d == 128
+        and bs % 64 == 0
+        and bt_row.dtype == torch.int32
+        and bt_row.stride(0) == 1
+        and bt_state.dtype == torch.int32
+        and key_cache.dtype == torch.bfloat16
+        and key_cache.stride(3) == 1
+        and k_fp8_cache.stride(3) == 1
+        and (not want_kmax or v4_boxes is not None)
+    ):
+        km8, kr8, kb_sc = v4_boxes if v4_boxes is not None else (None, None, None)
+        rc = v4_lib.quantize_k_shadow_v4_sm121_fwd(
+            key_cache.data_ptr(),
+            k_fp8_cache.data_ptr(),
+            k_scale64_cache.data_ptr(),
+            k_mid_cache.data_ptr() if want_kmax else 0,
+            k_rad_cache.data_ptr() if want_kmax else 0,
+            km8.data_ptr() if km8 is not None else 0,
+            kr8.data_ptr() if kr8 is not None else 0,
+            kb_sc.data_ptr() if kb_sc is not None else 0,
+            bt_row.data_ptr(),
+            bt_state.data_ptr(),
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+            k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
+            k_scale64_cache.stride(0), k_scale64_cache.stride(1),
+            k_mid_cache.stride(0) if want_kmax else 0,
+            k_mid_cache.stride(1) if want_kmax else 0,
+            km8.stride(0) if km8 is not None else 0,
+            km8.stride(1) if km8 is not None else 0,
+            (kb_sc.stride(0) // 2) if kb_sc is not None else 0,
+            (kb_sc.stride(1) // 2) if kb_sc is not None else 0,
+            int(nblks), int(start_blk), int(prev_idx),
+            1 if check_contig else 0,
+            1 if want_kmax else 0,
+            1 if compact_out else 0,
+            int(bs), int(hkv),
+            int(torch.cuda.current_stream(key_cache.device).cuda_stream),
+        )
+        if rc == 0:
+            return
     dummy_m = k_mid_cache if want_kmax else key_cache
     dummy_r = k_rad_cache if want_kmax else key_cache
     smid_b = k_mid_cache.stride(0) if want_kmax else 0
@@ -658,6 +967,62 @@ def quantize_k_to_fp8_blocks_v3_syncfree(
         num_warps=4, num_stages=2,
     )
     _update_bt_state_kernel[(1,)](bt_row, bt_state, nblks - 1, num_warps=1)
+
+
+def update_bt_state_gpu(bt_row: torch.Tensor, bt_state: torch.Tensor, end_idx: int) -> None:
+    """Zero-sync GPU update of `[bt_state[0], bt_state[1]] = [bt_row[0], bt_row[end_idx]]`."""
+    _update_bt_state_kernel[(1,)](bt_row, bt_state, int(end_idx), num_warps=1)
+
+
+def quantize_k_to_fp8_blocks_v3_local_syncfree(
+    k_local_stage: torch.Tensor,
+    k_fp8_cache: torch.Tensor,
+    k_scale64_cache: torch.Tensor,
+    k_mid_cache: torch.Tensor | None,
+    k_rad_cache: torch.Tensor | None,
+    bt_row: torch.Tensor,
+    bt_state: torch.Tensor,
+    n_sub: int,
+    out_offset: int,
+    prev_idx: int,
+    check_contig: bool,
+    with_kmax: bool = False,
+    compact_out: bool = False,
+) -> None:
+    """Zero-sync chunked Shadow-K quantizer reading locally-indexed `k_local_stage [n_sub, BS, Hkv, D]`
+    (for KV-BF12 unpacked chunks). Caller calls `update_bt_state_gpu` once after all chunks complete."""
+    if n_sub <= 0:
+        return
+    _, bs, hkv, d = k_local_stage.shape
+    want_kmax = with_kmax and (k_mid_cache is not None) and (k_rad_cache is not None)
+    v4_boxes = getattr(k_mid_cache, "_v4_fp8_boxes", None) if want_kmax else None
+    has_v4_boxes = want_kmax and (v4_boxes is not None)
+    km8, kr8, kb_sc = v4_boxes if has_v4_boxes else (k_local_stage, k_local_stage, k_local_stage)
+    dummy_m = k_mid_cache if want_kmax else k_local_stage
+    dummy_r = k_rad_cache if want_kmax else k_local_stage
+    smid_b = k_mid_cache.stride(0) if want_kmax else 0
+    smid_h = k_mid_cache.stride(1) if want_kmax else 0
+    skm8_b = km8.stride(0) if has_v4_boxes else 0
+    skm8_h = km8.stride(1) if has_v4_boxes else 0
+    skbsc_b = kb_sc.stride(0) if has_v4_boxes else 0
+    skbsc_h = kb_sc.stride(1) if has_v4_boxes else 0
+    _quantize_k_blocks_fp8_v3_local_syncfree_kernel[(int(n_sub), hkv)](
+        k_local_stage, k_fp8_cache, k_scale64_cache, dummy_m, dummy_r,
+        km8, kr8, kb_sc, bt_row, bt_state,
+        k_local_stage.stride(0), k_local_stage.stride(1), k_local_stage.stride(2),
+        k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
+        k_scale64_cache.stride(0), k_scale64_cache.stride(1),
+        smid_b, smid_h,
+        skm8_b, skm8_h,
+        skbsc_b, skbsc_h,
+        int(n_sub), int(out_offset), int(prev_idx),
+        CHECK_CONTIG=bool(check_contig),
+        COMPUTE_KMAX=want_kmax,
+        COMPUTE_V4_BOXES=has_v4_boxes,
+        COMPACT_OUT=bool(compact_out),
+        BS=bs, D=d,
+        num_warps=4, num_stages=2,
+    )
 
 
 def quantize_k_to_fp8_blocks_v2_syncfree(
@@ -810,6 +1175,7 @@ def select_topk_blocks_exact_kmax(
     local_blocks: int | None = None,
     max_seq: int | None = None,
     cuda_lib=None,
+    k_bt_mode: int = 0,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Opt-in 2-level exact-Kmax block selector (guaranteed needle-safe Quest upper bound).
     Uses native SM121a FP8-f16 CUDA scorer (`score_kmax_blocks_fp8_sm121_fwd`) when available,
@@ -830,6 +1196,48 @@ def select_topk_blocks_exact_kmax(
     num_mt = triton.cdiv(max_seqlen_q, 128)
     n_ctas = num_reqs * num_mt * H
     k_sel = min(budget, max_pblks)
+
+    # V4 Single-Launch SM121a Pre-Quantized Multi-Head Scorer + In-SMEM TopK + Bitonic Sort
+    v4_boxes = getattr(k_mid, "_v4_fp8_boxes", None)
+    v4_lib = get_nonmoe_v4_lib() if (_PF_TOPK_V4 and v4_boxes is not None) else None
+    if (
+        v4_lib is not None
+        and D == 128
+        and (BS & (BS - 1)) == 0
+        and (k_sel - (s_blks + l_blks)) <= 128
+        and q.dtype == torch.bfloat16
+        and q.stride(2) == 1
+    ):
+        km8, kr8, kb_sc = v4_boxes
+        if _PF_GLOBAL_ZERO_SYNC and not torch.cuda.is_current_stream_capturing():
+            sel_blocks_v4, sel_counts_v4 = _get_topk_sel_scratch(q.device, n_ctas, k_sel)
+        else:
+            sel_blocks_v4 = torch.empty((n_ctas, k_sel), dtype=torch.int32, device=q.device)
+            sel_counts_v4 = torch.empty((n_ctas,), dtype=torch.int32, device=q.device)
+        rc_v4 = v4_lib.score_topk_sort_fp8_v4_sm121_fwd(
+            q.data_ptr(),
+            km8.data_ptr(),
+            kr8.data_ptr(),
+            kb_sc.data_ptr(),
+            block_table.data_ptr(),
+            cache_seqlens.data_ptr(),
+            cu_seqlens_q.data_ptr(),
+            sel_blocks_v4.data_ptr(),
+            sel_counts_v4.data_ptr(),
+            q.stride(0), q.stride(1),
+            km8.stride(0), km8.stride(1),
+            kb_sc.stride(0) // 2, kb_sc.stride(1) // 2,
+            block_table.stride(0),
+            sel_blocks_v4.stride(0),
+            int(num_reqs), int(max_seqlen_q), int(max_pblks),
+            int(H), int(G), int(BS), int(E),
+            int(s_blks), int(l_blks), int(k_sel),
+            1 if int(k_bt_mode) == 1 else 0,
+            int(torch.cuda.current_stream(q.device).cuda_stream),
+        )
+        if rc_v4 == 0:
+            return sel_blocks_v4, sel_counts_v4
+
     if _PF_GLOBAL_ZERO_SYNC and not torch.cuda.is_current_stream_capturing():
         scores = _get_topk_scores_scratch(q.device, n_ctas, max_pblks)
     else:
@@ -1543,11 +1951,31 @@ def launch_global_sage2_prefix_v3_only(
     max_seq: int | None = None,
     k_bt: torch.Tensor | None = None,
     k_bt_mode: int = 0,
+    use_v6_fp8: bool = False,
+    pv_f16_acc: bool | None = None,
 ):
-    """Run ONLY the SM121a Sage2 v3/v4/v5 FP8 prefix kernel and return
+    """Run ONLY the SM121a Sage2 v3/v4/v5/v6 FP8 prefix kernel and return
     `(acc_buf, m_buf, l_buf, prefix_bm=128, tail_prefix_bn)` for direct handoff to
-    `libglobal_tail_otf_rel_sm121.so` (ZERO sheared rel_logits, ZERO Triton tail merge!)."""
+    `libpf_fp8_attn_v6.so` or `libglobal_tail_otf_rel_sm121.so`."""
     lib = get_cuda_lib(cuda_lib_path)
+    try:
+        from . import sm12_attn as _sm12_a
+        if _sm12_a.is_kv_bf12_cache(value_cache):
+            _orig_bt = block_table
+            _, _v_res, _bt_res = _sm12_a.resolve_kv_bf12_for_prefill(
+                key_cache, value_cache, block_table, cache_seqlens,
+                need_k=False, need_v=True, window=-1,
+                cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q,
+            )
+            if _v_res is None or _bt_res is None:
+                return None
+            value_cache = _v_res
+            block_table = _bt_res
+            if int(k_bt_mode) == 0 and k_fp8_cache is not None:
+                k_bt = _orig_bt
+                k_bt_mode = 2
+    except Exception:
+        pass
     p_bn = bn or _ENV_BN or 64
     if p_bn not in (64, 128):
         p_bn = 64
@@ -1556,12 +1984,22 @@ def launch_global_sage2_prefix_v3_only(
         p_min_ctas = 2
     tau = PV_SKIP_TAU if pv_skip_tau is None else float(pv_skip_tau)
     need_v5 = int(k_bt_mode) != 0
+    can_v6 = (
+        bool(use_v6_fp8)
+        and int(max_seqlen_q) >= 1024
+        and not torch.cuda.is_current_stream_capturing()
+        and lib is not None
+        and hasattr(lib, "global_sage2_prefix_v6_sm121_fwd")
+    )
     if not (
         lib is not None
         and (
-            hasattr(lib, "global_sage2_prefix_v5_sm121_fwd")
-            if need_v5
-            else hasattr(lib, "global_sage2_prefix_v3_sm121_fwd")
+            can_v6
+            or (
+                hasattr(lib, "global_sage2_prefix_v5_sm121_fwd")
+                if need_v5
+                else hasattr(lib, "global_sage2_prefix_v3_sm121_fwd")
+            )
         )
         and k_fp8_cache is not None
         and k_scale64_cache is not None
@@ -1587,13 +2025,36 @@ def launch_global_sage2_prefix_v3_only(
         sel_blocks, sel_counts = select_topk_blocks_exact_kmax(
             q, k_mid_cache, k_rad_cache, score_bt, cache_seqlens, cu_seqlens_q,
             max_seqlen_q, E, BS, H, G, D, num_reqs, eff_topk,
-            max_seq=max_seq, cuda_lib=lib,
+            max_seq=max_seq, cuda_lib=lib, k_bt_mode=int(k_bt_mode),
         )
     use_sparse = sel_blocks is not None and sel_counts is not None
     T = q.shape[0]
     acc_buf, m_buf, l_buf = _get_cuda_scratch(q.device, T, H, D)
     stream = int(torch.cuda.current_stream(q.device).cuda_stream)
-    if need_v5:
+    if can_v6:
+        eff_pv_f16 = int(_PF_FP8_PV_F16_ACC if pv_f16_acc is None else bool(pv_f16_acc))
+        rc = lib.global_sage2_prefix_v6_sm121_fwd(
+            q.data_ptr(), k_fp8_cache.data_ptr(), k_scale64_cache.data_ptr(), value_cache.data_ptr(),
+            block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+            sel_blocks.data_ptr() if use_sparse else 0,
+            sel_counts.data_ptr() if use_sparse else 0,
+            acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
+            q.stride(0), q.stride(1),
+            k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
+            k_scale64_cache.stride(0), k_scale64_cache.stride(1),
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+            block_table.stride(0),
+            int(num_reqs), int(max_seqlen_q), int(H), int(G),
+            int(BS), int(E), int(p_bn), int(p_min_ctas),
+            int(sel_blocks.shape[1]) if use_sparse else 0,
+            float(softmax_scale * LOG2E), float(tau),
+            k_bt.data_ptr() if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
+            int(k_bt.stride(0)) if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
+            int(k_bt_mode),
+            eff_pv_f16,
+            stream,
+        )
+    elif need_v5:
         rc = lib.global_sage2_prefix_v5_sm121_fwd(
             q.data_ptr(), k_fp8_cache.data_ptr(), k_scale64_cache.data_ptr(), value_cache.data_ptr(),
             block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
@@ -1662,6 +2123,8 @@ def launch_global_prefill(
     max_seq: int | None = None,
     k_bt: torch.Tensor | None = None,
     k_bt_mode: int = 0,
+    use_v6_fp8: bool = False,
+    pv_f16_acc: bool | None = None,
 ) -> bool:
     """Drop-in replacement for the `window < 0` branch of `sm12_attn._launch_prefill_opt`.
     Returns True if executed, False if caller should fall back to stock `_attn_prefill_full_kernel`."""
@@ -1721,13 +2184,42 @@ def launch_global_prefill(
                 sel_blocks, sel_counts = select_topk_blocks_exact_kmax(
                     q, k_mid_cache, k_rad_cache, score_bt, cache_seqlens, cu_seqlens_q,
                     max_seqlen_q, E, BS, H, G, D, num_reqs, eff_topk,
-                    max_seq=max_seq, cuda_lib=lib,
+                    max_seq=max_seq, cuda_lib=lib, k_bt_mode=int(k_bt_mode),
                 )
             use_sparse = sel_blocks is not None and sel_counts is not None
             T = q.shape[0]
             acc_buf, m_buf, l_buf = _get_cuda_scratch(q.device, T, H, D)
             stream = int(torch.cuda.current_stream(q.device).cuda_stream)
-            if need_v5:
+            can_v6 = (
+                bool(use_v6_fp8)
+                and int(max_seqlen_q) >= 1024
+                and not torch.cuda.is_current_stream_capturing()
+                and hasattr(lib, "global_sage2_prefix_v6_sm121_fwd")
+            )
+            if can_v6:
+                eff_pv_f16 = int(_PF_FP8_PV_F16_ACC if pv_f16_acc is None else bool(pv_f16_acc))
+                rc = lib.global_sage2_prefix_v6_sm121_fwd(
+                    q.data_ptr(), k_fp8_cache.data_ptr(), ks64.data_ptr(), value_cache.data_ptr(),
+                    block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+                    sel_blocks.data_ptr() if use_sparse else 0,
+                    sel_counts.data_ptr() if use_sparse else 0,
+                    acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
+                    q.stride(0), q.stride(1),
+                    k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
+                    ks64.stride(0), ks64.stride(1),
+                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                    block_table.stride(0),
+                    int(num_reqs), int(max_seqlen_q), int(H), int(G),
+                    int(BS), int(E), int(p_bn), int(p_min_ctas),
+                    int(sel_blocks.shape[1]) if use_sparse else 0,
+                    float(softmax_scale * LOG2E), float(tau),
+                    k_bt.data_ptr() if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
+                    int(k_bt.stride(0)) if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
+                    int(k_bt_mode),
+                    eff_pv_f16,
+                    stream,
+                )
+            elif need_v5:
                 rc = lib.global_sage2_prefix_v5_sm121_fwd(
                     q.data_ptr(), k_fp8_cache.data_ptr(), ks64.data_ptr(), value_cache.data_ptr(),
                     block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),

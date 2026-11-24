@@ -31,8 +31,17 @@ import torch
 TREE_SPEC_ENABLED = os.environ.get("INKLING_TREE_SPEC", "0").strip().lower() not in (
     "0", "", "off", "false", "no"
 )
+# Wave-V10 strict B==1-only guard (default OFF for 1dcfb306 invariance; when ON, hard-clamps
+# TREE_SPEC_MAX_B=1 and defaults TREE_WS_MAX=1 root-sibling so B>=2 stays 100% linear with 0% regression!).
+TREE_SPEC_B1_ONLY = os.environ.get("INKLING_TREE_SPEC_B1_ONLY", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_TREE_SPEC_MAX_B_RAW = os.environ.get("INKLING_TREE_SPEC_MAX_B", "").strip()
+TREE_SPEC_MAX_B = 1 if TREE_SPEC_B1_ONLY else (max(1, int(_TREE_SPEC_MAX_B_RAW)) if _TREE_SPEC_MAX_B_RAW else 1)
 TREE_SPEC_MAX_M = int(os.environ.get("INKLING_TREE_SPEC_MAX_M", "8") or "8")
-TREE_WS_MAX = max(1, min(4, int(os.environ.get("INKLING_TREE_WS_MAX", "2") or "2")))
+_TREE_WS_MAX_RAW = os.environ.get("INKLING_TREE_WS_MAX", "").strip()
+_TREE_WS_MAX_DEF = "1" if TREE_SPEC_B1_ONLY else "2"
+TREE_WS_MAX = max(1, min(4, int(_TREE_WS_MAX_RAW or _TREE_WS_MAX_DEF)))
 
 # Global registry (mirroring rdma_all_reduce.ROWAR) so target ops (`sconv_ops.py`, `sm12_attn.py`,
 # `sync_free.py`) read persistent CUDA-graph-captured device pointers with zero signature churn.
@@ -40,6 +49,7 @@ TREE_STATE: dict[str, object] = {
     "scope": 0,           # active padded batch size M (e.g., 8 or 16)
     "state": None,        # TreeSpecState instance
     "suppressed": False,  # True during prefill / B>1 / profile forwards
+    "active_b": 1,        # active request count B (enforces B <= TREE_SPEC_MAX_B)
 }
 
 _TREE_TARGET_LIB_PATH = os.environ.get(
@@ -49,8 +59,22 @@ _TREE_TARGET_LIB: Any = None
 _TREE_TARGET_LIB_TRIED = False
 
 
-def get_active_tree_state(num_tokens: int) -> "TreeSpecState | None":
+def set_active_batch_size(num_reqs: int) -> bool:
+    """Record active decode batch size `num_reqs` and return True iff tree speculation is allowed."""
+    b = max(0, int(num_reqs))
+    TREE_STATE["active_b"] = b
+    allowed = bool(TREE_SPEC_ENABLED and 1 <= b <= TREE_SPEC_MAX_B)
+    if TREE_SPEC_B1_ONLY:
+        TREE_STATE["suppressed"] = not allowed
+    return allowed
+
+
+def get_active_tree_state(num_tokens: int, num_reqs: int | None = None) -> "TreeSpecState | None":
     if not TREE_SPEC_ENABLED or TREE_STATE.get("suppressed", False):
+        return None
+    if num_reqs is not None and int(num_reqs) > TREE_SPEC_MAX_B:
+        return None
+    if TREE_SPEC_B1_ONLY and int(TREE_STATE.get("active_b", 1)) > TREE_SPEC_MAX_B:
         return None
     if TREE_STATE.get("scope") == num_tokens:
         return TREE_STATE.get("state")  # type: ignore[return-value]

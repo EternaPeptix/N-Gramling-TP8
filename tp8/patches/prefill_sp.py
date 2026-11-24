@@ -82,11 +82,14 @@ if SP_PREFIX_SYNC not in ("eager", "deferred", "off"):
     SP_PREFIX_SYNC = "eager"
 # INKLING_PREFILL_SP_RS_MODE (prefill-only ReduceScatter transport, default nccl):
 #   nccl | rhd_int8 | rhd_fp8 | fp8_a2a | int8_a2a | int8_col | bf12 | rdma_bf16 | rdma_int8_col | rdma_bf12
-SP_RS_MODE = os.environ.get("INKLING_PREFILL_SP_RS_MODE", "nccl").strip().lower()
-if SP_RS_MODE not in (
+_VALID_SP_RS_MODES = (
     "nccl",
     "rhd_int8",
     "rhd_fp8",
+    "rhd_int8_lowsm",
+    "rhd_fp8_lowsm",
+    "a2a_int8_lowsm",
+    "a2a_fp8_lowsm",
     "fp8_a2a",
     "int8_a2a",
     "int8_col",
@@ -94,14 +97,51 @@ if SP_RS_MODE not in (
     "rdma_bf16",
     "rdma_int8_col",
     "rdma_bf12",
-):
+)
+SP_RS_MODE = os.environ.get("INKLING_PREFILL_SP_RS_MODE", "nccl").strip().lower()
+if SP_RS_MODE not in _VALID_SP_RS_MODES:
     SP_RS_MODE = "nccl"
+# Opt-in Half-1 (comm-bound local Attn half) RS mode override (default "" = inherit SP_RS_MODE).
+# Lets Half-1 use faster `rhd_int8` while keeping MoE-overlapped Half-2 on 8-SM `nccl` or `*_lowsm`!
+SP_RS_HALF1_MODE = os.environ.get("INKLING_PREFILL_SP_RS_HALF1_MODE", "").strip().lower()
+if SP_RS_HALF1_MODE not in _VALID_SP_RS_MODES:
+    SP_RS_HALF1_MODE = ""
+# Wave-V10 opt-in Global-layer Half-1 RS mode override (default "" = inherit SP_RS_MODE).
+SP_RS_HALF1_GLOBAL_MODE = os.environ.get("INKLING_PREFILL_SP_RS_HALF1_GLOBAL_MODE", "").strip().lower()
+if SP_RS_HALF1_GLOBAL_MODE not in _VALID_SP_RS_MODES:
+    SP_RS_HALF1_GLOBAL_MODE = ""
+# Opt-in Half-2 (MoE-overlapped half) Low-SM L2-streaming RS mode override (default "" = inherit SP_RS_MODE).
+# E.g. `rhd_int8_lowsm` or `a2a_int8_lowsm` cuts Half-2 RS wire 2x using <= 6 SMs & < 0.5 MiB L2!
+SP_RS_HALF2_MODE = os.environ.get("INKLING_PREFILL_SP_RS_HALF2_MODE", "").strip().lower()
+if SP_RS_HALF2_MODE not in _VALID_SP_RS_MODES:
+    SP_RS_HALF2_MODE = ""
 SP_RS_MIN_T = max(int(os.environ.get("INKLING_PREFILL_SP_RS_MIN_T", "2048") or 2048), 1024)
 # INKLING_PREFILL_SP_AG_MODE (prefill-only AllGather transport, default nccl):
-#   nccl | rhd_int8 | rhd_fp8 (zero-incast 3-step Recursive Doubling AllGather, T >= 2048!)
+#   nccl | rhd_int8 | rhd_fp8 | rhd_int8_lowsm | rhd_fp8_lowsm | nccl_fp8_lowsm | nccl_fp8_zcopy_lowsm
+_VALID_SP_AG_MODES = (
+    "nccl",
+    "rhd_int8",
+    "rhd_fp8",
+    "rhd_int8_lowsm",
+    "rhd_fp8_lowsm",
+    "nccl_fp8_lowsm",
+    "nccl_fp8_zcopy_lowsm",
+)
 SP_AG_MODE = os.environ.get("INKLING_PREFILL_SP_AG_MODE", "nccl").strip().lower()
-if SP_AG_MODE not in ("nccl", "rhd_int8", "rhd_fp8"):
+if SP_AG_MODE not in _VALID_SP_AG_MODES:
     SP_AG_MODE = "nccl"
+# Wave-V10 opt-in Half-1 AG mode & Low-SM CTA overrides (default "" / 0 = unchanged).
+SP_AG_HALF1_MODE = os.environ.get("INKLING_PREFILL_SP_AG_HALF1_MODE", "").strip().lower()
+if SP_AG_HALF1_MODE not in _VALID_SP_AG_MODES:
+    SP_AG_HALF1_MODE = ""
+SP_LOWSM_HALF1_CTAS = max(
+    min(int(os.environ.get("INKLING_PREFILL_SP_LOWSM_HALF1_CTAS", "0") or 0), 48), 0
+)
+# Opt-in Half-2 (MoE-overlapped half) AG transport override (default "" = inherit SP_AG_MODE).
+# E.g. `nccl_fp8_zcopy_lowsm` or `nccl_fp8_lowsm` eliminates 48-SM preemption & unpack!
+SP_AG_HALF2_MODE = os.environ.get("INKLING_PREFILL_SP_AG_HALF2_MODE", "").strip().lower()
+if SP_AG_HALF2_MODE not in _VALID_SP_AG_MODES:
+    SP_AG_HALF2_MODE = ""
 SP_AG_MIN_T = max(int(os.environ.get("INKLING_PREFILL_SP_AG_MIN_T", "2048") or 2048), 1024)
 # Opt-in tail prefill chunk SP/DBO padding (default OFF; T >= 2048 with T % 8 != 0 -> pad to SP/DBO!)
 SP_PAD_TAIL = os.environ.get("INKLING_PREFILL_SP_PAD_TAIL", "0").strip().lower() in (
@@ -150,6 +190,11 @@ SP_FP8_AG_KV = os.environ.get("INKLING_PREFILL_SP_FP8_AG_KV", "1").strip().lower
 DBO_INTERLEAVE = os.environ.get("INKLING_PREFILL_DBO_INTERLEAVE", "0").strip().lower() in (
     "1", "on", "true", "yes",
 )
+# When DBO_INTERLEAVE=1, restrict interleaving to local SWA layers (Attn ~1.05 ms << RS 2.6 ms).
+# Global layers (Attn ~4-7 ms >> RS) MUST keep standard order so Attn(B) is never stalled behind Attn(A)!
+DBO_INTERLEAVE_LOCAL_ONLY = os.environ.get(
+    "INKLING_PREFILL_DBO_INTERLEAVE_LOCAL_ONLY", "1"
+).strip().lower() not in ("0", "", "off", "false", "no")
 
 _LOGGED_ONCE: set[str] = set()
 
@@ -951,6 +996,8 @@ def _tp_reduce_scatter_into(
     mode: str,
     begin: int,
     end: int,
+    rs_mode_override: str | None = None,
+    lowsm_ctas_override: int | None = None,
 ) -> None:
     """Reduce-scatter `partial [T, H]` along dim=0 directly into `out_shard [S, H]`."""
     from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
@@ -962,7 +1009,7 @@ def _tp_reduce_scatter_into(
 
     tp_group = get_tp_group()
     comm = getattr(tp_group, "device_communicator", None)
-    rs_mode = SP_RS_MODE
+    rs_mode = rs_mode_override if rs_mode_override else SP_RS_MODE
     if mode == "rdma" and rs_mode == "nccl":
         rs_mode = "rdma_bf16"
 
@@ -983,9 +1030,20 @@ def _tp_reduce_scatter_into(
         if rs_mode in ("rdma_int8_col", "rdma_bf12"):
             rs_mode = rs_mode[5:]
 
-    # 2. Optional compressed ReduceScatter (`rhd_int8` | `rhd_fp8` | `fp8_a2a` | `int8_a2a` | `int8_col` | `bf12`, T >= SP_RS_MIN_T)
+    # 2. Optional compressed ReduceScatter (`rhd_*` | `a2a_*_lowsm` | `fp8_a2a` | `int8_a2a` | `int8_col` | `bf12`, T >= SP_RS_MIN_T)
     if (
-        rs_mode in ("rhd_int8", "rhd_fp8", "fp8_a2a", "int8_a2a", "int8_col", "bf12")
+        rs_mode in (
+            "rhd_int8",
+            "rhd_fp8",
+            "rhd_int8_lowsm",
+            "rhd_fp8_lowsm",
+            "a2a_int8_lowsm",
+            "a2a_fp8_lowsm",
+            "fp8_a2a",
+            "int8_a2a",
+            "int8_col",
+            "bf12",
+        )
         and int(partial.shape[0]) >= SP_RS_MIN_T
     ):
         try:
@@ -998,6 +1056,7 @@ def _tp_reduce_scatter_into(
                 world_size=tp_group.world_size,
                 rank=tp_group.rank_in_group,
                 min_tokens=SP_RS_MIN_T,
+                lowsm_ctas=lowsm_ctas_override,
             ):
                 return
         except Exception as _e:
@@ -1081,18 +1140,25 @@ def _tp_all_gather_dim0(shard: torch.Tensor) -> torch.Tensor:
     return tensor_model_parallel_all_gather(shard.contiguous(), dim=0)
 
 
-def _tp_all_gather_mode(shard: torch.Tensor, mode: str) -> torch.Tensor:
+def _tp_all_gather_mode(
+    shard: torch.Tensor,
+    mode: str,
+    ag_transport_override: str | None = None,
+    lowsm_ctas_override: int | None = None,
+) -> torch.Tensor:
     """All-gather contiguous `[S, H]` BF16 shard along dim=0 with optional zero-incast
-    3-step RHD (`INKLING_PREFILL_SP_AG_MODE=rhd_int8|rhd_fp8`) or FP8 Ring compression:
-      - `bf16`: standard BF16 AllGather (2 B/elem) — unless `SP_AG_MODE != nccl` and
-        `mode == "rhd"` (used when `SP_FP8_AG=0` + `SP_AG_MODE=rhd_int8|rhd_fp8`).
-      - `direct`: quantize `[S, H]` -> FP8 E4M3 (1 B/elem) + `[S, 1]` FP32 scale, AllGather
-        (single packed RHD collective when `SP_AG_MODE=rhd_fp8`, else 2x NCCL Ring AG),
-        returning FP8 tensor carrying `._inkling_fp8_scale` for `linear.py` `torch._scaled_mm`.
-      - `dequant`: 2x-smaller compressed AllGather + fused dequant to BF16 on current stream.
-    """
+    3-step RHD, 1-collective Low-SM NCCL Ring (`nccl_fp8_lowsm`), or Zero-Unpack Grouped
+    Low-SM FP8 AG (`nccl_fp8_zcopy_lowsm`)."""
+    eff_ag_mode = ag_transport_override if ag_transport_override else SP_AG_MODE
     if (
-        SP_AG_MODE in ("rhd_int8", "rhd_fp8")
+        eff_ag_mode in (
+            "rhd_int8",
+            "rhd_fp8",
+            "rhd_int8_lowsm",
+            "rhd_fp8_lowsm",
+            "nccl_fp8_lowsm",
+            "nccl_fp8_zcopy_lowsm",
+        )
         and mode != "bf16"
         and shard.dtype == torch.bfloat16
         and shard.ndim == 2
@@ -1101,19 +1167,21 @@ def _tp_all_gather_mode(shard: torch.Tensor, mode: str) -> torch.Tensor:
         try:
             from . import prefill_sp_rs as _sp_rs
 
-            want_direct = (mode == "direct") and (SP_AG_MODE == "rhd_fp8")
+            want_direct = (mode == "direct") and ("fp8" in eff_ag_mode)
             rhd_out = _sp_rs.compressed_all_gather_dim0(
                 shard,
-                mode=SP_AG_MODE,
+                mode=eff_ag_mode,
                 fp8_direct=want_direct,
                 min_tokens=SP_AG_MIN_T,
+                all_gather_1d_fn=_tp_all_gather_dim0,
+                lowsm_ctas=lowsm_ctas_override,
             )
             if rhd_out is not None:
                 return rhd_out
         except Exception as _e:
             _log_once(
-                f"ag_rhd_fallback_{SP_AG_MODE}",
-                f"[inkling-prefill-sp] RHD AG ({SP_AG_MODE}) unavailable ({_e!r}); "
+                f"ag_rhd_fallback_{eff_ag_mode}",
+                f"[inkling-prefill-sp] Compressed AG ({eff_ag_mode}) unavailable ({_e!r}); "
                 "falling back to standard NCCL AllGather.",
             )
 
@@ -1581,6 +1649,8 @@ class PrefillSeqParallel:
         partial: torch.Tensor,
         plan: PrefillSPPlan,
         sconv_mod: Any | None = None,
+        rs_mode_override: str | None = None,
+        lowsm_ctas_override: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """1. Reduce-scatter `partial [T, H]` directly into `x_with_halo[halo:]`.
         2. Populate the 3-row halo `x_with_halo[:halo]` + immediate `conv_state.kv_cache` sync rows:
@@ -1592,7 +1662,11 @@ class PrefillSeqParallel:
         halo = plan.halo
         x_with_halo = partial.new_empty((halo + plan.shard_size, self.hidden_size))
         x_shard = x_with_halo[halo:]
-        _tp_reduce_scatter_into(partial, x_shard, self.mode, plan.begin, plan.end)
+        _tp_reduce_scatter_into(
+            partial, x_shard, self.mode, plan.begin, plan.end,
+            rs_mode_override=rs_mode_override,
+            lowsm_ctas_override=lowsm_ctas_override,
+        )
 
         gathered_sync = None
         if plan.has_cache and plan.my_pack_idx is not None:
@@ -1667,24 +1741,45 @@ class PrefillSeqParallel:
         out_shard: torch.Tensor,
         next_global_repl: GlobalKVReplWeights | None = None,
         fp8_ag_modes: tuple[str, ...] | None = None,
+        ag_transport_override: str | None = None,
+        lowsm_ctas_override: int | None = None,
     ) -> list[Any]:
         """All-gather `[Q, S, H]` along dim=0 per query -> list of `Q` contiguous `[T, H]` tensors.
         When `next_global_repl` is provided and `Q == 3` (`INKLING_PREFILL_SP_Q3=repl_kv`),
         AllGathers ONLY `x_q` and projects sharded `x_k, x_v` + 1 tiny `all_to_all` (20x less wire,
         100% BF16 exact!)."""
         nq = int(out_shard.shape[0])
-        _default_ag_mode = "rhd" if SP_AG_MODE != "nccl" else "bf16"
+        eff_ag_tr = ag_transport_override if ag_transport_override else SP_AG_MODE
+        _default_ag_mode = "rhd" if eff_ag_tr != "nccl" else "bf16"
         if next_global_repl is not None and nq == 3:
             q_mode = fp8_ag_modes[0] if (SP_FP8_AG and fp8_ag_modes is not None) else _default_ag_mode
-            x_q_full = _tp_all_gather_mode(out_shard[0], q_mode)
+            x_q_full = _tp_all_gather_mode(
+                out_shard[0], q_mode,
+                ag_transport_override=ag_transport_override,
+                lowsm_ctas_override=lowsm_ctas_override,
+            )
             kv_preproj = global_kv_proj_fused_a2a(
                 out_shard[1], out_shard[2], next_global_repl, _tp_all_to_all_dim0
             )
             return [x_q_full, kv_preproj, kv_preproj]
         if SP_FP8_AG and fp8_ag_modes is not None and len(fp8_ag_modes) == nq:
-            return [_tp_all_gather_mode(out_shard[q], fp8_ag_modes[q]) for q in range(nq)]
-        if SP_AG_MODE != "nccl":
-            return [_tp_all_gather_mode(out_shard[q], "rhd") for q in range(nq)]
+            return [
+                _tp_all_gather_mode(
+                    out_shard[q], fp8_ag_modes[q],
+                    ag_transport_override=ag_transport_override,
+                    lowsm_ctas_override=lowsm_ctas_override,
+                )
+                for q in range(nq)
+            ]
+        if eff_ag_tr != "nccl":
+            return [
+                _tp_all_gather_mode(
+                    out_shard[q], "rhd",
+                    ag_transport_override=ag_transport_override,
+                    lowsm_ctas_override=lowsm_ctas_override,
+                )
+                for q in range(nq)
+            ]
         return [_tp_all_gather_dim0(out_shard[q]) for q in range(nq)]
 
 
@@ -1707,6 +1802,19 @@ class PreprojectedGlobalKV:
         self._backing.record_stream(stream)
 
 
+_PF_REPL_KV_FP8 = os.environ.get("INKLING_PF_REPL_KV_FP8", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+_PF_REPL_KV_FP8_FREE_BF16 = os.environ.get(
+    "INKLING_PF_REPL_KV_FP8_FREE_BF16",
+    os.environ.get("INKLING_FREE_PACKED_RAW_WEIGHTS", "0"),
+).strip().lower() in ("1", "true", "on", "yes")
+_PF_REPL_KV_FP8_BUILD_CAT = os.environ.get(
+    "INKLING_PF_REPL_KV_FP8_BUILD_CAT",
+    "0" if _PF_REPL_KV_FP8_FREE_BF16 else "1",
+).strip().lower() in ("1", "true", "on", "yes")
+
+
 @dataclass
 class GlobalKVReplWeights:
     """Replicated `[world_size * (kv_dim + w_dim), H]` K+k_dyn and V+v_dyn weights for one
@@ -1717,6 +1825,19 @@ class GlobalKVReplWeights:
     kv_dim: int
     w_dim: int
     world_size: int
+    wkd_fp8_t: torch.Tensor | None = None
+    wkd_sc: torch.Tensor | None = None
+    wvd_fp8_t: torch.Tensor | None = None
+    wvd_sc: torch.Tensor | None = None
+    wkvd_cat_fp8_t: torch.Tensor | None = None
+    wkvd_cat_sc: torch.Tensor | None = None
+
+
+def _quantize_repl_w_fp8_rowwise(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    wf = w.float()
+    sc = torch.clamp(wf.abs().amax(dim=1) * (1.0 / 448.0), min=1e-12)
+    w_fp8 = torch.clamp(wf / sc[:, None], -448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+    return w_fp8.t(), sc.view(1, -1).contiguous()
 
 
 @torch.no_grad()
@@ -1744,13 +1865,55 @@ def build_global_kv_repl_weights(attn: Any, world_size: int) -> GlobalKVReplWeig
     local_vd = torch.cat([w_v, v_dyn_w], dim=0).contiguous()  # [kv_dim + w_dim, H]
     wkd_all = _tp_all_gather_dim0(local_kd).contiguous()      # [W * (kv_dim + w_dim), H]
     wvd_all = _tp_all_gather_dim0(local_vd).contiguous()      # [W * (kv_dim + w_dim), H]
+    wkd_fp8_t = wkd_sc = wvd_fp8_t = wvd_sc = wkvd_cat_fp8_t = wkvd_cat_sc = None
+    if (
+        _PF_REPL_KV_FP8
+        and (wkd_all.shape[0] & 15) == 0
+        and (wkd_all.shape[1] & 15) == 0
+        and wkd_all.is_cuda
+    ):
+        wkd_fp8_t, wkd_sc = _quantize_repl_w_fp8_rowwise(wkd_all)
+        wvd_fp8_t, wvd_sc = _quantize_repl_w_fp8_rowwise(wvd_all)
+        if _PF_REPL_KV_FP8_BUILD_CAT:
+            wkvd_cat_fp8_t, wkvd_cat_sc = _quantize_repl_w_fp8_rowwise(
+                torch.cat([wkd_all, wvd_all], dim=0)
+            )
+        if _PF_REPL_KV_FP8_FREE_BF16 and wkd_fp8_t is not None and wvd_fp8_t is not None:
+            try:
+                from .ops.linear import _probe_fp8_cap
+
+                _mode, _ = _probe_fp8_cap(wkd_all.device)
+            except Exception:
+                _mode = "off"
+            if _mode == "rowwise":
+                wkd_all.untyped_storage().resize_(0)
+                wvd_all.untyped_storage().resize_(0)
     return GlobalKVReplWeights(
         wkd_all=wkd_all,
         wvd_all=wvd_all,
         kv_dim=kv_dim,
         w_dim=w_dim,
         world_size=world_size,
+        wkd_fp8_t=wkd_fp8_t,
+        wkd_sc=wkd_sc,
+        wvd_fp8_t=wvd_fp8_t,
+        wvd_sc=wvd_sc,
+        wkvd_cat_fp8_t=wkvd_cat_fp8_t,
+        wkvd_cat_sc=wkvd_cat_sc,
     )
+
+
+def _repl_w_bf16(
+    raw_w: torch.Tensor,
+    fp8_t: torch.Tensor | None,
+    sc: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return raw BF16 replicated KV weight or safely dequantize from FP8 if raw storage was freed."""
+    if raw_w.untyped_storage().size() > 0:
+        return raw_w
+    if fp8_t is not None and sc is not None:
+        return (fp8_t.t().float() * sc.t()).to(torch.bfloat16)
+    return raw_w
 
 
 def global_kv_proj_fused_a2a(
@@ -1773,9 +1936,70 @@ def global_kv_proj_fused_a2a(
     wd = repl_w.w_dim
     stride = kv + wd
     T = S * W
+    min_fp8_s = 128 if _PF_REPL_KV_FP8_FREE_BF16 else 256
 
-    k_kd = torch.nn.functional.linear(x_k_shard, repl_w.wkd_all).view(S, W, stride)
-    v_vd = torch.nn.functional.linear(x_v_shard, repl_w.wvd_all).view(S, W, stride)
+    if (
+        _PF_REPL_KV_FP8
+        and repl_w.wkd_fp8_t is not None
+        and S >= min_fp8_s
+        and x_k_shard.dtype == torch.bfloat16
+        and x_v_shard.dtype == torch.bfloat16
+        and x_k_shard.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        from .ops.linear import _probe_fp8_cap, quantize_fp8_rowwise
+
+        mode, _ = _probe_fp8_cap(x_k_shard.device)
+        if mode == "rowwise":
+            H_dim = int(x_k_shard.shape[1])
+            s_pad = (S + 15) & ~15
+            if x_k_shard.data_ptr() == x_v_shard.data_ptr() and repl_w.wkvd_cat_fp8_t is not None:
+                x_fp8, x_sc = quantize_fp8_rowwise(x_k_shard, pad_m16=True, reuse_scratch=True)
+                kvd = torch._scaled_mm(
+                    x_fp8, repl_w.wkvd_cat_fp8_t, scale_a=x_sc, scale_b=repl_w.wkvd_cat_sc,
+                    out_dtype=torch.bfloat16, use_fast_accum=False,
+                )[:S]
+                n_single = W * stride
+                k_kd = kvd[:, :n_single].view(S, W, stride)
+                v_vd = kvd[:, n_single:].view(S, W, stride)
+            elif (
+                s_pad == S
+                and x_k_shard.is_contiguous()
+                and x_v_shard.is_contiguous()
+                and x_v_shard.data_ptr() == x_k_shard.data_ptr() + S * H_dim * 2
+            ):
+                # Single-launch 2*S batch quantize over contiguous out_shard[1:3]!
+                xkv_view = x_k_shard.as_strided((2 * S, H_dim), (H_dim, 1))
+                xkv_fp8, xkv_sc = quantize_fp8_rowwise(xkv_view, pad_m16=False, reuse_scratch=True)
+                k_kd = torch._scaled_mm(
+                    xkv_fp8[:S], repl_w.wkd_fp8_t, scale_a=xkv_sc[:S], scale_b=repl_w.wkd_sc,
+                    out_dtype=torch.bfloat16, use_fast_accum=False,
+                ).view(S, W, stride)
+                v_vd = torch._scaled_mm(
+                    xkv_fp8[S:], repl_w.wvd_fp8_t, scale_a=xkv_sc[S:], scale_b=repl_w.wvd_sc,
+                    out_dtype=torch.bfloat16, use_fast_accum=False,
+                ).view(S, W, stride)
+            else:
+                xk_fp8, xk_sc = quantize_fp8_rowwise(x_k_shard, pad_m16=True)
+                xv_fp8, xv_sc = quantize_fp8_rowwise(x_v_shard, pad_m16=True)
+                k_kd = torch._scaled_mm(
+                    xk_fp8, repl_w.wkd_fp8_t, scale_a=xk_sc, scale_b=repl_w.wkd_sc,
+                    out_dtype=torch.bfloat16, use_fast_accum=False,
+                )[:S].view(S, W, stride)
+                v_vd = torch._scaled_mm(
+                    xv_fp8, repl_w.wvd_fp8_t, scale_a=xv_sc, scale_b=repl_w.wvd_sc,
+                    out_dtype=torch.bfloat16, use_fast_accum=False,
+                )[:S].view(S, W, stride)
+        else:
+            wkd_bf16 = _repl_w_bf16(repl_w.wkd_all, repl_w.wkd_fp8_t, repl_w.wkd_sc)
+            wvd_bf16 = _repl_w_bf16(repl_w.wvd_all, repl_w.wvd_fp8_t, repl_w.wvd_sc)
+            k_kd = torch.nn.functional.linear(x_k_shard, wkd_bf16).view(S, W, stride)
+            v_vd = torch.nn.functional.linear(x_v_shard, wvd_bf16).view(S, W, stride)
+    else:
+        wkd_bf16 = _repl_w_bf16(repl_w.wkd_all, repl_w.wkd_fp8_t, repl_w.wkd_sc)
+        wvd_bf16 = _repl_w_bf16(repl_w.wvd_all, repl_w.wvd_fp8_t, repl_w.wvd_sc)
+        k_kd = torch.nn.functional.linear(x_k_shard, wkd_bf16).view(S, W, stride)
+        v_vd = torch.nn.functional.linear(x_v_shard, wvd_bf16).view(S, W, stride)
     # Order [k(128), v(128), k_dyn(4), v_dyn(4)] -> stride 264 bf16 = 528B (% 16 == 0) so both k & v are 16B-aligned!
     packed_in = (
         torch.cat(
@@ -2232,6 +2456,9 @@ class PrefillAROverlap:
         need_aux_shard: torch.Tensor | None = None,
         fp8_ag_modes: tuple[str, ...] | None = None,
         next_global_repl: GlobalKVReplWeights | None = None,
+        rs_mode_override: str | None = None,
+        ag_transport_override: str | None = None,
+        lowsm_ctas_override: int | None = None,
     ) -> _AsyncSPSublayerHandle:
         """Execute an ENTIRE SP sublayer (`RS -> halo+cache_sync -> sharded sconv+AttnRes -> AG`)
         asynchronously on `comm_stream` so BOTH `RS` AND `AG` overlap 100% with the other
@@ -2252,7 +2479,9 @@ class PrefillAROverlap:
         partial.record_stream(cs)
         with torch.cuda.stream(cs):
             x_with_halo, _ = sp.reduce_scatter_and_halo(
-                partial, plan, sconv_mod=sconv_mod
+                partial, plan, sconv_mod=sconv_mod,
+                rs_mode_override=rs_mode_override,
+                lowsm_ctas_override=lowsm_ctas_override,
             )
             out_shard = run_sharded_sconv_attn_res(
                 sconv_mod=sconv_mod,
@@ -2271,6 +2500,8 @@ class PrefillAROverlap:
                 out_shard,
                 next_global_repl=next_global_repl,
                 fp8_ag_modes=fp8_ag_modes,
+                ag_transport_override=ag_transport_override,
+                lowsm_ctas_override=lowsm_ctas_override,
             )
             aux_g = (
                 _tp_all_gather_dim0(need_aux_shard)
@@ -2290,6 +2521,8 @@ class PrefillAROverlap:
         sconv_mod: Any,
         plan: PrefillSPPlan,
         compute_stream: torch.cuda.Stream,
+        rs_mode_override: str | None = None,
+        lowsm_ctas_override: int | None = None,
     ) -> _AsyncHandle:
         """Stage 1 of Hybrid NIC-First Interleaved DBO+SP (`INKLING_PREFILL_DBO_INTERLEAVE=1`):
         runs ONLY `reduce_scatter + halo/cache_sync` on `comm_stream` and returns an
@@ -2302,7 +2535,9 @@ class PrefillAROverlap:
         partial.record_stream(cs)
         with torch.cuda.stream(cs):
             x_with_halo, gathered_sync = sp.reduce_scatter_and_halo(
-                partial, plan, sconv_mod=sconv_mod
+                partial, plan, sconv_mod=sconv_mod,
+                rs_mode_override=rs_mode_override,
+                lowsm_ctas_override=lowsm_ctas_override,
             )
             ev_done = torch.cuda.Event()
             ev_done.record(cs)
@@ -2322,6 +2557,8 @@ class PrefillAROverlap:
         need_aux_shard: torch.Tensor | None = None,
         fp8_ag_modes: tuple[str, ...] | None = None,
         next_global_repl: GlobalKVReplWeights | None = None,
+        ag_transport_override: str | None = None,
+        lowsm_ctas_override: int | None = None,
     ) -> _AsyncSPSublayerHandle:
         """Stage 2 of Hybrid NIC-First Interleaved DBO+SP (`INKLING_PREFILL_DBO_INTERLEAVE=1`):
         runs ONLY `gather_queries (+ optional aux AG)` on `comm_stream` after `compute_stream`
@@ -2338,6 +2575,8 @@ class PrefillAROverlap:
                 out_shard,
                 next_global_repl=next_global_repl,
                 fp8_ag_modes=fp8_ag_modes,
+                ag_transport_override=ag_transport_override,
+                lowsm_ctas_override=lowsm_ctas_override,
             )
             aux_g = (
                 _tp_all_gather_dim0(need_aux_shard)

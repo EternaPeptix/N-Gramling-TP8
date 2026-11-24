@@ -17,6 +17,19 @@ from torch import nn
 
 _FUSED_SCONV_AR = os.environ.get("INKLING_FUSED_SCONV_AR", "0").strip().lower() not in ("0", "", "off", "false", "no")
 _FUSED_AR_SCONV = os.environ.get("INKLING_FUSED_AR_SCONV", "0").strip().lower() not in ("0", "", "off", "false", "no")
+_FUSED_AR_SCONV_C28 = os.environ.get("INKLING_FUSED_AR_SCONV_C28", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_FUSED_AR_SCONV_C28_MIN_T = max(
+    1, min(64, int(os.environ.get("INKLING_FUSED_AR_SCONV_C28_MIN_T", "9") or "9"))
+)
+_FUSED_AR_SCONV_C28_MAX_T = max(
+    _FUSED_AR_SCONV_C28_MIN_T,
+    min(64, int(os.environ.get("INKLING_FUSED_AR_SCONV_C28_MAX_T", "64") or "64")),
+)
+_FUSED_AR_SCONV_C28_MAX_NSTACK = max(
+    1, min(10, int(os.environ.get("INKLING_FUSED_AR_SCONV_C28_MAX_NSTACK", "10") or "10"))
+)
 _FUSED_SCONV_AR_TRITON = os.environ.get("INKLING_FUSED_SCONV_AR_TRITON", "0").strip().lower() not in ("0", "", "off", "false", "no")
 _TREE_SPEC = os.environ.get("INKLING_TREE_SPEC", "0").strip().lower() not in ("0", "", "off", "false", "no")
 
@@ -29,6 +42,140 @@ def _tree_active_for(num_tokens: int) -> bool:
         return _tsr.get_active_tree_state(num_tokens) is not None
     except Exception:
         return False
+
+
+def _get_tree_st_for(num_tokens: int):
+    if not _TREE_SPEC:
+        return None
+    try:
+        from .ops import tree_spec_runtime as _tsr
+        return _tsr.get_active_tree_state(num_tokens)
+    except Exception:
+        return None
+
+
+_FUSED_SCONV_AR_C1 = os.environ.get("INKLING_FUSED_SCONV_AR_C1", "0").strip().lower() in ("1", "true", "on", "yes")
+_FUSED_C1_MAX_T = int(os.environ.get("INKLING_FUSED_SCONV_AR_C1_MAX_T", "16"))
+_FUSED_C1_LIB_PATH = os.environ.get("INKLING_FUSED_SCONV_AR_C1_LIB", "/rdma/libfused_sconv_ar_v4_exact.so")
+_FUSED_C1_NLIVE = os.environ.get("INKLING_FUSED_SCONV_AR_C1_NLIVE", "1").strip().lower() not in ("0", "", "off", "false", "no")
+_FUSED_C1_PDL = os.environ.get("INKLING_FUSED_SCONV_AR_C1_PDL", "1").strip().lower() not in ("0", "", "off", "false", "no")
+_FUSED_C1_EARLY = os.environ.get(
+    "INKLING_FUSED_SCONV_AR_C1_EARLY", os.environ.get("INKLING_PDL_SKINNY", "1")
+).strip().lower() not in ("0", "", "off", "false", "no")
+_FUSED_C1_TREE = os.environ.get("INKLING_FUSED_SCONV_AR_C1_TREE", "1").strip().lower() not in ("0", "", "off", "false", "no")
+_FUSED_C1_LIB = None
+_FUSED_C1_LIB_TRIED = False
+
+# v7 C=2..8 (T = 1..64) 0-ULP fused ShortConv + AttnRes + RMSNorm (opt-in, default OFF):
+# Extends v4 C=1 pre-gdc_wait Stack preload + Pass-1 overlap + early PDL + NLivePtr + TreeSconvAnc
+# across T = 1..64, n_stack = 1..10, normalize_values ∈ {False, True}.
+_FUSED_SCONV_AR_C48 = os.environ.get("INKLING_FUSED_SCONV_AR_C48", "0").strip().lower() in ("1", "true", "on", "yes")
+_FUSED_C48_MAX_T = max(1, min(64, int(os.environ.get("INKLING_FUSED_SCONV_AR_C48_MAX_T", "64"))))
+_FUSED_C48_LIB_PATH = os.environ.get("INKLING_FUSED_SCONV_AR_C48_LIB", "/rdma/libfused_sconv_ar_c48_v7.so")
+_FUSED_C48_NLIVE = os.environ.get("INKLING_FUSED_SCONV_AR_C48_NLIVE", "1").strip().lower() not in ("0", "", "off", "false", "no")
+_FUSED_C48_PDL = os.environ.get("INKLING_FUSED_SCONV_AR_C48_PDL", "1").strip().lower() not in ("0", "", "off", "false", "no")
+_FUSED_C48_EARLY = os.environ.get(
+    "INKLING_FUSED_SCONV_AR_C48_EARLY", os.environ.get("INKLING_PDL_SKINNY", "1")
+).strip().lower() not in ("0", "", "off", "false", "no")
+_FUSED_C48_TREE = os.environ.get("INKLING_FUSED_SCONV_AR_C48_TREE", "1").strip().lower() not in ("0", "", "off", "false", "no")
+_FUSED_C48_LIB = None
+_FUSED_C48_LIB_TRIED = False
+
+
+def _get_fused_c48_lib():
+    global _FUSED_C48_LIB, _FUSED_C48_LIB_TRIED
+    if not _FUSED_SCONV_AR_C48:
+        return None
+    if not _FUSED_C48_LIB_TRIED:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        _FUSED_C48_LIB_TRIED = True
+        import ctypes
+        for cand_path in (_FUSED_C48_LIB_PATH, _FUSED_C1_LIB_PATH, _FUSED_C32_LIB_PATH):
+            if cand_path and os.path.exists(cand_path):
+                try:
+                    lib = ctypes.CDLL(cand_path)
+                    if not hasattr(lib, "fused_sconv_ar_c48_fwd"):
+                        continue
+                    lib.fused_sconv_ar_c48_init_smem.argtypes = []
+                    lib.fused_sconv_ar_c48_init_smem.restype = ctypes.c_int
+                    lib.fused_sconv_ar_c48_fwd.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                        ctypes.c_int,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_int, ctypes.c_int,
+                        ctypes.c_uint64,
+                    ]
+                    lib.fused_sconv_ar_c48_fwd.restype = ctypes.c_int
+                    rc = lib.fused_sconv_ar_c48_init_smem()
+                    if rc != 0:
+                        raise RuntimeError(f"fused_sconv_ar_c48_init_smem failed: cudaError={rc}")
+                    _FUSED_C48_LIB = lib
+                    print(
+                        f"[inkling-sconv-ar-c48-v7] loaded + init_smem OK: {cand_path} "
+                        f"(max_t={_FUSED_C48_MAX_T}, pdl={int(_FUSED_C48_PDL)}, "
+                        f"early={int(_FUSED_C48_EARLY)}, nlive={int(_FUSED_C48_NLIVE)})",
+                        flush=True,
+                    )
+                    break
+                except Exception as e:
+                    print(f"[inkling-sconv-ar-c48-v7] load failed on {cand_path} ({e!r})", flush=True)
+                    _FUSED_C48_LIB = None
+    return _FUSED_C48_LIB
+
+
+def _get_fused_c1_lib():
+    global _FUSED_C1_LIB, _FUSED_C1_LIB_TRIED
+    if not _FUSED_SCONV_AR_C1:
+        return None
+    if not _FUSED_C1_LIB_TRIED:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        _FUSED_C1_LIB_TRIED = True
+        import ctypes
+        for cand_path in (_FUSED_C1_LIB_PATH, _FUSED_C32_LIB_PATH):
+            if cand_path and os.path.exists(cand_path):
+                try:
+                    lib = ctypes.CDLL(cand_path)
+                    if not hasattr(lib, "fused_sconv_ar_c1_fwd"):
+                        continue
+                    lib.fused_sconv_ar_c1_init_smem.argtypes = []
+                    lib.fused_sconv_ar_c1_init_smem.restype = ctypes.c_int
+                    lib.fused_sconv_ar_c1_fwd.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_int, ctypes.c_int,
+                        ctypes.c_uint64,
+                    ]
+                    lib.fused_sconv_ar_c1_fwd.restype = ctypes.c_int
+                    rc = lib.fused_sconv_ar_c1_init_smem()
+                    if rc != 0:
+                        raise RuntimeError(f"fused_sconv_ar_c1_init_smem failed: cudaError={rc}")
+                    _FUSED_C1_LIB = lib
+                    print(f"[inkling-sconv-ar-c1-v4] loaded + init_smem OK: {cand_path}", flush=True)
+                    break
+                except Exception as e:
+                    print(f"[inkling-sconv-ar-c1-v4] load failed on {cand_path} ({e!r})", flush=True)
+                    _FUSED_C1_LIB = None
+    return _FUSED_C1_LIB
 _FUSED_SCONV_AR_PATH = os.environ.get("INKLING_SCONV_AR_EXT", "/rdma/inkling_sconv_ar_ext.so")
 _FUSED_SCONV_AR_EXT = None
 _FUSED_SCONV_AR_TRIED = False
@@ -321,6 +468,10 @@ class Inkling2ShortConv(nn.Module):
                 torch.empty(dim, 1, kernel_size), requires_grad=False
             )
             set_weight_attrs(self.weight, {"weight_loader": self._load_dim0})
+            if _FUSED_SCONV_AR_C48 and torch.cuda.is_available():
+                _get_fused_c48_lib()
+            if _FUSED_SCONV_AR_C1 and torch.cuda.is_available():
+                _get_fused_c1_lib()
 
     def _load(self, param: nn.Parameter, loaded: torch.Tensor, dim: int) -> None:
         size = param.shape[dim]
@@ -403,23 +554,34 @@ class Inkling2ShortConv(nn.Module):
         norm: nn.Module,
         normalize_values: bool,
     ) -> bool:
-        if not _FUSED_AR_SCONV or self.dynamic or not normalize_values:
+        if self.dynamic or hidden != 4608:
+            return False
+        use_c28 = (
+            _FUSED_AR_SCONV_C28
+            and _FUSED_AR_SCONV_C28_MIN_T <= num_tokens <= _FUSED_AR_SCONV_C28_MAX_T
+        )
+        use_c1 = (
+            not use_c28
+            and _FUSED_AR_SCONV
+            and normalize_values
+            and 1 <= num_tokens <= 8
+        )
+        if not (use_c28 or use_c1):
             return False
         if _TREE_SPEC and _tree_active_for(num_tokens):
-            return False
-        if not (1 <= num_tokens <= 8 and hidden == 4608):
             return False
         m = conv_metadata(self.owner)
         if m is None:
             return False
         nq = int(queries.shape[0])
         n_stack = int(stack.shape[0])
+        max_ns = _FUSED_AR_SCONV_C28_MAX_NSTACK if use_c28 else 8
         offset, width = self.owner.stream_ranges[self.stream]
         c = self.owner.kv_cache
         cw = self.conv_weight
         if not (
             nq in (1, 3)
-            and 1 <= n_stack <= 8
+            and 1 <= n_stack <= max_ns
             and c.shape[1] == 1
             and width == 4608
             and offset % 8 == 0
@@ -448,7 +610,14 @@ class Inkling2ShortConv(nn.Module):
             comm = getattr(get_tp_group().device_communicator, "rdma_comm", None)
         except Exception:
             return False
-        return comm is not None and comm.can_fused_sconv_attnres(num_tokens, hidden)
+        if comm is None:
+            return False
+        if use_c28:
+            return bool(
+                hasattr(comm, "can_fused_c32_sconv_attnres")
+                and comm.can_fused_c32_sconv_attnres(num_tokens, hidden)
+            )
+        return bool(comm.can_fused_sconv_attnres(num_tokens, hidden))
 
     def try_fused_ar_sconv_attn_res(
         self,
@@ -465,11 +634,12 @@ class Inkling2ShortConv(nn.Module):
         aux_out: torch.Tensor | None = None,
         eps: float = 1e-6,
     ) -> torch.Tensor | None:
-        """s8: 0-ULP fused RDMA AllReduce + SConv + AttnRes + RMSNorm (eliminates 96x sconv + 96x attn_res!)."""
+        """s8/v8: 0-ULP fused RDMA AllReduce + SConv + AttnRes + RMSNorm (eliminates 96x sconv + 96x attn_res!)."""
         if x_partial.dim() != 2 or x_partial.dtype != torch.bfloat16 or not x_partial.is_contiguous():
             return None
+        t_rows = int(x_partial.shape[0])
         if not self.can_fused_ar_sconv_attn_res(
-            int(x_partial.shape[0]), int(x_partial.shape[1]), stack, queries, norm, normalize_values
+            t_rows, int(x_partial.shape[1]), stack, queries, norm, normalize_values
         ):
             return None
         if not (
@@ -492,6 +662,33 @@ class Inkling2ShortConv(nn.Module):
         comm = getattr(get_tp_group().device_communicator, "rdma_comm", None)
         if comm is None:
             return None
+        if (
+            _FUSED_AR_SCONV_C28
+            and _FUSED_AR_SCONV_C28_MIN_T <= t_rows <= _FUSED_AR_SCONV_C28_MAX_T
+            and hasattr(comm, "all_reduce_c32_sconv_attnres")
+        ):
+            return comm.all_reduce_c32_sconv_attnres(
+                x_partial,
+                self.conv_weight,
+                self.owner.kv_cache,
+                positions,
+                m.block_table,
+                m.seq_idx,
+                m.slot_mapping,
+                m.query_start,
+                offset,
+                conv_out,
+                aux_out,
+                conv_res,
+                conv_addend,
+                stack,
+                mix_last,
+                queries,
+                norm.weight,
+                eps=eps,
+                norm_eps=norm.eps,
+                normalize_values=normalize_values,
+            )
         return comm.all_reduce_sconv_attnres(
             x_partial,
             self.conv_weight,
@@ -514,6 +711,10 @@ class Inkling2ShortConv(nn.Module):
             norm_eps=norm.eps,
         )
 
+    @property
+    def c1_aux_ok(self) -> bool:
+        return bool((_FUSED_SCONV_AR_C48 or _FUSED_SCONV_AR_C1) and not self.dynamic)
+
     def try_fused_sconv_attn_res(
         self,
         x: torch.Tensor,
@@ -533,6 +734,175 @@ class Inkling2ShortConv(nn.Module):
         Returns (Q, T, D) bf16 output on success, or None to fall back to unfused path."""
         if self.dynamic:
             return None
+        # v7 C=1..8 (T = 1..64, n_stack = 1..10, normalize_values ∈ {False, True}):
+        # 0-ULP 1-launch fused ShortConv + AttnRes + RMSNorm (+ AuxOut + NLIVE + PDL + TreeSconvAnc)
+        if _FUSED_SCONV_AR_C48 and 1 <= x.shape[0] <= _FUSED_C48_MAX_T:
+            T, D = x.shape
+            tree_st = _get_tree_st_for(T) if _TREE_SPEC else None
+            can_tree = (
+                tree_st is None
+                or (_FUSED_C48_TREE and getattr(tree_st, "tree_sconv_anc", None) is not None)
+            )
+            c48lib = _get_fused_c48_lib() if can_tree else None
+            m = conv_metadata(self.owner) if c48lib is not None else None
+            if c48lib is not None and m is not None:
+                nq = queries.shape[0]
+                n_stack = stack.shape[0]
+                offset, width = self.owner.stream_ranges[self.stream]
+                c = self.owner.kv_cache
+                cw = self.conv_weight
+                if (
+                    D == 4608
+                    and nq in (1, 3)
+                    and 1 <= n_stack <= 10
+                    and c.shape[1] == 1
+                    and width == D
+                    and offset % 8 == 0
+                    and c.stride(0) % 8 == 0
+                    and c.stride(2) % 8 == 0
+                    and cw.shape == (D, 4)
+                    and cw.is_contiguous()
+                    and x.dtype == torch.bfloat16
+                    and c.dtype == torch.bfloat16
+                    and cw.dtype == torch.bfloat16
+                    and norm.weight.dtype == torch.bfloat16
+                    and stack.dtype == torch.bfloat16
+                    and queries.dtype == torch.float32
+                    and positions.dtype == torch.int64
+                    and m.slot_mapping.dtype == torch.int64
+                    and m.seq_idx.dtype == torch.int32
+                    and m.block_table.dtype == torch.int32
+                    and m.query_start.dtype == torch.int32
+                    and x.stride(1) == 1
+                    and x.stride(0) % 8 == 0
+                    and c.stride(3) == 1
+                    and conv_out.is_contiguous()
+                    and conv_out.dtype == torch.bfloat16
+                    and queries.is_contiguous()
+                    and norm.weight.is_contiguous()
+                    and stack.stride(1) == D
+                    and stack.stride(2) == 1
+                    and (aux_out is None or (aux_out.is_contiguous() and aux_out.dtype == torch.bfloat16))
+                    and (conv_res is None or (conv_res.is_contiguous() and conv_res.dtype == torch.bfloat16))
+                    and (conv_addend is None or (conv_addend.is_contiguous() and conv_addend.dtype == torch.bfloat16))
+                    and (mix_last is None or (mix_last.is_contiguous() and mix_last.dtype == torch.bfloat16))
+                    and not (conv_res is not None and conv_addend is None)
+                    and not (conv_addend is not None and mix_last is not None)
+                ):
+                    nl_buf = _rowar_nlive_buf(T) if _FUSED_C48_NLIVE else None
+                    tree_anc_ptr = (
+                        int(tree_st.tree_sconv_anc.data_ptr()) if tree_st is not None else 0
+                    )
+                    out = torch.empty((nq, T, D), dtype=torch.bfloat16, device=x.device)
+                    rc = c48lib.fused_sconv_ar_c48_fwd(
+                        x.data_ptr(), cw.data_ptr(), c.data_ptr(),
+                        conv_out.data_ptr(),
+                        0 if conv_res is None else conv_res.data_ptr(),
+                        0 if conv_addend is None else conv_addend.data_ptr(),
+                        0 if aux_out is None else aux_out.data_ptr(),
+                        positions.data_ptr(), m.seq_idx.data_ptr(), m.slot_mapping.data_ptr(),
+                        m.block_table.data_ptr(), m.query_start.data_ptr(),
+                        stack.data_ptr(), 0 if mix_last is None else mix_last.data_ptr(),
+                        queries.data_ptr(), norm.weight.data_ptr(), out.data_ptr(),
+                        0 if nl_buf is None else nl_buf.data_ptr(),
+                        tree_anc_ptr,
+                        int(x.stride(0)), int(c.stride(0)), int(c.stride(2)), int(m.block_table.stride(0)),
+                        int(m.block_table.shape[1]), int(c.shape[2]), int(offset), int(stack.stride(0)),
+                        nq, T, n_stack, float(5**-0.5), float(eps), float(norm.eps),
+                        1 if normalize_values else 0,
+                        1 if conv_res is not None else 0,
+                        1 if conv_addend is not None else 0,
+                        1 if mix_last is not None else 0,
+                        1 if _FUSED_C48_PDL else 0,
+                        1 if (_FUSED_C48_PDL and _FUSED_C48_EARLY) else 0,
+                        int(torch.cuda.current_stream(x.device).cuda_stream),
+                    )
+                    if rc == 0:
+                        return out
+        # v4 C=1 (M = 1..16): 0-ULP 1-launch fused ShortConv + AttnRes + RMSNorm (+ AuxOut + NLIVE + PDL + TreeSconvAnc)
+        if _FUSED_SCONV_AR_C1 and 1 <= x.shape[0] <= _FUSED_C1_MAX_T:
+            T, D = x.shape
+            tree_st = _get_tree_st_for(T) if _TREE_SPEC else None
+            can_tree = (
+                tree_st is None
+                or (_FUSED_C1_TREE and getattr(tree_st, "tree_sconv_anc", None) is not None)
+            )
+            c1lib = _get_fused_c1_lib() if can_tree else None
+            m = conv_metadata(self.owner) if c1lib is not None else None
+            if c1lib is not None and m is not None:
+                nq = queries.shape[0]
+                n_stack = stack.shape[0]
+                offset, width = self.owner.stream_ranges[self.stream]
+                c = self.owner.kv_cache
+                cw = self.conv_weight
+                if (
+                    D == 4608
+                    and nq in (1, 3)
+                    and 1 <= n_stack <= 8
+                    and normalize_values
+                    and c.shape[1] == 1
+                    and width == D
+                    and offset % 8 == 0
+                    and c.stride(0) % 8 == 0
+                    and c.stride(2) % 8 == 0
+                    and cw.shape == (D, 4)
+                    and cw.is_contiguous()
+                    and x.dtype == torch.bfloat16
+                    and c.dtype == torch.bfloat16
+                    and cw.dtype == torch.bfloat16
+                    and norm.weight.dtype == torch.bfloat16
+                    and stack.dtype == torch.bfloat16
+                    and queries.dtype == torch.float32
+                    and positions.dtype == torch.int64
+                    and m.slot_mapping.dtype == torch.int64
+                    and m.seq_idx.dtype == torch.int32
+                    and m.block_table.dtype == torch.int32
+                    and m.query_start.dtype == torch.int32
+                    and x.stride(1) == 1
+                    and x.stride(0) % 8 == 0
+                    and c.stride(3) == 1
+                    and conv_out.is_contiguous()
+                    and conv_out.dtype == torch.bfloat16
+                    and queries.is_contiguous()
+                    and norm.weight.is_contiguous()
+                    and stack.stride(1) == D
+                    and stack.stride(2) == 1
+                    and (aux_out is None or (aux_out.is_contiguous() and aux_out.dtype == torch.bfloat16))
+                    and (conv_res is None or (conv_res.is_contiguous() and conv_res.dtype == torch.bfloat16))
+                    and (conv_addend is None or (conv_addend.is_contiguous() and conv_addend.dtype == torch.bfloat16))
+                    and (mix_last is None or (mix_last.is_contiguous() and mix_last.dtype == torch.bfloat16))
+                    and not (conv_res is not None and conv_addend is None)
+                    and not (conv_addend is not None and mix_last is not None)
+                ):
+                    nl_buf = _rowar_nlive_buf(T) if _FUSED_C1_NLIVE else None
+                    tree_anc_ptr = (
+                        int(tree_st.tree_sconv_anc.data_ptr()) if tree_st is not None else 0
+                    )
+                    out = torch.empty((nq, T, D), dtype=torch.bfloat16, device=x.device)
+                    rc = c1lib.fused_sconv_ar_c1_fwd(
+                        x.data_ptr(), cw.data_ptr(), c.data_ptr(),
+                        conv_out.data_ptr(),
+                        0 if conv_res is None else conv_res.data_ptr(),
+                        0 if conv_addend is None else conv_addend.data_ptr(),
+                        0 if aux_out is None else aux_out.data_ptr(),
+                        positions.data_ptr(), m.seq_idx.data_ptr(), m.slot_mapping.data_ptr(),
+                        m.block_table.data_ptr(), m.query_start.data_ptr(),
+                        stack.data_ptr(), 0 if mix_last is None else mix_last.data_ptr(),
+                        queries.data_ptr(), norm.weight.data_ptr(), out.data_ptr(),
+                        0 if nl_buf is None else nl_buf.data_ptr(),
+                        tree_anc_ptr,
+                        int(x.stride(0)), int(c.stride(0)), int(c.stride(2)), int(m.block_table.stride(0)),
+                        int(m.block_table.shape[1]), int(c.shape[2]), int(offset), int(stack.stride(0)),
+                        nq, T, n_stack, float(5**-0.5), float(eps), float(norm.eps),
+                        1 if conv_res is not None else 0,
+                        1 if conv_addend is not None else 0,
+                        1 if mix_last is not None else 0,
+                        1 if _FUSED_C1_PDL else 0,
+                        1 if (_FUSED_C1_PDL and _FUSED_C1_EARLY) else 0,
+                        int(torch.cuda.current_stream(x.device).cuda_stream),
+                    )
+                    if rc == 0:
+                        return out
         if _TREE_SPEC and _tree_active_for(int(x.shape[0])):
             return None
         # C=32 0-ULP 1-pass fused short_conv + AttnRes + RMSNorm (+ AuxOut) across ALL 96 layers (M=17..512):

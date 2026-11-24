@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -1784,6 +1785,9 @@ def get_global_kv_cache_groups(
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
     extra_retained_tokens = max(0, vllm_config.num_prefill_lookahead_tokens - 1)
     retention_interval = vllm_config.cache_config.prefix_cache_retention_interval
+    draft_swa_sparse = os.environ.get("INKLING_DRAFT_SWA_SPARSE", "0").strip().lower() in (
+        "1", "on", "true", "yes"
+    )
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
             if layer_spec.sparse_prefill_discard:
@@ -1792,10 +1796,73 @@ def get_global_kv_cache_groups(
                     extra_retained_tokens=extra_retained_tokens,
                     sparse_retention_interval=retention_interval,
                 )
+            elif draft_swa_sparse and layer_spec.is_draft:
+                # Wave-V9: DSpark draft SWA layers are write-only during chunked prefill
+                # (store_context_kv never attends over prefill interior tokens!). Route
+                # interior prefill writes to the pool discard block while retaining the
+                # end-of-prompt tail + warm-suffix slack for 100% Warm-1M prefix-cache hits.
+                draft_ret = 0 if retention_interval is None else retention_interval
+                merged_kv_cache_specs[layer_name] = replace(
+                    layer_spec,
+                    extra_retained_tokens=extra_retained_tokens,
+                    sparse_prefill_discard=True,
+                    sparse_retention_interval=draft_ret,
+                )
             else:
                 merged_kv_cache_specs[layer_name] = replace(
                     layer_spec, extra_retained_tokens=extra_retained_tokens
                 )
+
+    # Wave-V10 KV-BF12 Single-Pool Page Unification:
+    # When target attention layers use 0-ULP lossless KV-BF12 (99.000 KiB = 101,376 B),
+    # right-size any draft SlidingWindowSpec whose unpadded BF16 page exceeds the target
+    # KV-BF12 page (e.g. BS=256 128 KiB -> BS=128 64 KiB) so upstream
+    # `unify_kv_cache_spec_page_size` pads it to 99.000 KiB cleanly in ONE BlockPool.
+    # Invariants preserved: scheduler_block_size = lcm(256, 4, 128) = 256,
+    # hash_block_size = gcd(256, 4, 128) = 4, bytes_per_block = 8 * 99 KiB = 792 KiB.
+    bf12_target_pages = [
+        spec.page_size_bytes
+        for spec in merged_kv_cache_specs.values()
+        if isinstance(spec, AttentionSpec)
+        and spec.kv_quant_mode == KVQuantMode.KV_BF12
+    ]
+    _bf12_global_only = os.environ.get("INKLING_KV_BF12_GLOBAL_ONLY", "0").strip().lower() in (
+        "1", "on", "true", "yes"
+    )
+    if bf12_target_pages:
+        bf12_page = min(bf12_target_pages)
+        for layer_name, layer_spec in list(merged_kv_cache_specs.items()):
+            if (
+                isinstance(layer_spec, SlidingWindowSpec)
+                and layer_spec.kv_quant_mode != KVQuantMode.KV_BF12
+                and (layer_spec.is_draft or (_bf12_global_only and layer_spec.head_size_v > 0))
+            ):
+                new_bs = layer_spec.block_size
+                if layer_spec.unpadded_page_size_bytes > bf12_page:
+                    while (
+                        new_bs > 16
+                        and (new_bs % 2) == 0
+                        and (layer_spec.unpadded_page_size_bytes * new_bs)
+                        // layer_spec.block_size
+                        > bf12_page
+                    ):
+                        new_bs //= 2
+                elif _bf12_global_only and not layer_spec.is_draft:
+                    # Maximize power-of-2 BF16 SWA block density within the 99 KiB page
+                    # (e.g. --block-size 64 -> BS=128 64 KiB padded to 99 KiB, 9 vs 17 blks/grp!).
+                    while (
+                        new_bs < 128
+                        and (layer_spec.unpadded_page_size_bytes * (new_bs * 2))
+                        // layer_spec.block_size
+                        <= bf12_page
+                    ):
+                        new_bs *= 2
+                if new_bs != layer_spec.block_size:
+                    merged_kv_cache_specs[layer_name] = replace(
+                        layer_spec,
+                        block_size=new_bs,
+                        page_size_padded=None,
+                    )
 
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.

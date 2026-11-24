@@ -20,6 +20,7 @@ Key wins vs cert_head_fast_v6 (INT7_g64: 105.14 MB, 439 us screen + 20.3 us refi
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import math
 import os
 import threading
@@ -34,21 +35,44 @@ except ImportError:  # Local Mac verification runs without PyTorch
 
 ENABLED = os.environ.get("INKLING_CERT_HEAD_V7", "0").strip().lower() in ("1", "true", "on", "yes")
 _LIB_PATH = os.environ.get("INKLING_CERT_V7_LIB", "/rdma/libcert_head_fast_v7.so")
+MAX_M = max(16, min(128, int(os.environ.get("INKLING_CERT_HEAD_V7_MAX_M", "16") or 16)))
+_QUALIFY_REF = os.environ.get("INKLING_CERT_V9_QUALIFY_REF", "torch").strip().lower()  # torch (default) | b1_exact
 _CFG_ID = int(os.environ.get("INKLING_CERT_V7_CFG", "0"))  # 0: BN=64 W=4 SUB=2 (default); 1: BN=32 W=4; 2: BN=16 W=2
 _REF_GRID = int(os.environ.get("INKLING_CERT_V7_REF_GRID", "96"))
 _USE_PDL = os.environ.get("INKLING_CERT_V7_PDL", "1").strip().lower() not in ("0", "", "off", "false", "no")
+_CACHE_DIR = os.environ.get("INKLING_CERT_HEAD_CACHE", "").strip()
+_FREE_PACKED_DEFAULT = os.environ.get("INKLING_FREE_PACKED_RAW_WEIGHTS", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+_DELEGATE_C32 = os.environ.get(
+    "INKLING_CERT_V7_DELEGATE_C32",
+    "0" if _FREE_PACKED_DEFAULT else "1",
+).strip().lower() not in ("0", "", "off", "false", "no")
 
 MS_MULTS = np.array([0.375, 0.5625, 0.75, 1.0], dtype=np.float32)
 
-# Soundness constants matching cert_head.py & cert_head_cuda.py (exact IEEE-754 bounds)
+# Exact IEEE-754 soundness constants matching cert_head.py & cert_head_cuda.py
 _EPS_F32 = 2.0 ** -24
-_INFL_X = 1.0 + 1e-4
-_X_ABS = 1e-6
-_INFL_Q = 1.0 + 1e-5
-_INFL_B = 1.0 + 1e-4
-_SLOP_REL = 1e-5
-_SLOP_ABS = 1e-4
-_SLACK = 1e-4
+_INFL_X = 1.0 + 2.0 ** -14
+_X_ABS = 2.0 ** -59
+_INFL_Q = 1.0 + 2.0 ** -14
+_INFL_B = 1.0 + 2.0 ** -20
+_SLOP_REL = 2.0 ** -21
+_SLOP_ABS = 2.0 ** -126
+CAP_DIP_30 = 1.9073486328125e-06
+_SLACK = float(np.float32(2.0 * CAP_DIP_30 * (1.0 + 2.0 ** -10) + 2.0 ** -17))
+
+
+def slack_of_v7(dip: float) -> float:
+    return 0.0 if dip <= 0.0 else float(np.float32(2.0 * dip * (1.0 + 2.0 ** -10) + 2.0 ** -17))
+
+
+def round_up_f32_np(x64: np.ndarray) -> np.ndarray:
+    """float64 (>= 0 or inf) -> smallest IEEE-754 float32 >= x64."""
+    x64 = np.asarray(x64, dtype=np.float64)
+    f = x64.astype(np.float32)
+    bump = f.astype(np.float64) < x64
+    return np.where(bump, np.nextafter(f, np.float32(np.inf)), f).astype(np.float32)
 
 _CFGS = {
     0: (4, 2, 64),
@@ -57,7 +81,22 @@ _CFGS = {
 }
 
 _LIB = None
+_HAS_C48 = False
+_HAS_V9 = False
+_LIB_VER = 0
+_LIB_C48_MAX_M = 16
 _LIB_LOCK = threading.Lock()
+_ACTIVE_ADAPTER = None
+_TP_ALL_GATHER_FN = None
+
+
+def _get_tp_all_gather():
+    global _TP_ALL_GATHER_FN
+    fn = _TP_ALL_GATHER_FN
+    if fn is None:
+        from vllm.distributed import tensor_model_parallel_all_gather as fn
+        _TP_ALL_GATHER_FN = fn
+    return fn
 
 
 def bf16_rn_np(x_f32: np.ndarray) -> np.ndarray:
@@ -75,8 +114,7 @@ def bf16_rn_np(x_f32: np.ndarray) -> np.ndarray:
 
 def cacc2_for_k(K: int) -> float:
     """Exact 2 * c_acc MMA accumulation error constant for K-dot products (matches cert_head.py)."""
-    # K/16 MMA steps of 16-term fp32 sums; Higham gamma_n bound doubled for |W| + |W1|
-    c_acc = (K * _EPS_F32) / max(1.0 - K * _EPS_F32, 0.5) * 2.0
+    c_acc = (K / 16.0) * 17.0 * 2.0 ** -23
     return float(2.0 * c_acc)
 
 
@@ -203,11 +241,10 @@ def pack_cert_v7_np(w_bf16_as_f32: np.ndarray, cfg_id: int = 0) -> PackedCertV7N
     nw1_f64 = np.sqrt(np.sum(w1_bf16.astype(np.float64) ** 2, axis=1))
     ndw_f64 = np.sqrt(np.sum(dw_bf16.astype(np.float64) ** 2, axis=1))
 
-    up = 1.0 + 1e-6
-    rt1 = (np.sqrt(np.sum(r1_f64 ** 2, axis=1)) * up).astype(np.float32)
-    nv1 = (np.maximum(nw_f64, nw1_f64) * up).astype(np.float32)
-    rt2 = (np.sqrt(np.sum(r2_f64 ** 2, axis=1)) * up).astype(np.float32)
-    nv2 = ((np.maximum(nw_f64, nw1_f64) + ndw_f64) * up).astype(np.float32)
+    rt1 = round_up_f32_np(np.sqrt(np.sum(r1_f64 ** 2, axis=1)))
+    nv1 = round_up_f32_np(np.maximum(nw_f64, nw1_f64))
+    rt2 = round_up_f32_np(np.sqrt(np.sum(r2_f64 ** 2, axis=1)))
+    nv2 = round_up_f32_np(np.maximum(nw_f64, nw1_f64) + ndw_f64)
 
     # 2. Pack row-contiguous Stage-2 arrays: MS_ROW [V, n_qchunks, 4] uint32 & LSB1_ROW [V, n_qchunks*16] uint32
     c2_4 = code2.reshape(V, n_qchunks, 4, 16)
@@ -384,10 +421,12 @@ class CudaCertStateV7:
     arrive: object
     out_pair: object
     nlive_full: object
+    mask1: object = None
+    mask1_128: object = None
 
 
 def _load_lib():
-    global _LIB
+    global _LIB, _HAS_C48, _HAS_V9, _LIB_VER, _LIB_C48_MAX_M
     if _LIB is not None:
         return _LIB
     with _LIB_LOCK:
@@ -425,69 +464,400 @@ def _load_lib():
             ]
             lib.cert_head_v7_post_refine.restype = ctypes.c_int
 
+            if hasattr(lib, "cert_head_v7_post_refine_c48"):
+                lib.cert_head_v7_post_refine_c48.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_uint64,
+                ]
+                lib.cert_head_v7_post_refine_c48.restype = ctypes.c_int
+                _HAS_C48 = True
+
+            if hasattr(lib, "cert_head_v9_post_refine"):
+                lib.cert_head_v9_post_refine.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_uint64,
+                ]
+                lib.cert_head_v9_post_refine.restype = ctypes.c_int
+                _HAS_V9 = True
+
+            if hasattr(lib, "cert_head_v9_max_m"):
+                lib.cert_head_v9_max_m.argtypes = []
+                lib.cert_head_v9_max_m.restype = ctypes.c_int
+                _LIB_C48_MAX_M = max(16, min(128, int(lib.cert_head_v9_max_m())))
+            elif hasattr(lib, "cert_head_v7_c48_max_m"):
+                lib.cert_head_v7_c48_max_m.argtypes = []
+                lib.cert_head_v7_c48_max_m.restype = ctypes.c_int
+                _LIB_C48_MAX_M = max(16, min(64, int(lib.cert_head_v7_c48_max_m())))
+            elif _HAS_C48:
+                _LIB_C48_MAX_M = 64
+            else:
+                _LIB_C48_MAX_M = 16
+
             lib.cert_head_v7_exact_all.argtypes = [
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                 ctypes.c_uint64,
             ]
             lib.cert_head_v7_exact_all.restype = ctypes.c_int
+            if hasattr(lib, "cert_head_v12_version"):
+                lib.cert_head_v12_version.argtypes = []
+                lib.cert_head_v12_version.restype = ctypes.c_int
+                _LIB_VER = int(lib.cert_head_v12_version())
+            elif hasattr(lib, "cert_head_v7_version"):
+                lib.cert_head_v7_version.argtypes = []
+                lib.cert_head_v7_version.restype = ctypes.c_int
+                _LIB_VER = int(lib.cert_head_v7_version())
+            else:
+                _LIB_VER = 9 if _HAS_V9 else 7
             _LIB = lib
     return _LIB
 
 
-def build_cuda_table_v7(w, cfg_id: int = _CFG_ID) -> CudaCertTableV7:
-    """Offline pack a CUDA bf16 LM-head shard `w [V, K]` into a GPU `CudaCertTableV7`."""
+def lib_max_m() -> int:
+    """Return effective max_m supported by both env (`INKLING_CERT_HEAD_V7_MAX_M`) and loaded `.so`."""
+    if _load_lib() is None:
+        return 16
+    return min(MAX_M, _LIB_C48_MAX_M) if (_HAS_V9 or _HAS_C48) else 16
+
+
+def active_max_m_global() -> int:
+    """Global active max_m query for `l2pf.get_head_weight(num_tokens)`."""
+    if not ENABLED or _load_lib() is None:
+        return 0
+    return lib_max_m()
+
+
+def is_m_qualified_global(M: int) -> bool:
+    """True iff `M` actually passed `m_ok[M]` qualification on the active CertHead v7/v9/v12 adapter.
+    Prevents `l2pf.get_head_weight(M)` from prefetching unused v7 slabs when `M > 16` fell back!"""
+    if not ENABLED or _load_lib() is None or M < 2:
+        return False
+    ad = _ACTIVE_ADAPTER
+    if ad is None:
+        return 2 <= M <= 16
+    if M <= ad.max_m:
+        return bool(ad.m_ok.get(int(M), False))
+    c32 = getattr(ad, "_c32_state", None)
+    if c32 is not None and hasattr(c32, "m_ok"):
+        return bool(c32.m_ok.get(int(M), False))
+    return False
+
+
+def active_summary_global() -> dict | None:
+    """Structured summary of the active CertHead v7/v9/v12 adapter for accurate startup logging."""
+    ad = _ACTIVE_ADAPTER
+    if ad is None:
+        return None
+    lim = int(ad.max_m)
+    ok_le16 = [m for m in range(2, min(16, lim) + 1) if ad.m_ok.get(m, False)]
+    bad_le16 = [m for m in range(2, min(16, lim) + 1) if not ad.m_ok.get(m, False)]
+    ok_gt16 = [m for m in range(17, lim + 1) if ad.m_ok.get(m, False)]
+    bad_gt16 = [m for m in range(17, lim + 1) if not ad.m_ok.get(m, False)]
+    s1_mb = float(ad.tbl.slabs_u4.numel() * ad.tbl.slabs_u4.element_size() / 1e6)
+    return {
+        "lib_ver": int(_LIB_VER or (9 if _HAS_V9 else 7)),
+        "max_m": lim,
+        "qualify_ref": str(_QUALIFY_REF),
+        "ok_le16": len(ok_le16),
+        "bad_le16": bad_le16,
+        "ok_gt16": len(ok_gt16),
+        "bad_gt16": bad_gt16,
+        "s1_mb": s1_mb,
+    }
+
+
+def _wkey_v7(w, cfg_id: int) -> str:
+    h = hashlib.sha256()
+    h.update(f"v7.2:{cfg_id}:{tuple(w.shape)}:{w.dtype}".encode())
+    sample = w[:: max(1, w.shape[0] // 64), :: max(1, w.shape[1] // 64)]
+    h.update(memoryview(sample.detach().cpu().contiguous().view(torch.uint8).numpy().reshape(-1)))
+    return h.hexdigest()[:16]
+
+
+def _round_up_f32_torch(x64):
+    f = x64.float()
+    bump = f.double() < x64
+    return torch.where(bump, torch.nextafter(f, torch.full_like(f, float("inf"))), f)
+
+
+def _to_u32_torch(x_i64):
+    return (x_i64 & 0xFFFFFFFF).to(torch.int32).view(torch.uint32).contiguous()
+
+
+def pack_cert_v7_torch(w, cfg_id: int = _CFG_ID) -> CudaCertTableV7:
+    """Fast (~15-25 ms) GPU PyTorch packer bit-identical to `pack_cert_v7_np`."""
     assert torch is not None
     dev = w.device
-    w_f32 = w.detach().float().cpu().numpy()
-    probe = check_nw_heterogeneous(w_f32)
-    pk = pack_cert_v7_np(w_f32, cfg_id=cfg_id)
-    if os.environ.get("INKLING_CERT_VERBOSE", "1") != "0":
-        print(
-            f"[cert-v7] packed V={pk.V} K={pk.K} cfg={cfg_id}: "
-            f"S1={pk.stage1_bytes/1e6:.2f}MB S2={pk.stage2_bytes/1e6:.2f}MB "
-            f"(GM/RMS={probe['gm_over_rms']:.3f})",
-            flush=True,
+    w_bf = w.detach().to(torch.bfloat16)
+    V, K = int(w_bf.shape[0]), int(w_bf.shape[1])
+    assert K % 512 == 0, f"K={K} must be a multiple of 512"
+    warps, sub_n, bn = _CFGS[cfg_id]
+    n_qchunks = K // 512
+    n_tiles = (V + bn - 1) // bn
+    v_pad = n_tiles * bn
+    wtot = n_tiles * warps
+
+    with torch.no_grad():
+        wf = w_bf.float()
+        w_blk = wf.view(V, n_qchunks, 64, 8)
+        m_abs = w_blk.abs().amax(dim=3)
+        row_max = m_abs.amax(dim=2)
+
+        bs_raw = (row_max / 31.0).to(torch.float16)
+        bs_f32 = bs_raw.float()
+        need_up = (row_max > 0.0) & (bs_f32 * 31.0 < row_max)
+        pos_inf16 = torch.full_like(bs_raw, float("inf"))
+        while bool(need_up.any()):
+            bs_raw = torch.where(need_up, torch.nextafter(bs_raw, pos_inf16), bs_raw)
+            bs_f32 = bs_raw.float()
+            need_up = (row_max > 0.0) & (bs_f32 * 31.0 < row_max)
+
+        big_s_row = bs_raw.contiguous()
+        bs_exp = bs_f32.unsqueeze(-1)
+
+        t0 = bs_exp * float(np.float32(0.375 * 31.0))
+        t1 = bs_exp * float(np.float32(0.5625 * 31.0))
+        t2 = bs_exp * float(np.float32(0.75 * 31.0))
+        code2 = torch.where(
+            m_abs <= t0,
+            0,
+            torch.where(m_abs <= t1, 1, torch.where(m_abs <= t2, 2, 3)),
+        ).to(torch.int64)
+
+        mults = torch.tensor([0.375, 0.5625, 0.75, 1.0], dtype=torch.float32, device=dev)
+        sc_mb = bs_exp * mults[code2]
+        inv_sc = torch.where(sc_mb > 0.0, 1.0 / sc_mb, torch.zeros_like(sc_mb))
+        q1 = torch.round(w_blk * inv_sc.unsqueeze(-1)).clamp(-31.0, 31.0).to(torch.int64)
+        u6 = q1 + 32
+
+        w1_blk = (q1.float() * sc_mb.unsqueeze(-1)).to(torch.bfloat16).float()
+        w1_bf16 = w1_blk.view(V, K)
+
+        r1_blk = w_blk.double() - w1_blk.double()
+        lsb_bit = (r1_blk >= 0.0).to(torch.int64)
+        sc_s2 = (bs_exp * 0.25) * mults[code2]
+        dw_blk = torch.where(lsb_bit == 1, sc_s2.unsqueeze(-1), -sc_s2.unsqueeze(-1)).to(torch.bfloat16).float()
+        dw_bf16 = dw_blk.view(V, K)
+
+        w_d = wf.double()
+        w1_d = w1_bf16.double()
+        dw_d = dw_bf16.double()
+        r1_d = w_d - w1_d
+        r2_d = w_d - (w1_d + dw_d)
+        nw_d = torch.sqrt(torch.sum(w_d * w_d, dim=1))
+        nw1_d = torch.sqrt(torch.sum(w1_d * w1_d, dim=1))
+        ndw_d = torch.sqrt(torch.sum(dw_d * dw_d, dim=1))
+
+        rt1 = _round_up_f32_torch(torch.sqrt(torch.sum(r1_d * r1_d, dim=1))).contiguous()
+        nv1 = _round_up_f32_torch(torch.maximum(nw_d, nw1_d)).contiguous()
+        rt2 = _round_up_f32_torch(torch.sqrt(torch.sum(r2_d * r2_d, dim=1))).contiguous()
+        nv2 = _round_up_f32_torch(torch.maximum(nw_d, nw1_d) + ndw_d).contiguous()
+
+        c2_4 = code2.view(V, n_qchunks, 4, 16)
+        shifts_ms = (torch.arange(16, dtype=torch.int64, device=dev) * 2).view(1, 1, 1, 16)
+        ms_row_i64 = torch.sum(c2_4 << shifts_ms, dim=3)
+        ms_row = _to_u32_torch(ms_row_i64)
+
+        lsb_32 = lsb_bit.view(V, n_qchunks * 16, 32)
+        shifts_b = torch.arange(32, dtype=torch.int64, device=dev).view(1, 1, 32)
+        lsb1_row = _to_u32_torch(torch.sum(lsb_32 << shifts_b, dim=2))
+
+        if v_pad != V:
+            u6_p = torch.full((v_pad, n_qchunks, 512), 32, dtype=torch.int64, device=dev)
+            u6_p[:V] = u6.view(V, n_qchunks, 512)
+            ms_p = torch.zeros((v_pad, n_qchunks, 4), dtype=torch.int64, device=dev)
+            ms_p[:V] = ms_row_i64
+            bs_p = torch.zeros((v_pad, n_qchunks), dtype=torch.float16, device=dev)
+            bs_p[:V] = big_s_row
+        else:
+            u6_p = u6.view(V, n_qchunks, 512)
+            ms_p = ms_row_i64
+            bs_p = big_s_row
+
+        ms_t = ms_p.view(n_tiles, warps, sub_n, 8, n_qchunks, 4).permute(0, 1, 4, 2, 3, 5).contiguous()
+        ms_u4 = _to_u32_torch(ms_t.view(wtot, n_qchunks * sub_n, 8, 4))
+
+        bs_t = bs_p.view(n_tiles, warps, sub_n, 8, n_qchunks).permute(0, 1, 4, 2, 3).contiguous()
+        big_s = bs_t.view(wtot, n_qchunks * sub_n, 8).contiguous()
+
+        u6_t = u6_p.view(n_tiles, warps, sub_n, 8, n_qchunks, 8, 4, 2, 4, 2)
+        u6_t = u6_t.permute(0, 1, 4, 2, 3, 8, 5, 6, 7, 9).contiguous()
+        u6_t = u6_t.view(wtot, n_qchunks * sub_n, 32, 8, 4, 4)
+
+        u24 = (
+            u6_t[..., 0]
+            | (u6_t[..., 1] << 6)
+            | (u6_t[..., 2] << 12)
+            | (u6_t[..., 3] << 18)
         )
+        w0 = u24[..., 0] | ((u24[..., 1] & 0xFF) << 24)
+        w1 = (u24[..., 1] >> 8) | ((u24[..., 2] & 0xFFFF) << 16)
+        w2 = (u24[..., 2] >> 16) | (u24[..., 3] << 8)
+        words24 = torch.stack([w0, w1, w2], dim=-1).view(wtot, n_qchunks * sub_n, 32, 6, 4)
+        slabs_u4 = _to_u32_torch(words24.permute(0, 1, 3, 2, 4))
+
     return CudaCertTableV7(
-        slabs_u4=torch.from_numpy(pk.slabs_u4).to(dev).contiguous(),
-        ms_u4=torch.from_numpy(pk.ms_u4).to(dev).contiguous(),
-        big_s=torch.from_numpy(pk.big_s).to(dev).contiguous(),
-        lsb1_row=torch.from_numpy(pk.lsb1_row).to(dev).contiguous(),
-        ms_row=torch.from_numpy(pk.ms_row).to(dev).contiguous(),
-        big_s_row=torch.from_numpy(pk.big_s_row).to(dev).contiguous(),
-        rt1=torch.from_numpy(pk.rt1).to(dev).contiguous(),
-        nv1=torch.from_numpy(pk.nv1).to(dev).contiguous(),
-        rt2=torch.from_numpy(pk.rt2).to(dev).contiguous(),
-        nv2=torch.from_numpy(pk.nv2).to(dev).contiguous(),
-        V=pk.V,
-        K=pk.K,
+        slabs_u4=slabs_u4,
+        ms_u4=ms_u4,
+        big_s=big_s,
+        lsb1_row=lsb1_row,
+        ms_row=ms_row,
+        big_s_row=big_s_row,
+        rt1=rt1,
+        nv1=nv1,
+        rt2=rt2,
+        nv2=nv2,
+        V=V,
+        K=K,
         cfg_id=cfg_id,
-        cacc2=cacc2_for_k(pk.K),
+        cacc2=cacc2_for_k(K),
     )
+
+
+def build_cuda_table_v7(w, cfg_id: int = _CFG_ID) -> CudaCertTableV7:
+    """Pack or disk-cache load a CUDA bf16 LM-head shard `w [V, K]` into `CudaCertTableV7`."""
+    assert torch is not None
+    dev = w.device
+    V, K = int(w.shape[0]), int(w.shape[1])
+    cache_path = None
+    if _CACHE_DIR:
+        try:
+            wkey = _wkey_v7(w, cfg_id)
+            cache_path = os.path.join(_CACHE_DIR, f"cert-v7-{wkey}-{V}x{K}-cfg{cfg_id}.pt")
+            if os.path.exists(cache_path):
+                d = torch.load(cache_path, map_location=dev, weights_only=True)
+                tbl = CudaCertTableV7(
+                    slabs_u4=d["slabs_u4"].view(torch.uint32).contiguous(),
+                    ms_u4=d["ms_u4"].view(torch.uint32).contiguous(),
+                    big_s=d["big_s"].contiguous(),
+                    lsb1_row=d["lsb1_row"].view(torch.uint32).contiguous(),
+                    ms_row=d["ms_row"].view(torch.uint32).contiguous(),
+                    big_s_row=d["big_s_row"].contiguous(),
+                    rt1=d["rt1"].contiguous(),
+                    nv1=d["nv1"].contiguous(),
+                    rt2=d["rt2"].contiguous(),
+                    nv2=d["nv2"].contiguous(),
+                    V=V,
+                    K=K,
+                    cfg_id=cfg_id,
+                    cacc2=cacc2_for_k(K),
+                )
+                if os.environ.get("INKLING_CERT_VERBOSE", "1") != "0":
+                    s1_mb = (tbl.slabs_u4.nbytes + tbl.ms_u4.nbytes + tbl.big_s.nbytes + tbl.rt1.nbytes + tbl.nv1.nbytes) / 1e6
+                    print(f"[cert-v7] loaded cached V={V} K={K} cfg={cfg_id} S1={s1_mb:.2f}MB ({cache_path})", flush=True)
+                return tbl
+        except Exception:
+            pass
+
+    if w.is_cuda:
+        tbl = pack_cert_v7_torch(w, cfg_id=cfg_id)
+    else:
+        w_f32 = w.detach().float().cpu().numpy()
+        pk = pack_cert_v7_np(w_f32, cfg_id=cfg_id)
+        tbl = CudaCertTableV7(
+            slabs_u4=torch.from_numpy(pk.slabs_u4).to(dev).contiguous(),
+            ms_u4=torch.from_numpy(pk.ms_u4).to(dev).contiguous(),
+            big_s=torch.from_numpy(pk.big_s).to(dev).contiguous(),
+            lsb1_row=torch.from_numpy(pk.lsb1_row).to(dev).contiguous(),
+            ms_row=torch.from_numpy(pk.ms_row).to(dev).contiguous(),
+            big_s_row=torch.from_numpy(pk.big_s_row).to(dev).contiguous(),
+            rt1=torch.from_numpy(pk.rt1).to(dev).contiguous(),
+            nv1=torch.from_numpy(pk.nv1).to(dev).contiguous(),
+            rt2=torch.from_numpy(pk.rt2).to(dev).contiguous(),
+            nv2=torch.from_numpy(pk.nv2).to(dev).contiguous(),
+            V=pk.V,
+            K=pk.K,
+            cfg_id=cfg_id,
+            cacc2=cacc2_for_k(pk.K),
+        )
+
+    if cache_path is not None:
+        try:
+            os.makedirs(_CACHE_DIR, exist_ok=True)
+            tmp = f"{cache_path}.{os.getpid()}.tmp"
+            torch.save(
+                {
+                    "slabs_u4": tbl.slabs_u4.view(torch.int32).cpu(),
+                    "ms_u4": tbl.ms_u4.view(torch.int32).cpu(),
+                    "big_s": tbl.big_s.cpu(),
+                    "lsb1_row": tbl.lsb1_row.view(torch.int32).cpu(),
+                    "ms_row": tbl.ms_row.view(torch.int32).cpu(),
+                    "big_s_row": tbl.big_s_row.cpu(),
+                    "rt1": tbl.rt1.cpu(),
+                    "nv1": tbl.nv1.cpu(),
+                    "rt2": tbl.rt2.cpu(),
+                    "nv2": tbl.nv2.cpu(),
+                },
+                tmp,
+            )
+            os.replace(tmp, cache_path)
+        except Exception:
+            pass
+
+    if os.environ.get("INKLING_CERT_VERBOSE", "1") != "0":
+        s1_mb = (tbl.slabs_u4.nbytes + tbl.ms_u4.nbytes + tbl.big_s.nbytes + tbl.rt1.nbytes + tbl.nv1.nbytes) / 1e6
+        s2_mb = (tbl.lsb1_row.nbytes + tbl.ms_row.nbytes + tbl.big_s_row.nbytes + tbl.rt2.nbytes + tbl.nv2.nbytes) / 1e6
+        print(f"[cert-v7] packed V={V} K={K} cfg={cfg_id}: S1={s1_mb:.2f}MB S2={s2_mb:.2f}MB", flush=True)
+    return tbl
 
 
 def alloc_state_v7(M: int, V: int, K: int, world_size: int, device) -> CudaCertStateV7:
     assert torch is not None
-    m_rows = 8 if M <= 8 else 16
+    m_rows = 8 if M <= 8 else (((M + 15) // 16) * 16)
+    m_cap = max(16, m_rows)
     return CudaCertStateV7(
         x_pad=torch.empty((m_rows, K), dtype=torch.bfloat16, device=device),
-        xn=torch.empty((16,), dtype=torch.float32, device=device),
-        bad=torch.empty((16,), dtype=torch.int32, device=device),
+        xn=torch.empty((m_cap,), dtype=torch.float32, device=device),
+        bad=torch.empty((m_cap,), dtype=torch.int32, device=device),
         s1_out=torch.empty((M, V), dtype=torch.float32, device=device),
         hi=torch.empty((M, V), dtype=torch.float16, device=device),
-        thr_u=torch.empty((M,), dtype=torch.uint32, device=device),
-        thr_ag=torch.empty((world_size, M), dtype=torch.uint32, device=device),
-        t_glob=torch.empty((16,), dtype=torch.float32, device=device),
+        thr_u=torch.full((m_cap,), 0x007FFFFF, dtype=torch.uint32, device=device),
+        thr_ag=torch.empty((world_size, m_cap), dtype=torch.uint32, device=device),
+        t_glob=torch.empty((m_cap,), dtype=torch.float32, device=device),
         idx1=torch.empty((V,), dtype=torch.int32, device=device),
         cnt1=torch.zeros((1,), dtype=torch.int32, device=device),
         idx2=torch.empty((V,), dtype=torch.int32, device=device),
         cnt2=torch.zeros((1,), dtype=torch.int32, device=device),
-        best=torch.zeros((16,), dtype=torch.uint64, device=device),
+        best=torch.zeros((m_cap,), dtype=torch.uint64, device=device),
         arrive=torch.zeros((1,), dtype=torch.int32, device=device),
-        out_pair=torch.empty((M, 4), dtype=torch.float32, device=device),
+        out_pair=torch.empty((m_cap, 4), dtype=torch.float32, device=device),
         nlive_full=torch.tensor([M], dtype=torch.int32, device=device),
+        mask1=torch.empty((V,), dtype=torch.int64, device=device),
+        mask1_128=torch.empty((V, 2), dtype=torch.int64, device=device) if (M > 64 or _HAS_V9) else None,
     )
+
+
+def _encode_logits_idx_ptr(logits_idx) -> int:
+    if logits_idx is None:
+        return 0
+    ptr = int(logits_idx.data_ptr())
+    if torch is not None and logits_idx.dtype == torch.int32:
+        return ptr | 1
+    return ptr
+
+
+def _inv_cap_of_v7(cap: float) -> float:
+    return float(np.float32(1.0) / np.float32(cap)) if cap > 0.0 else 0.0
 
 
 def certified_local_pairs_v7(
@@ -503,6 +873,7 @@ def certified_local_pairs_v7(
     logits_idx=None,
     n_live_buf=None,
     pdl: bool = _USE_PDL,
+    slack: float = _SLACK,
 ):
     """Run full 0-ULP CertHead-v7 pipeline:
       1. `cert_head_v7_pre_screen` (optional direct LOGITS_IDX gather + 91.11 MB INT6_g512_ms8 screen)
@@ -518,7 +889,7 @@ def certified_local_pairs_v7(
 
     rc = lib.cert_head_v7_pre_screen(
         int(x.data_ptr()),
-        int(logits_idx.data_ptr()) if logits_idx is not None else 0,
+        _encode_logits_idx_ptr(logits_idx),
         int(table.slabs_u4.data_ptr()),
         int(table.ms_u4.data_ptr()),
         int(table.big_s.data_ptr()),
@@ -553,38 +924,99 @@ def certified_local_pairs_v7(
         ws = 1
         tstride = M
 
-    inv_cap = 1.0 / cap if cap > 0.0 else 0.0
-    rc = lib.cert_head_v7_post_refine(
-        int(state.x_pad.data_ptr()),
-        int(w_bf16.data_ptr()),
-        int(table.lsb1_row.data_ptr()),
-        int(table.ms_row.data_ptr()),
-        int(table.big_s_row.data_ptr()),
-        int(state.s1_out.data_ptr()),
-        int(table.rt2.data_ptr()),
-        int(table.nv2.data_ptr()),
-        int(state.xn.data_ptr()),
-        int(state.hi.data_ptr()),
-        thr_ag_ptr,
-        int(state.bad.data_ptr()),
-        int(state.t_glob.data_ptr()),
-        int(state.idx1.data_ptr()),
-        int(state.cnt1.data_ptr()),
-        int(state.idx2.data_ptr()),
-        int(state.cnt2.data_ptr()),
-        int(state.best.data_ptr()),
-        int(state.arrive.data_ptr()),
-        int(state.out_pair.data_ptr()),
-        int(nl_buf.data_ptr()),
-        M, table.V, vreal, vstart, table.K, int(w_bf16.stride(0)),
-        ws, tstride, _REF_GRID, 1 if pdl else 0,
-        table.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
-        inv_cap, cap, _SLACK,
-        stream,
-    )
+    inv_cap = _inv_cap_of_v7(cap)
+    if _HAS_V9 and getattr(state, "mask1_128", None) is not None:
+        rc = lib.cert_head_v9_post_refine(
+            int(state.x_pad.data_ptr()),
+            int(w_bf16.data_ptr()),
+            int(table.lsb1_row.data_ptr()),
+            int(table.ms_row.data_ptr()),
+            int(table.big_s_row.data_ptr()),
+            int(state.s1_out.data_ptr()),
+            int(table.rt2.data_ptr()),
+            int(table.nv2.data_ptr()),
+            int(state.xn.data_ptr()),
+            int(state.hi.data_ptr()),
+            thr_ag_ptr,
+            int(state.bad.data_ptr()),
+            int(state.t_glob.data_ptr()),
+            int(state.idx1.data_ptr()),
+            int(state.mask1_128.data_ptr()),
+            int(state.cnt1.data_ptr()),
+            int(state.idx2.data_ptr()),
+            int(state.cnt2.data_ptr()),
+            int(state.best.data_ptr()),
+            int(state.arrive.data_ptr()),
+            int(state.out_pair.data_ptr()),
+            int(nl_buf.data_ptr()),
+            M, table.V, vreal, vstart, table.K, int(w_bf16.stride(0)),
+            ws, tstride, _REF_GRID, 1 if pdl else 0,
+            table.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+            inv_cap, cap, slack,
+            stream,
+        )
+    elif _HAS_C48 and getattr(state, "mask1", None) is not None:
+        rc = lib.cert_head_v7_post_refine_c48(
+            int(state.x_pad.data_ptr()),
+            int(w_bf16.data_ptr()),
+            int(table.lsb1_row.data_ptr()),
+            int(table.ms_row.data_ptr()),
+            int(table.big_s_row.data_ptr()),
+            int(state.s1_out.data_ptr()),
+            int(table.rt2.data_ptr()),
+            int(table.nv2.data_ptr()),
+            int(state.xn.data_ptr()),
+            int(state.hi.data_ptr()),
+            thr_ag_ptr,
+            int(state.bad.data_ptr()),
+            int(state.t_glob.data_ptr()),
+            int(state.idx1.data_ptr()),
+            int(state.mask1.data_ptr()),
+            int(state.cnt1.data_ptr()),
+            int(state.idx2.data_ptr()),
+            int(state.cnt2.data_ptr()),
+            int(state.best.data_ptr()),
+            int(state.arrive.data_ptr()),
+            int(state.out_pair.data_ptr()),
+            int(nl_buf.data_ptr()),
+            M, table.V, vreal, vstart, table.K, int(w_bf16.stride(0)),
+            ws, tstride, _REF_GRID, 1 if pdl else 0,
+            table.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+            inv_cap, cap, slack,
+            stream,
+        )
+    else:
+        rc = lib.cert_head_v7_post_refine(
+            int(state.x_pad.data_ptr()),
+            int(w_bf16.data_ptr()),
+            int(table.lsb1_row.data_ptr()),
+            int(table.ms_row.data_ptr()),
+            int(table.big_s_row.data_ptr()),
+            int(state.s1_out.data_ptr()),
+            int(table.rt2.data_ptr()),
+            int(table.nv2.data_ptr()),
+            int(state.xn.data_ptr()),
+            int(state.hi.data_ptr()),
+            thr_ag_ptr,
+            int(state.bad.data_ptr()),
+            int(state.t_glob.data_ptr()),
+            int(state.idx1.data_ptr()),
+            int(state.cnt1.data_ptr()),
+            int(state.idx2.data_ptr()),
+            int(state.cnt2.data_ptr()),
+            int(state.best.data_ptr()),
+            int(state.arrive.data_ptr()),
+            int(state.out_pair.data_ptr()),
+            int(nl_buf.data_ptr()),
+            M, table.V, vreal, vstart, table.K, int(w_bf16.stride(0)),
+            ws, tstride, _REF_GRID, 1 if pdl else 0,
+            table.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+            inv_cap, cap, slack,
+            stream,
+        )
     if rc != 0:
         raise RuntimeError(f"cert_head_v7_post_refine failed: cudaError={rc}")
-    return state.out_pair
+    return state.out_pair[:M]
 
 
 def _get_tp_world_size() -> int:
@@ -596,7 +1028,9 @@ def _get_tp_world_size() -> int:
 
 
 class CudaCertStateV7Adapter:
-    """Drop-in adapter compatible with sync_free.py's CudaCertState interface."""
+    """Drop-in adapter compatible with sync_free.py's CudaCertState interface
+    (serves M=2..INKLING_CERT_HEAD_V7_MAX_M [up to 64] via CertHead-v7 over the same 91.20 MB
+    Stage-1 table with 0 extra table VRAM, and optionally delegates M>max_m to CertHead-C32)."""
 
     def __init__(self, tbl: CudaCertTableV7, W, vreal: int, vstart: int, cap: float = 30.0, dip: float = 0.0):
         assert torch is not None
@@ -605,50 +1039,134 @@ class CudaCertStateV7Adapter:
         self.vreal = int(vreal)
         self.vstart = int(vstart)
         self.cap = float(np.float32(cap)) if cap else 0.0
+        self.inv_cap = _inv_cap_of_v7(self.cap)
         self.dip = float(dip)
+        self.slack = slack_of_v7(self.dip) if self.dip > 0.0 else (_SLACK if self.cap > 0.0 else 0.0)
         self.world_size = _get_tp_world_size()
-        self.state = alloc_state_v7(16, tbl.V, tbl.K, max(1, self.world_size), W.device)
-        # Ensure thr_u & out_pair are 16-row graph-safe workspaces
-        self.state.thr_u = torch.full((16,), 0x007FFFFF, dtype=torch.uint32, device=W.device)
-        self.state.out_pair = torch.empty((16, 4), dtype=torch.float32, device=W.device)
-        self._nlive_full = {m: torch.tensor([m], dtype=torch.int32, device=W.device) for m in range(1, 17)}
+        self.max_m = lib_max_m()
+        self.state = alloc_state_v7(self.max_m, tbl.V, tbl.K, max(1, self.world_size), W.device)
+        self._nlive_full = {m: torch.tensor([m], dtype=torch.int32, device=W.device) for m in range(1, self.max_m + 1)}
         self.m_ok: dict[int, bool] = {}
         self.is_v7 = True
+        self._c32_state = None
+        if _DELEGATE_C32:
+            try:
+                from . import cert_head_cuda as chc
+            except Exception:
+                try:
+                    import cert_head_cuda as chc  # type: ignore
+                except Exception:
+                    chc = None  # type: ignore
+            if chc is not None and chc.ENABLED and chc.C32_ENABLED and chc._get_lib() is not None and chc._HAS_C32:
+                try:
+                    ct_c32 = chc.build_cuda_table(W, self.vreal)
+                    cand_c32 = chc.CudaCertState(ct_c32, W, vstart=self.vstart, cap=cap, dip=dip)
+                    cand_c32.qualify(cand_c32.active_max_m())
+                    self._c32_state = cand_c32
+                    print(
+                        "[inkling-cert-v7] WARNING: delegating C=32 to v6 allocates +100.3 MiB duplicate "
+                        "table (slower at M>=48; set INKLING_CERT_HEAD_C32=0 to reclaim)",
+                        flush=True,
+                    )
+                except Exception:
+                    self._c32_state = None
 
-    def qualify(self, max_m: int = 16) -> list[int]:
+    def active_max_m(self) -> int:
+        c32_m = int(self._c32_state.active_max_m()) if (
+            self._c32_state is not None and hasattr(self._c32_state, "active_max_m")
+        ) else 0
+        return max(self.max_m, c32_m)
+
+    def qualify_one(self, M: int) -> bool:
+        """Prove literal 0-ULP bit-equality of CertHead-v7 refine MMA vs torch.mm(out_dtype=fp32)."""
+        cached = self.m_ok.get(M)
+        if cached is not None:
+            return cached
         lib = _load_lib()
-        if lib is None:
-            return list(range(2, max_m + 1))
-        bad = []
+        if lib is None or M < 2 or M > self.max_m or torch.cuda.is_current_stream_capturing():
+            return False
         V, K = self.tbl.V, self.tbl.K
-        for M in range(2, min(16, max_m) + 1):
-            g = torch.Generator(device=self.W.device)
-            g.manual_seed(1234 + M)
-            ok = True
-            m_pad = 8 if M <= 8 else 16
-            for sc in (1.0, 0.3, 4.0):
-                x = (torch.randn((M, K), device=self.W.device, generator=g) * sc).to(torch.bfloat16)
+        g = torch.Generator(device=self.W.device)
+        g.manual_seed(1234 + M)
+        ok = True
+        m_pad = 8 if M <= 8 else (((M + 15) // 16) * 16)
+        for sc in (1.0, 0.3, 4.0):
+            x = (torch.randn((M, K), device=self.W.device, generator=g) * sc).to(torch.bfloat16)
+            if _QUALIFY_REF == "b1_exact" and M > 16:
+                # Wave-V12 fix: pad tail to uniform 16-row tiles so `M % 16 == 1` (17, 33, 49, 65, ...)
+                # never dispatches cuBLASLt `(1, K)` GEMV instead of `m16n8k16`, proving exact 0-ULP
+                # row-for-row bit-equality with `B=1` `exact_ink.py` across ALL `M = 2..128`!
+                if M == m_pad:
+                    x_q = x
+                else:
+                    x_q = torch.zeros((m_pad, K), dtype=x.dtype, device=x.device)
+                    x_q[:M].copy_(x)
+                ref = torch.cat(
+                    [torch.mm(x_q[m0 : m0 + 16], self.W.t(), out_dtype=torch.float32) for m0 in range(0, m_pad, 16)],
+                    dim=0,
+                )[:M]
+            else:
                 ref = torch.mm(x, self.W.t(), out_dtype=torch.float32)
-                self.state.x_pad[:M].copy_(x)
-                if M < m_pad:
-                    self.state.x_pad[M:m_pad].zero_()
-                out = torch.empty_like(ref)
-                rc = lib.cert_head_v7_exact_all(
-                    int(self.state.x_pad.data_ptr()), int(self.W.data_ptr()), int(out.data_ptr()),
-                    int(self._nlive_full[M].data_ptr()), M, V, K, int(self.W.stride(0)),
-                    _REF_GRID, int(torch.cuda.current_stream(self.W.device).cuda_stream),
-                )
-                if rc != 0 or not bool(torch.equal(out.view(torch.int32), ref.view(torch.int32))):
-                    ok = False
-                    break
-            self.m_ok[M] = ok
-            if not ok:
+            self.state.x_pad[:M].copy_(x)
+            if M < m_pad and m_pad <= self.state.x_pad.shape[0]:
+                self.state.x_pad[M:m_pad].zero_()
+            out = torch.empty_like(ref)
+            rc = lib.cert_head_v7_exact_all(
+                int(self.state.x_pad.data_ptr()), int(self.W.data_ptr()), int(out.data_ptr()),
+                int(self._nlive_full[M].data_ptr()), M, V, K, int(self.W.stride(0)),
+                _REF_GRID, int(torch.cuda.current_stream(self.W.device).cuda_stream),
+            )
+            if rc != 0 or not bool(torch.equal(out.view(torch.int32), ref.view(torch.int32))):
+                ok = False
+                break
+        self.m_ok[M] = ok
+        return ok
+
+    def qualify(self, max_m: int | None = None) -> list[int]:
+        lib = _load_lib()
+        # sync_free.py:1043 calls cand_v7.qualify(16); when C48 is enabled (self.max_m > 16),
+        # qualify all M=2..self.max_m up front (graph-capture safe!) and fail-closed any M>16
+        # individually without disqualifying M=2..16.
+        sync_free_compat = (max_m == 16 and self.max_m > 16)
+        lim = self.max_m if (max_m is None or sync_free_compat) else min(self.max_m, int(max_m))
+        if lib is None:
+            return list(range(2, min(16, lim) + 1))
+        bad = []
+        for M in range(2, lim + 1):
+            if not self.qualify_one(M):
                 bad.append(M)
+        global _ACTIVE_ADAPTER
+        if sync_free_compat:
+            bad_le16 = [m for m in bad if m <= 16]
+            bad_gt16 = [m for m in bad if m > 16]
+            if not bad_le16:
+                _ACTIVE_ADAPTER = self
+            if os.environ.get("INKLING_CERT_VERBOSE", "1") != "0":
+                _ver_tag = _LIB_VER or (9 if _HAS_V9 else 7)
+                print(
+                    f"[cert-v{_ver_tag}] C48 qualify (ref={_QUALIFY_REF}) M=2..{lim}: "
+                    f"ok={lim - 1 - len(bad)}/{lim - 1} "
+                    f"(bad_le16={bad_le16}, bad_gt16={bad_gt16})",
+                    flush=True,
+                )
+            return bad_le16
+        if not bad:
+            _ACTIVE_ADAPTER = self
         return bad
 
     def local_pairs(self, x, nlive=None, logits_idx=None, pdl: bool = _USE_PDL):
         M = int(logits_idx.shape[0]) if logits_idx is not None else int(x.shape[0])
-        if not ENABLED or M < 2 or M > 16 or not self.m_ok.get(M, False):
+        if M > self.max_m and self._c32_state is not None and logits_idx is None:
+            try:
+                from . import cert_head_cuda as chc
+            except Exception:
+                import cert_head_cuda as chc  # type: ignore
+            return chc.certified_local_pairs(self._c32_state, x, nlive=nlive, pdl=pdl)
+        if not ENABLED or M < 2 or M > self.max_m:
+            return None
+        if M not in self.m_ok and not torch.cuda.is_current_stream_capturing():
+            self.qualify_one(M)
+        if not self.m_ok.get(M, False):
             return None
         lib = _load_lib()
         if lib is None:
@@ -661,7 +1179,7 @@ class CudaCertStateV7Adapter:
         st = self.state
         rc = lib.cert_head_v7_pre_screen(
             int(x.data_ptr()),
-            int(logits_idx.data_ptr()) if logits_idx is not None else 0,
+            _encode_logits_idx_ptr(logits_idx),
             int(t.slabs_u4.data_ptr()),
             int(t.ms_u4.data_ptr()),
             int(t.big_s.data_ptr()),
@@ -687,9 +1205,8 @@ class CudaCertStateV7Adapter:
             raise RuntimeError(f"cert_head_v7_pre_screen failed: cudaError={rc}")
 
         if self.world_size > 1:
-            from vllm.distributed import tensor_model_parallel_all_gather
             thr_stride = ((M + 3) // 4) * 4
-            thr_ag = tensor_model_parallel_all_gather(st.thr_u[:thr_stride].view(torch.int32), dim=0)
+            thr_ag = _get_tp_all_gather()(st.thr_u[:thr_stride].view(torch.int32), dim=0)
             if not thr_ag.is_contiguous():
                 thr_ag = thr_ag.contiguous()
             thr_ag_ptr = int(thr_ag.data_ptr())
@@ -699,35 +1216,95 @@ class CudaCertStateV7Adapter:
             thr_ag_ptr = int(st.thr_u.data_ptr())
             ws = 1
 
-        inv_cap = 1.0 / self.cap if self.cap > 0.0 else 0.0
-        rc = lib.cert_head_v7_post_refine(
-            int(st.x_pad.data_ptr()),
-            int(self.W.data_ptr()),
-            int(t.lsb1_row.data_ptr()),
-            int(t.ms_row.data_ptr()),
-            int(t.big_s_row.data_ptr()),
-            int(st.s1_out.data_ptr()),
-            int(t.rt2.data_ptr()),
-            int(t.nv2.data_ptr()),
-            int(st.xn.data_ptr()),
-            int(st.hi.data_ptr()),
-            thr_ag_ptr,
-            int(st.bad.data_ptr()),
-            int(st.t_glob.data_ptr()),
-            int(st.idx1.data_ptr()),
-            int(st.cnt1.data_ptr()),
-            int(st.idx2.data_ptr()),
-            int(st.cnt2.data_ptr()),
-            int(st.best.data_ptr()),
-            int(st.arrive.data_ptr()),
-            int(st.out_pair.data_ptr()),
-            int(nl_buf.data_ptr()),
-            M, t.V, self.vreal, self.vstart, t.K, int(self.W.stride(0)),
-            ws, thr_stride, _REF_GRID, 1 if pdl else 0,
-            t.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
-            inv_cap, self.cap, _SLACK,
-            stream,
-        )
+        if _HAS_V9 and getattr(st, "mask1_128", None) is not None:
+            rc = lib.cert_head_v9_post_refine(
+                int(st.x_pad.data_ptr()),
+                int(self.W.data_ptr()),
+                int(t.lsb1_row.data_ptr()),
+                int(t.ms_row.data_ptr()),
+                int(t.big_s_row.data_ptr()),
+                int(st.s1_out.data_ptr()),
+                int(t.rt2.data_ptr()),
+                int(t.nv2.data_ptr()),
+                int(st.xn.data_ptr()),
+                int(st.hi.data_ptr()),
+                thr_ag_ptr,
+                int(st.bad.data_ptr()),
+                int(st.t_glob.data_ptr()),
+                int(st.idx1.data_ptr()),
+                int(st.mask1_128.data_ptr()),
+                int(st.cnt1.data_ptr()),
+                int(st.idx2.data_ptr()),
+                int(st.cnt2.data_ptr()),
+                int(st.best.data_ptr()),
+                int(st.arrive.data_ptr()),
+                int(st.out_pair.data_ptr()),
+                int(nl_buf.data_ptr()),
+                M, t.V, self.vreal, self.vstart, t.K, int(self.W.stride(0)),
+                ws, thr_stride, _REF_GRID, 1 if pdl else 0,
+                t.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+                self.inv_cap, self.cap, self.slack,
+                stream,
+            )
+        elif _HAS_C48 and getattr(st, "mask1", None) is not None:
+            rc = lib.cert_head_v7_post_refine_c48(
+                int(st.x_pad.data_ptr()),
+                int(self.W.data_ptr()),
+                int(t.lsb1_row.data_ptr()),
+                int(t.ms_row.data_ptr()),
+                int(t.big_s_row.data_ptr()),
+                int(st.s1_out.data_ptr()),
+                int(t.rt2.data_ptr()),
+                int(t.nv2.data_ptr()),
+                int(st.xn.data_ptr()),
+                int(st.hi.data_ptr()),
+                thr_ag_ptr,
+                int(st.bad.data_ptr()),
+                int(st.t_glob.data_ptr()),
+                int(st.idx1.data_ptr()),
+                int(st.mask1.data_ptr()),
+                int(st.cnt1.data_ptr()),
+                int(st.idx2.data_ptr()),
+                int(st.cnt2.data_ptr()),
+                int(st.best.data_ptr()),
+                int(st.arrive.data_ptr()),
+                int(st.out_pair.data_ptr()),
+                int(nl_buf.data_ptr()),
+                M, t.V, self.vreal, self.vstart, t.K, int(self.W.stride(0)),
+                ws, thr_stride, _REF_GRID, 1 if pdl else 0,
+                t.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+                self.inv_cap, self.cap, self.slack,
+                stream,
+            )
+        else:
+            rc = lib.cert_head_v7_post_refine(
+                int(st.x_pad.data_ptr()),
+                int(self.W.data_ptr()),
+                int(t.lsb1_row.data_ptr()),
+                int(t.ms_row.data_ptr()),
+                int(t.big_s_row.data_ptr()),
+                int(st.s1_out.data_ptr()),
+                int(t.rt2.data_ptr()),
+                int(t.nv2.data_ptr()),
+                int(st.xn.data_ptr()),
+                int(st.hi.data_ptr()),
+                thr_ag_ptr,
+                int(st.bad.data_ptr()),
+                int(st.t_glob.data_ptr()),
+                int(st.idx1.data_ptr()),
+                int(st.cnt1.data_ptr()),
+                int(st.idx2.data_ptr()),
+                int(st.cnt2.data_ptr()),
+                int(st.best.data_ptr()),
+                int(st.arrive.data_ptr()),
+                int(st.out_pair.data_ptr()),
+                int(nl_buf.data_ptr()),
+                M, t.V, self.vreal, self.vstart, t.K, int(self.W.stride(0)),
+                ws, thr_stride, _REF_GRID, 1 if pdl else 0,
+                t.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+                self.inv_cap, self.cap, self.slack,
+                stream,
+            )
         if rc != 0:
             raise RuntimeError(f"cert_head_v7_post_refine failed: cudaError={rc}")
         return st.out_pair[:M]

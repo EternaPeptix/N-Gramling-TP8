@@ -4,6 +4,7 @@
 prefill-only dynamic FP8 dense path (INKLING_PF_DENSE_FP8=1, M >= 1024) on SM121,
 and the reference ``linear`` with fp32 accumulation in ordered 1024-wide K groups."""
 
+import ctypes
 import os
 import torch
 
@@ -30,7 +31,12 @@ _SKINNY = _SM12 and os.environ.get("INKLING_SKINNY", "0") == "1"
 _PDL_QKVR = _SM12 and os.environ.get("INKLING_PDL_SKINNY", "0") == "1"
 _PDL_WO = (_SM12 and os.environ.get("INKLING_WO_L2PF", "0") == "1"
            and os.environ.get("INKLING_ATTN_FUSE_GS", "0") == "1")
-_PDL = _PDL_QKVR or _PDL_WO
+# v12 opt-in (default OFF): decouple BF11 wo_ud PDL (attn->wo_ud wait + wo_ud->rdma_ar trig)
+# from legacy Triton INKLING_WO_L2PF so all 48 attention layers overlap cleanly at C=1..8!
+_PDL_WO_BF11 = (_SM12 and os.environ.get("INKLING_PDL_WO_BF11", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+))
+_PDL = _PDL_QKVR or _PDL_WO or _PDL_WO_BF11
 _PDL_QKVR_N = tuple(int(v) for v in os.environ.get("INKLING_PDL_QKVR_N", "1896,1640,128").split(","))
 _PDL_WO_N, _PDL_WO_K = (int(v) for v in os.environ.get("INKLING_PDL_WO_NK", "4608,768").split(","))
 
@@ -57,6 +63,85 @@ _PF_ROUTER_FP8 = _SM12 and os.environ.get("INKLING_PF_ROUTER_FP8", "0").strip().
 _PF_ROUTER_FP8_MIN_M = int(os.environ.get("INKLING_PF_ROUTER_FP8_MIN_M", "1024"))
 _FP8_MAX = 448.0
 _FP8_EPS = 1e-12
+_PF_ROWQUANT_V4 = _SM12 and os.environ.get("INKLING_PF_ROWQUANT_V4", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+_PF_NONMOE_V4_LIB_PATH = os.environ.get(
+    "INKLING_PF_NONMOE_V4_LIB", "/rdma/libpf_attn_nonmoe_v4_sm121.so"
+).strip()
+_PF_NONMOE_V4_LIB = None
+_PF_NONMOE_V4_TRIED = False
+_PF_ROWQUANT_SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_SHARED_PF_SCRATCH = os.environ.get(
+    "INKLING_SHARED_PF_SCRATCH",
+    os.environ.get("INKLING_FREE_PACKED_RAW_WEIGHTS", "0"),
+).strip().lower() in ("1", "true", "on", "yes")
+_SHARED_PF_SCRATCH_BUF: dict[tuple, torch.Tensor] = {}
+
+
+def get_shared_pf_scratch(
+    device: torch.device,
+    nbytes: int,
+    stream_id: int | None = None,
+) -> torch.Tensor:
+    """Shared same-stream prefill scratch pool (`INKLING_SHARED_PF_SCRATCH=1`).
+
+    Allows disjoint prefill phases (`_PF_ROWQUANT_SCRATCH` 72 MiB and
+    `global_attn_1m._CUDA_SCRATCH` 48.75 MiB) to alias ONE high-water buffer.
+    """
+    if stream_id is None:
+        stream_id = int(torch.cuda.current_stream(device).cuda_stream) if device.type == "cuda" else 0
+    need = (int(nbytes) + 255) & ~255
+    skey = (device, stream_id)
+    buf = _SHARED_PF_SCRATCH_BUF.get(skey)
+    if buf is None or int(buf.numel()) < need:
+        buf = torch.empty((need,), dtype=torch.uint8, device=device)
+        _SHARED_PF_SCRATCH_BUF[skey] = buf
+    return buf[:need]
+
+
+def _resolve_bf16_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Return `weight` if raw storage is live, else lossless 0-ULP unpack from BF12/BF11."""
+    if weight.untyped_storage().size() > 0:
+        return weight
+    try:
+        from . import router_bf12
+
+        unpacked = router_bf12.unpack_bf16(weight)
+        if unpacked is not None:
+            return unpacked
+    except Exception:
+        pass
+    try:
+        from . import skinny_bf11
+
+        unpacked = skinny_bf11.unpack_bf16(weight)
+        if unpacked is not None:
+            return unpacked
+    except Exception:
+        pass
+    return weight
+
+
+def _get_pf_nonmoe_v4_lib():
+    global _PF_NONMOE_V4_LIB, _PF_NONMOE_V4_TRIED
+    if _PF_NONMOE_V4_TRIED:
+        return _PF_NONMOE_V4_LIB
+    _PF_NONMOE_V4_TRIED = True
+    if not _PF_NONMOE_V4_LIB_PATH or not os.path.exists(_PF_NONMOE_V4_LIB_PATH):
+        return None
+    try:
+        lib = ctypes.CDLL(_PF_NONMOE_V4_LIB_PATH)
+        lib.quant_fp8_rowwise_v4_sm121_fwd.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+            ctypes.c_uint64,
+        ]
+        lib.quant_fp8_rowwise_v4_sm121_fwd.restype = ctypes.c_int
+        _PF_NONMOE_V4_LIB = lib
+    except Exception:
+        _PF_NONMOE_V4_LIB = None
+    return _PF_NONMOE_V4_LIB
 
 # Keyed by (weight.data_ptr(), N, K, stride0, stride1, mode) so ephemeral slices
 # like global attention q_side_w / w_k / w_v cache cleanly without re-quantizing!
@@ -148,12 +233,64 @@ def _quant_fp8_rowwise_generic_kernel(
         tl.store(y_row + offs, yv, mask=offs < K)
 
 
-def quantize_fp8_rowwise(x: torch.Tensor, pad_m16: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp8_rowwise(
+    x: torch.Tensor,
+    pad_m16: bool = True,
+    *,
+    reuse_scratch: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamic per-row BF16 [M, K] -> (x_fp8 [M_pad, K] e4m3fn, x_scale [M_pad, 1] fp32)."""
     m, k = x.shape
     m_pad = ((m + 15) & ~15) if pad_m16 else m
-    x_fp8 = torch.empty((m_pad, k), dtype=torch.float8_e4m3fn, device=x.device)
-    x_scale = torch.empty((m_pad, 1), dtype=torch.float32, device=x.device)
+    can_v4 = (
+        _PF_ROWQUANT_V4
+        and m >= 512
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.stride(1) == 1
+        and (k == 768 or (k & 127) == 0)
+        and not torch.cuda.is_current_stream_capturing()
+    )
+    if can_v4 and reuse_scratch:
+        stream_id = int(torch.cuda.current_stream(x.device).cuda_stream)
+        cap_m = max(m_pad, 8192)
+        if _SHARED_PF_SCRATCH:
+            fp8_bytes = (cap_m * k + 255) & ~255
+            sc_bytes = cap_m * 4
+            buf = get_shared_pf_scratch(x.device, fp8_bytes + sc_bytes, stream_id)
+            x_fp8 = buf[: m_pad * k].view(torch.float8_e4m3fn).view(m_pad, k)
+            x_scale = buf[fp8_bytes : fp8_bytes + m_pad * 4].view(torch.float32).view(m_pad, 1)
+        else:
+            skey = (x.device, stream_id, k)
+            pair = _PF_ROWQUANT_SCRATCH.get(skey)
+            if pair is None or pair[0].shape[0] < m_pad:
+                pair = (
+                    torch.empty((cap_m, k), dtype=torch.float8_e4m3fn, device=x.device),
+                    torch.empty((cap_m, 1), dtype=torch.float32, device=x.device),
+                )
+                _PF_ROWQUANT_SCRATCH[skey] = pair
+            x_fp8 = pair[0][:m_pad]
+            x_scale = pair[1][:m_pad]
+    else:
+        x_fp8 = torch.empty((m_pad, k), dtype=torch.float8_e4m3fn, device=x.device)
+        x_scale = torch.empty((m_pad, 1), dtype=torch.float32, device=x.device)
+
+    if can_v4:
+        lib = _get_pf_nonmoe_v4_lib()
+        if lib is not None:
+            rc = lib.quant_fp8_rowwise_v4_sm121_fwd(
+                x.data_ptr(),
+                x_fp8.data_ptr(),
+                x_scale.data_ptr(),
+                int(m),
+                int(m_pad),
+                int(k),
+                int(x.stride(0)),
+                int(torch.cuda.current_stream(x.device).cuda_stream),
+            )
+            if rc == 0:
+                return x_fp8, x_scale
+
     head = 1 << (k.bit_length() - 1)
     tail = k - head
     if head <= 8192 and (tail == 0 or (tail & (tail - 1)) == 0):
@@ -350,21 +487,29 @@ def _probe_fp8_cap(device: torch.device) -> tuple[str, bool]:
 
 def _get_cached_w_fp8(weight: torch.Tensor, mode: str) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Lazily quantize & cache BF16 weight [N, K] -> (w_fp8_T [K, N_pad], w_scale, N_pad)."""
+    direct_entries = getattr(weight, "_inkling_fp8_entries", None)
+    if isinstance(direct_entries, dict):
+        hit = direct_entries.get(mode)
+        if hit is not None:
+            return hit
     n, k = int(weight.shape[0]), int(weight.shape[1])
-    key = (int(weight.data_ptr()), n, k, int(weight.stride(0)), int(weight.stride(1)), mode)
-    cached = _FP8_W_CACHE.get(key)
-    if cached is not None:
-        return cached
+    ptr = int(weight.data_ptr())
+    key = (ptr, n, k, int(weight.stride(0)), int(weight.stride(1)), mode)
+    if ptr != 0:
+        cached = _FP8_W_CACHE.get(key)
+        if cached is not None:
+            return cached
+    w_src = _resolve_bf16_weight(weight)
     n_pad = (n + 15) & ~15
-    w_f32 = weight.float()
+    w_f32 = w_src.float()
     if mode == "rowwise":
         amax = w_f32.abs().amax(dim=1)  # [N]
         sc = torch.clamp(amax * (1.0 / _FP8_MAX), min=_FP8_EPS)  # [N]
         w_q = torch.clamp(w_f32 / sc[:, None], -_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
         if n_pad != n:
-            w_pad = torch.zeros((n_pad, k), dtype=torch.float8_e4m3fn, device=weight.device)
+            w_pad = torch.zeros((n_pad, k), dtype=torch.float8_e4m3fn, device=w_src.device)
             w_pad[:n].copy_(w_q)
-            sc_pad = torch.ones((1, n_pad), dtype=torch.float32, device=weight.device)
+            sc_pad = torch.ones((1, n_pad), dtype=torch.float32, device=w_src.device)
             sc_pad[0, :n].copy_(sc)
             w_fp8, w_scale = w_pad, sc_pad
         else:
@@ -375,7 +520,7 @@ def _get_cached_w_fp8(weight: torch.Tensor, mode: str) -> tuple[torch.Tensor, to
         sc = torch.clamp(amax * (1.0 / _FP8_MAX), min=_FP8_EPS).reshape(1)
         w_q = torch.clamp(w_f32 / sc, -_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
         if n_pad != n:
-            w_pad = torch.zeros((n_pad, k), dtype=torch.float8_e4m3fn, device=weight.device)
+            w_pad = torch.zeros((n_pad, k), dtype=torch.float8_e4m3fn, device=w_src.device)
             w_pad[:n].copy_(w_q)
             w_fp8 = w_pad
         else:
@@ -383,7 +528,15 @@ def _get_cached_w_fp8(weight: torch.Tensor, mode: str) -> tuple[torch.Tensor, to
         w_scale = sc.contiguous()
     # Keep transpose view [K, N_pad] (col-major contiguous!) cached to save view overhead.
     entry = (w_fp8.t(), w_scale, n_pad)
-    _FP8_W_CACHE[key] = entry
+    if ptr != 0:
+        _FP8_W_CACHE[key] = entry
+    try:
+        if not isinstance(direct_entries, dict):
+            direct_entries = {}
+            weight._inkling_fp8_entries = direct_entries  # type: ignore[attr-defined]
+        direct_entries[mode] = entry
+    except Exception:
+        pass
     return entry
 
 
@@ -427,7 +580,7 @@ def pf_dense_fp8_linear(
 
     w_fp8_t, w_scale, n_pad = _get_cached_w_fp8(weight, mode)
     if mode == "rowwise":
-        x_fp8, x_scale = quantize_fp8_rowwise(x, pad_m16=True)
+        x_fp8, x_scale = quantize_fp8_rowwise(x, pad_m16=True, reuse_scratch=True)
         fast_accum = False
     else:
         x_fp8, x_scale = quantize_fp8_tensorwise(x, pad_m16=True)
@@ -463,11 +616,11 @@ def pf_dense_fp8_linear(
     return res
 
 
-def _pdl_site(x, weight, out) -> bool:
+def _pdl_site(x, weight, out, *, for_bf11: bool = False) -> bool:
     if not _PDL:
         return False
     n, k = weight.shape
-    if _PDL_WO and n == _PDL_WO_N and k == _PDL_WO_K:
+    if (_PDL_WO or (for_bf11 and _PDL_WO_BF11)) and n == _PDL_WO_N and k == _PDL_WO_K:
         # wo_ud in TP decode on GB10 (out=None or out=sbuf). Only when the preceding
         # merge_gate_sink was the PDL trigger (sm12_attn._WO_ARMED, set at trace/capture
         # time); the drafter o_proj has the same shape but no triggering predecessor.
@@ -495,13 +648,14 @@ def linear(
         from . import skinny_bf11, skinny_bf12
         from .skinny import skinny_linear, supported
         if supported(x, weight) and (out is None or out.stride(1) == 1):
-            pdl = _pdl_site(x, weight, out)
-            if _PDL_WO and tuple(weight.shape) == (_PDL_WO_N, _PDL_WO_K):
+            pdl_bf11 = _pdl_site(x, weight, out, for_bf11=True)
+            pdl = _pdl_site(x, weight, out, for_bf11=False)
+            if tuple(weight.shape) == (_PDL_WO_N, _PDL_WO_K) and (_PDL_WO or (_PDL_WO_BF11 and skinny_bf11.ENABLED) or skinny_bf11.V12_ENABLED):
                 from . import sm12_attn
-                sm12_attn._WO_ARMED = False  # one-shot: consumed by this wo_ud launch
+                sm12_attn._WO_ARMED = False  # one-shot: consumed/cleared by this wo_ud launch
             if skinny_bf11.ENABLED:
-                trig = pdl and (out is not None or weight.shape[1] == 4608)
-                res = skinny_bf11.bf11_linear(x, weight, out, pdl=pdl, trig=trig)
+                trig = pdl_bf11 and (out is not None or weight.shape[1] == 4608)
+                res = skinny_bf11.bf11_linear(x, weight, out, pdl=pdl_bf11, trig=trig)
                 if res is not None:
                     return res
             if skinny_bf12.ENABLED:
@@ -522,8 +676,8 @@ def linear(
             and weight.stride(1) == 1
             and (out is None or out.stride(1) == 1)
         ):
-            pdl = _pdl_site(x, weight, out)
-            if _PDL_WO and tuple(weight.shape) == (_PDL_WO_N, _PDL_WO_K):
+            pdl = _pdl_site(x, weight, out, for_bf11=True)
+            if tuple(weight.shape) == (_PDL_WO_N, _PDL_WO_K) and (_PDL_WO or _PDL_WO_BF11 or skinny_bf11.V12_ENABLED):
                 from . import sm12_attn
                 sm12_attn._WO_ARMED = False
             trig = pdl and (out is not None or weight.shape[1] == 4608)
@@ -538,6 +692,7 @@ def linear(
         res = pf_dense_fp8_linear(x, weight, out)
         if res is not None:
             return res
+    weight = _resolve_bf16_weight(weight)
     if out is not None:
         return torch.mm(x, weight.t(), out=out)
     # Autotuning would profile the CuTe DSL kernels past their 32-row limit.
@@ -741,6 +896,7 @@ def k_group_partials(
             if res.dtype != target_dtype:
                 res = res.to(target_dtype)
             return res.unsqueeze(0)
+    weight = _resolve_bf16_weight(weight)
     out = torch.matmul(x, weight.t())
     if out.dtype != target_dtype:
         out = out.to(target_dtype)

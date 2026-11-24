@@ -65,12 +65,29 @@ SP_RHD_SLICES = max(int(os.environ.get("INKLING_PREFILL_SP_RHD_SLICES", "4") or 
 SP_RHD_PIPE = os.environ.get("INKLING_PREFILL_SP_RHD_PIPE", "0").strip().lower() in (
     "1", "on", "true", "yes",
 )
+# Max intermediate keep buffer size (MiB) written with L2 WB (st.wb) vs streaming (st.cs).
+# Default 12 MiB prevents 18.87 MiB keep1 at T=8192 from wiping 79% of GB10's 24 MiB L2,
+# while keeping 9.44 MiB keep2 hot in L2 for the final Step-2 reduction!
+SP_RHD_WB_MAX_BYTES = max(
+    int(os.environ.get("INKLING_PREFILL_SP_RHD_WB_MAX_MB", "12") or 12), 0
+) << 20
 _FP8_RS_LIB_PATH = os.environ.get("INKLING_PF_FP8_RS_LIB", "/rdma/libpf_fp8_rs_sm121.so").strip()
 _FP8_RS_LIB: ctypes.CDLL | None = None
 _FP8_RS_TRIED = False
 _RHD_COMM_LIB_PATH = os.environ.get(
     "INKLING_PF_RHD_COMM_LIB", "/rdma/libpf_rhd_comm_sm121.so"
 ).strip()
+_RHD_COMM_V5_LIB_PATH = os.environ.get(
+    "INKLING_PF_RHD_COMM_V5_LIB", "/rdma/libpf_rhd_comm_v5.so"
+).strip()
+# v5 Low-SM (`4..8` CTAs) L2-streaming Half-2 config (prevents 48-SM preemption & 24 MiB L2 wipe!)
+SP_LOWSM_CTAS = max(min(int(os.environ.get("INKLING_PREFILL_SP_LOWSM_CTAS", "6") or 6), 32), 1)
+SP_LOWSM_WB_OUT = os.environ.get("INKLING_PREFILL_SP_LOWSM_WB_OUT", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+SP_RHD_LOWSM_TRANSPORT = os.environ.get("INKLING_PREFILL_SP_RHD_LOWSM_TRANSPORT", "").strip().lower()
+if SP_RHD_LOWSM_TRANSPORT not in ("", "pynccl_p2p", "sliced_p2p", "pair_subcomm", "pair_ag2"):
+    SP_RHD_LOWSM_TRANSPORT = ""
 _RHD_COMM_LIB: ctypes.CDLL | None = None
 _RHD_COMM_TRIED = False
 
@@ -171,16 +188,35 @@ def _tp_all_to_all_peers(send_buf: torch.Tensor, recv_buf: torch.Tensor) -> None
 # Zero-Incast 3-Step RHD (XOR Butterfly) Native SM121a Loader & Pairwise Transport
 # ---------------------------------------------------------------------------
 def _get_rhd_comm_lib() -> ctypes.CDLL | None:
-    """Lazily load native SM121a `libpf_rhd_comm_sm121.so` outside CUDA graph capture."""
+    """Lazily load native SM121a `libpf_rhd_comm_v5.so` / `libpf_rhd_comm_sm121.so` outside capture."""
     global _RHD_COMM_LIB, _RHD_COMM_TRIED
     if _RHD_COMM_TRIED:
         return _RHD_COMM_LIB
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         return None
     _RHD_COMM_TRIED = True
-    if _RHD_COMM_LIB_PATH and os.path.exists(_RHD_COMM_LIB_PATH):
+    _explicit_v5 = os.environ.get("INKLING_PF_RHD_COMM_V5_LIB", "").strip()
+    _explicit_rhd = os.environ.get("INKLING_PF_RHD_COMM_LIB", "").strip()
+    _here = os.path.dirname(os.path.abspath(__file__))
+    # Wave-V10 fix: `libpf_rhd_comm_v5.so` is a strict ABI superset of `libpf_rhd_comm_sm121.so`
+    # (all 13 legacy symbols + all 17 `*_lowsm_fwd` symbols); always prefer V5 over legacy!
+    _cand_paths = (
+        ((_explicit_v5,) if _explicit_v5 else ())
+        + (
+            _RHD_COMM_V5_LIB_PATH,
+            "/rdma/libpf_rhd_comm_v5.so",
+            os.path.join(_here, "libpf_rhd_comm_v5.so"),
+        )
+        + ((_explicit_rhd,) if _explicit_rhd else ())
+        + (
+            _RHD_COMM_LIB_PATH,
+            os.path.join(_here, "libpf_rhd_comm_sm121.so"),
+        )
+    )
+    _chosen_path = next((p for p in _cand_paths if p and os.path.exists(p)), "")
+    if _chosen_path:
         try:
-            lib = ctypes.CDLL(_RHD_COMM_LIB_PATH)
+            lib = ctypes.CDLL(_chosen_path)
             _quant_args = [
                 ctypes.c_void_p, ctypes.c_void_p,
                 ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
@@ -254,9 +290,101 @@ def _get_rhd_comm_lib() -> ctypes.CDLL | None:
                 ctypes.c_uint64,
             ]
             lib.rhd_ag_unpack_fp8_rowwise_fwd.restype = ctypes.c_int
+
+            # Optional v5 Low-SM (`max_ctas = 4..8`) L2-streaming entrypoints (`libpf_rhd_comm_v5.so`)
+            _has_v5 = hasattr(lib, "pf_rhd_comm_v5_version")
+            if _has_v5:
+                lib.pf_rhd_comm_v5_version.argtypes = []
+                lib.pf_rhd_comm_v5_version.restype = ctypes.c_int
+                _quant_lowsm_args = _quant_args[:-1] + [ctypes.c_int, ctypes.c_uint64]
+                _split_lowsm_args = _split_args[:-1] + [ctypes.c_int, ctypes.c_uint64]
+                _daq_lowsm_args = _daq_args[:-1] + [ctypes.c_int, ctypes.c_uint64]
+                _dab_lowsm_args = _dab_args[:-1] + [ctypes.c_int, ctypes.c_uint64]
+                _agd_lowsm_args = _agd_args[:-1] + [ctypes.c_int, ctypes.c_int, ctypes.c_uint64]
+                _a2a_q_lowsm_args = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                _a2a_d_lowsm_args = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                for fn_name in (
+                    "rhd_quant_slice_int8_g64_lowsm_fwd",
+                    "rhd_quant_slice_fp8_g64_lowsm_fwd",
+                ):
+                    fn = getattr(lib, fn_name)
+                    fn.argtypes = _quant_lowsm_args
+                    fn.restype = ctypes.c_int
+                for fn_name in (
+                    "rhd_dequant_add_split_quant_int8_g64_lowsm_fwd",
+                    "rhd_dequant_add_split_quant_fp8_g64_lowsm_fwd",
+                ):
+                    fn = getattr(lib, fn_name)
+                    fn.argtypes = _split_lowsm_args
+                    fn.restype = ctypes.c_int
+                for fn_name in (
+                    "rhd_dequant_add_quant_int8_g64_lowsm_fwd",
+                    "rhd_dequant_add_quant_fp8_g64_lowsm_fwd",
+                ):
+                    fn = getattr(lib, fn_name)
+                    fn.argtypes = _daq_lowsm_args
+                    fn.restype = ctypes.c_int
+                for fn_name in (
+                    "rhd_dequant_add_bf16_int8_g64_lowsm_fwd",
+                    "rhd_dequant_add_bf16_fp8_g64_lowsm_fwd",
+                ):
+                    fn = getattr(lib, fn_name)
+                    fn.argtypes = _dab_lowsm_args
+                    fn.restype = ctypes.c_int
+                for fn_name in (
+                    "a2a_quant_int8_g64_lowsm_fwd",
+                    "a2a_quant_fp8_g64_lowsm_fwd",
+                ):
+                    fn = getattr(lib, fn_name)
+                    fn.argtypes = _a2a_q_lowsm_args
+                    fn.restype = ctypes.c_int
+                for fn_name in (
+                    "a2a_dequant_sum8_int8_g64_lowsm_fwd",
+                    "a2a_dequant_sum8_fp8_g64_lowsm_fwd",
+                ):
+                    fn = getattr(lib, fn_name)
+                    fn.argtypes = _a2a_d_lowsm_args
+                    fn.restype = ctypes.c_int
+                lib.rhd_ag_quant_fp8_rowwise_lowsm_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                lib.rhd_ag_quant_fp8_rowwise_lowsm_fwd.restype = ctypes.c_int
+                lib.rhd_ag_unpack_fp8_rowwise_lowsm_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                lib.rhd_ag_unpack_fp8_rowwise_lowsm_fwd.restype = ctypes.c_int
+                lib.rhd_ag_dequant_fp8_rowwise_lowsm_fwd.argtypes = _agd_lowsm_args
+                lib.rhd_ag_dequant_fp8_rowwise_lowsm_fwd.restype = ctypes.c_int
+                for fn_name in (
+                    "rhd_ag_dequant_int8_g64_lowsm_fwd",
+                    "rhd_ag_dequant_fp8_g64_lowsm_fwd",
+                ):
+                    fn = getattr(lib, fn_name)
+                    fn.argtypes = _agd_lowsm_args
+                    fn.restype = ctypes.c_int
+
             _RHD_COMM_LIB = lib
             print(
-                f"[inkling-pf-rhd-comm] loaded native SM121a CUDA kernels: {_RHD_COMM_LIB_PATH}",
+                f"[inkling-pf-rhd-comm] loaded native SM121a CUDA kernels: {_chosen_path} "
+                f"(v5_lowsm={int(_has_v5)}, lowsm_ctas={SP_LOWSM_CTAS}, wb_out={int(SP_LOWSM_WB_OUT)})",
                 flush=True,
             )
         except Exception as e:
@@ -1259,6 +1387,7 @@ def compressed_reduce_scatter_into(
     rank: int,
     all_to_all_fn: Any | None = None,
     min_tokens: int | None = None,
+    lowsm_ctas: int | None = None,
 ) -> bool:
     """Compressed 1-hop ReduceScatter (`partial [T, H]` bf16 -> `out_shard [S, H]` bf16).
 
@@ -1504,18 +1633,96 @@ def compressed_reduce_scatter_into(
 
     # -----------------------------------------------------------------------
     # Mode 3: Zero-Incast 3-Step Recursive Halving-Doubling (RHD / Butterfly)
-    #   `rhd_int8` / `rhd_fp8` (g64 + BF16 scales = 1.03125 B/elem, 0.5156x BF16!)
-    #   Only 1 bidirectional peer per step (ZERO 7-to-1 RoCEv2 incast!)
+    #   `rhd_int8` / `rhd_fp8` (all-SM Half-1) & `rhd_int8_lowsm` / `rhd_fp8_lowsm`
+    #   (`4..8` CTAs, `100% ld.cs/st.cs` <= 0.5 MiB L2 for MoE-overlapped Half-2!)
     # -----------------------------------------------------------------------
-    if mode in ("rhd_int8", "rhd_fp8"):
+    if mode in ("rhd_int8", "rhd_fp8", "rhd_int8_lowsm", "rhd_fp8_lowsm"):
+        is_lowsm = mode.endswith("_lowsm")
+        eff_tr = None
+        if is_lowsm:
+            eff_tr = SP_RHD_LOWSM_TRANSPORT or (
+                "sliced_p2p" if SP_RHD_TRANSPORT == "pynccl_p2p" else SP_RHD_TRANSPORT
+            )
+        eff_lowsm_ctas = (
+            max(min(int(lowsm_ctas), 48), 1)
+            if (lowsm_ctas is not None and int(lowsm_ctas) > 0)
+            else SP_LOWSM_CTAS
+        )
         return _rhd_reduce_scatter_into(
             partial=partial,
             out_shard=out_shard,
-            is_fp8=(mode == "rhd_fp8"),
+            is_fp8=("fp8" in mode),
             world_size=world_size,
             rank=rank,
             pair_exchange_fn=all_to_all_fn,
+            transport=eff_tr,
+            low_sm=is_lowsm,
+            max_ctas=eff_lowsm_ctas if is_lowsm else 0,
+            wb_final=int(SP_LOWSM_WB_OUT) if is_lowsm else 1,
         )
+
+    # -----------------------------------------------------------------------
+    # Mode 4: v5 Low-SM 1-Hop Shift-Rotated AllToAll RS (`a2a_int8_lowsm` / `a2a_fp8_lowsm`)
+    #   - Only 1 quant stage (+3.5 dB higher SQNR), local 1/8 shard exact BF16,
+    #     deterministic `r = 0..W-1` FP32 sum, `<= 6` SMs & `< 0.5 MiB` L2!
+    # -----------------------------------------------------------------------
+    if mode in ("a2a_int8_lowsm", "a2a_fp8_lowsm"):
+        if H % 128 != 0 or world_size not in (2, 4, 8):
+            return False
+        rhd_lib = _get_rhd_comm_lib()
+        if rhd_lib is None or not hasattr(rhd_lib, "a2a_quant_int8_g64_lowsm_fwd"):
+            return False
+        is_fp8 = mode == "a2a_fp8_lowsm"
+        scale_off, peer_bytes = _rhd_g64_packed_bytes(S, H)
+        send_buf, recv_buf = _get_scratch_pair(partial.device, world_size, peer_bytes, mode)
+        q_fn = (
+            rhd_lib.a2a_quant_fp8_g64_lowsm_fwd
+            if is_fp8
+            else rhd_lib.a2a_quant_int8_g64_lowsm_fwd
+        )
+        d_fn = (
+            rhd_lib.a2a_dequant_sum8_fp8_g64_lowsm_fwd
+            if is_fp8
+            else rhd_lib.a2a_dequant_sum8_int8_g64_lowsm_fwd
+        )
+        eff_lowsm_ctas = (
+            max(min(int(lowsm_ctas), 48), 1)
+            if (lowsm_ctas is not None and int(lowsm_ctas) > 0)
+            else SP_LOWSM_CTAS
+        )
+        rc1 = q_fn(
+            partial.data_ptr(),
+            send_buf.data_ptr(),
+            int(partial.stride(0)),
+            int(peer_bytes),
+            int(scale_off),
+            S,
+            H,
+            world_size,
+            rank,
+            int(eff_lowsm_ctas),
+            stream,
+        )
+        if rc1 != 0:
+            return False
+        a2a(send_buf, recv_buf)
+        rc2 = d_fn(
+            recv_buf.data_ptr(),
+            partial.data_ptr(),
+            out_shard.data_ptr(),
+            int(partial.stride(0)),
+            int(out_shard.stride(0)),
+            int(peer_bytes),
+            int(scale_off),
+            S,
+            H,
+            world_size,
+            rank,
+            int(SP_LOWSM_WB_OUT),
+            int(eff_lowsm_ctas),
+            stream,
+        )
+        return rc2 == 0
 
     return False
 
@@ -1530,12 +1737,15 @@ def _rhd_reduce_scatter_into(
     pipe: bool | None = None,
     transport: str | None = None,
     slices: int | None = None,
+    low_sm: bool = False,
+    max_ctas: int = 0,
+    wb_final: int = 1,
 ) -> bool:
     """Zero-incast MSB-first Recursive Halving ReduceScatter (`r^4 -> r^2 -> r^1` for W=8).
 
-    Uses fused split-half SM121a CUDA kernels (`libpf_rhd_comm_sm121.so`) with seamless
-    Triton fallback. Optional Step-0 2-stage pipelining (`pipe=True` / `INKLING_PREFILL_SP_RHD_PIPE=1`)
-    overlaps Step 0B quant + Step 1 send-half re-quant + Step 0B keep-half add behind wire!
+    Uses fused split-half SM121a CUDA kernels (`libpf_rhd_comm_v5.so` / `libpf_rhd_comm_sm121.so`)
+    with seamless Triton fallback. When `low_sm=True`, dispatches `*_lowsm_fwd` (`max_ctas = 4..8`,
+    `100% ld.cs/st.cs` when `wb_final == 0`) so Half-2 never preempts MoE SMs or wipes L2!
     """
     if world_size not in (2, 4, 8):
         return False
@@ -1546,10 +1756,21 @@ def _rhd_reduce_scatter_into(
     K = world_size.bit_length() - 1  # 1, 2, or 3
 
     lib = _get_rhd_comm_lib()
+    use_lowsm_cu = bool(
+        low_sm and lib is not None and hasattr(lib, "rhd_quant_slice_int8_g64_lowsm_fwd")
+    )
+    if low_sm and not use_lowsm_cu:
+        return False
     if lib is None and not _TRITON_OK:
         return False
 
-    use_pipe = (SP_RHD_PIPE if pipe is None else bool(pipe)) and (lib is not None) and (world_size >= 4)
+    use_pipe = (
+        (SP_RHD_PIPE if pipe is None else bool(pipe))
+        and (lib is not None)
+        and (world_size >= 4)
+        and (not use_lowsm_cu)
+    )
+    eff_ctas = max(int(max_ctas or SP_LOWSM_CTAS), 1)
     half0 = T // 2
     sc0_off, b0 = _rhd_g64_packed_bytes(half0, H)
     sub_M = half0 // 2
@@ -1570,7 +1791,29 @@ def _rhd_reduce_scatter_into(
     NG = 8
     grid_g = (G + NG - 1) // NG
 
-    if lib is not None:
+    if use_lowsm_cu:
+        assert lib is not None
+        q_fn = (
+            lib.rhd_quant_slice_fp8_g64_lowsm_fwd
+            if is_fp8
+            else lib.rhd_quant_slice_int8_g64_lowsm_fwd
+        )
+        split_fn = (
+            lib.rhd_dequant_add_split_quant_fp8_g64_lowsm_fwd
+            if is_fp8
+            else lib.rhd_dequant_add_split_quant_int8_g64_lowsm_fwd
+        )
+        daq_fn = (
+            lib.rhd_dequant_add_quant_fp8_g64_lowsm_fwd
+            if is_fp8
+            else lib.rhd_dequant_add_quant_int8_g64_lowsm_fwd
+        )
+        dab_fn = (
+            lib.rhd_dequant_add_bf16_fp8_g64_lowsm_fwd
+            if is_fp8
+            else lib.rhd_dequant_add_bf16_int8_g64_lowsm_fwd
+        )
+    elif lib is not None:
         q_fn = lib.rhd_quant_slice_fp8_g64_fwd if is_fp8 else lib.rhd_quant_slice_int8_g64_fwd
         split_fn = (
             lib.rhd_dequant_add_split_quant_fp8_g64_fwd
@@ -1591,7 +1834,14 @@ def _rhd_reduce_scatter_into(
         q_fn = split_fn = daq_fn = dab_fn = None
 
     def _run_quant(src: torch.Tensor, dst_u8: torch.Tensor, row_off: int, sc_off: int, M: int, s_u64: int) -> None:
-        if q_fn is not None:
+        if use_lowsm_cu and q_fn is not None:
+            rc = q_fn(
+                src.data_ptr(), dst_u8.data_ptr(), int(src.stride(0)),
+                int(row_off), int(sc_off), int(M), H, eff_ctas, s_u64,
+            )
+            if rc != 0:
+                raise RuntimeError(f"rhd_quant_slice_g64_lowsm_fwd failed: rc={rc}")
+        elif q_fn is not None:
             rc = q_fn(
                 src.data_ptr(), dst_u8.data_ptr(), int(src.stride(0)),
                 int(row_off), int(sc_off), int(M), H, s_u64,
@@ -1610,7 +1860,17 @@ def _rhd_reduce_scatter_into(
         local_off: int, r_sc_off: int, n_sc_off: int, N: int,
         send_upper: bool, wb_keep: int, s_u64: int,
     ) -> None:
-        if split_fn is not None:
+        if use_lowsm_cu and split_fn is not None:
+            rc = split_fn(
+                recv_u8.data_ptr(), local_bf.data_ptr(),
+                next_send_u8.data_ptr(), next_keep_bf.data_ptr(),
+                int(local_bf.stride(0)), int(local_off), int(r_sc_off), int(n_sc_off),
+                int(next_keep_bf.stride(0)), int(N), H, 1 if send_upper else 0,
+                int(wb_keep), eff_ctas, s_u64,
+            )
+            if rc != 0:
+                raise RuntimeError(f"rhd_dequant_add_split_quant_g64_lowsm_fwd failed: rc={rc}")
+        elif split_fn is not None:
             rc = split_fn(
                 recv_u8.data_ptr(), local_bf.data_ptr(),
                 next_send_u8.data_ptr(), next_keep_bf.data_ptr(),
@@ -1631,7 +1891,15 @@ def _rhd_reduce_scatter_into(
         recv_u8: torch.Tensor, local_bf: torch.Tensor, out_bf: torch.Tensor,
         local_off: int, r_sc_off: int, M: int, wb_out: int, s_u64: int,
     ) -> None:
-        if dab_fn is not None:
+        if use_lowsm_cu and dab_fn is not None:
+            rc = dab_fn(
+                recv_u8.data_ptr(), local_bf.data_ptr(), out_bf.data_ptr(),
+                int(local_bf.stride(0)), int(local_off), int(r_sc_off),
+                int(out_bf.stride(0)), int(M), H, int(wb_out), eff_ctas, s_u64,
+            )
+            if rc != 0:
+                raise RuntimeError(f"rhd_dequant_add_bf16_g64_lowsm_fwd failed: rc={rc}")
+        elif dab_fn is not None:
             rc = dab_fn(
                 recv_u8.data_ptr(), local_bf.data_ptr(), out_bf.data_ptr(),
                 int(local_bf.stride(0)), int(local_off), int(r_sc_off),
@@ -1674,7 +1942,7 @@ def _rhd_reduce_scatter_into(
         send1 = st["send1"][:sub_b]
         recv1 = st["recv1"][:sub_b]
         keep1 = st["keep1"][: sub_M * H].view(sub_M, H)
-        wb_k1 = 1 if (sub_M * H * 2 <= (20 << 20)) else 0
+        wb_k1 = 1 if (sub_M * H * 2 <= SP_RHD_WB_MAX_BYTES) else 0
 
         st["ev_start"].record(cur_stream)
         cs.wait_event(st["ev_start"])
@@ -1758,7 +2026,10 @@ def _rhd_reduce_scatter_into(
         partner = rank ^ bit
         _pair_ex(cur_send, cur_recv, partner, bit)
         if step == (K - 1):
-            _run_dab(cur_recv, cur_local, out_shard, cur_local_off, cur_sc_off, S, 1, cur_stream_u64)
+            _run_dab(
+                cur_recv, cur_local, out_shard, cur_local_off, cur_sc_off,
+                S, 0 if use_lowsm_cu and wb_final == 0 else 1, cur_stream_u64,
+            )
         else:
             next_M = cur_M // 2
             next_bit = bit >> 1
@@ -1772,7 +2043,7 @@ def _rhd_reduce_scatter_into(
                 next_send = st["send0"][:next_b]
                 next_recv = st["recv0"][:next_b]
                 next_keep = st["keep2"][: next_M * H].view(next_M, H)
-            wb_keep = 1 if (next_M * H * 2 <= (20 << 20)) else 0
+            wb_keep = 0 if use_lowsm_cu else (1 if (next_M * H * 2 <= SP_RHD_WB_MAX_BYTES) else 0)
             _run_split(
                 cur_recv, cur_local, next_send, next_keep,
                 local_off=cur_local_off, r_sc_off=cur_sc_off, n_sc_off=next_sc_off,
@@ -1798,22 +2069,30 @@ def compressed_all_gather_dim0(
     min_tokens: int | None = None,
     transport: str | None = None,
     slices: int | None = None,
+    all_gather_1d_fn: Any | None = None,
+    lowsm_ctas: int | None = None,
+    pynccl_group_ag_fn: Any | None = None,
 ) -> torch.Tensor | None:
-    """Zero-incast 3-Step Mirror Recursive-Doubling AllGather (`r^1 -> r^2 -> r^4` for W=8).
+    """Zero-incast 3-Step Mirror Recursive-Doubling OR 1-Collective/Zero-Unpack Low-SM Ring AllGather.
 
     Strictly gated to eager prefill (`T = S * W >= SP_AG_MIN_T` = 2048, `!capturing`, ZERO
     touch to decode `T <= 512` or small `k_sync=3` halos!).
-    Quantizes ONCE before Step 0 and forwards quantized bytes verbatim across all 3 doubling
-    hops (ZERO intermediate re-quantization, 100% bit-identical outputs across all 8 TP ranks!).
+    Quantizes ONCE before transport and forwards quantized bytes verbatim (ZERO intermediate
+    re-quantization, 100% bit-identical outputs across all 8 TP ranks!).
 
     Modes:
-      - `rhd_fp8` with `fp8_direct=True`: packs `[S, H]` FP8-E4M3FN + `[S]` FP32 row scales
-        into ONE contiguous shard (`1.0009 B/elem` -> 1 collective instead of 2!), returns
-        `x_fp8_full [T, H]` (`float8_e4m3fn`) carrying `._inkling_fp8_scale` `[T, 1]` fp32!
-      - `rhd_int8` / `rhd_fp8` with `fp8_direct=False`: g64 + BF16 scales (`1.03125 B/elem`),
-        returns `[T, H]` BF16 (`44.26 dB` SQNR for `rhd_int8`!).
+      - `nccl_fp8_lowsm`: packs `[S, H]` FP8-E4M3FN + `[S]` FP32 scales on `<= 6` SMs
+        (`ld.cs/st.cs`), runs ONE 4-HCA NCCL Ring `all_gather` (eliminating the 48-SM
+        `quantize_fp8_rowwise` preemption AND the 2nd scale `all_gather`!), and unpacks/dequants
+        on `<= 6` SMs!
+      - `rhd_fp8` / `rhd_fp8_lowsm` with `fp8_direct=True`: 3-step RHD packed FP8 + FP32 scale.
+      - `rhd_int8` / `rhd_fp8` / `rhd_int8_lowsm` / `rhd_fp8_lowsm` with `fp8_direct=False`:
+        g64 + BF16 scales (`1.03125 B/elem`), returns `[T, H]` BF16 (`44.26 dB` SQNR for INT8!).
     """
-    if mode not in ("rhd_int8", "rhd_fp8"):
+    if mode not in (
+        "rhd_int8", "rhd_fp8", "rhd_int8_lowsm", "rhd_fp8_lowsm",
+        "nccl_fp8_lowsm", "nccl_fp8_zcopy_lowsm",
+    ):
         return None
     if not shard.is_cuda or shard.dtype != torch.bfloat16 or shard.ndim != 2:
         return None
@@ -1837,12 +2116,22 @@ def compressed_all_gather_dim0(
 
     shard_c = shard.contiguous()
     lib = _get_rhd_comm_lib()
+    is_lowsm = mode.endswith("_lowsm")
+    has_lowsm_cu = bool(lib is not None and hasattr(lib, "rhd_ag_quant_fp8_rowwise_lowsm_fwd"))
+    if is_lowsm and not has_lowsm_cu:
+        return None
     cur_stream = torch.cuda.current_stream(shard_c.device)
     stream_u64 = int(cur_stream.cuda_stream)
 
+    eff_tr = transport
+    if eff_tr is None and is_lowsm:
+        eff_tr = SP_RHD_LOWSM_TRANSPORT or (
+            "sliced_p2p" if SP_RHD_TRANSPORT == "pynccl_p2p" else SP_RHD_TRANSPORT
+        )
+
     if pair_exchange_fn is None:
         def _pair_ex(s_v: torch.Tensor, r_v: torch.Tensor, p: int, b: int) -> None:
-            _tp_pair_exchange(s_v, r_v, p, b, transport=transport, slices=slices)
+            _tp_pair_exchange(s_v, r_v, p, b, transport=eff_tr, slices=slices)
     else:
         _pair_ex = pair_exchange_fn
 
@@ -1860,13 +2149,111 @@ def compressed_all_gather_dim0(
             _pair_ex(s_view, r_view, partner, bit)
 
     # -----------------------------------------------------------------------
+    # v5 1-Collective Low-SM NCCL Ring FP8 Rowwise AllGather (`nccl_fp8_lowsm`)
+    # -----------------------------------------------------------------------
+    eff_ag_ctas = (
+        max(min(int(lowsm_ctas), 48), 1)
+        if (lowsm_ctas is not None and int(lowsm_ctas) > 0)
+        else SP_LOWSM_CTAS
+    )
+
+    if mode in ("nccl_fp8_lowsm", "nccl_fp8_zcopy_lowsm"):
+        if H % 16 != 0 or not has_lowsm_cu or lib is None:
+            return None
+        scale_off, shard_bytes = _rhd_rowwise_fp8_shard_bytes(S, H)
+        my_slot = _get_rhd_ag_scratch(shard_c.device, 1, shard_bytes, "nccl_ag_fp8_slot")[0]
+        rc1 = lib.rhd_ag_quant_fp8_rowwise_lowsm_fwd(
+            shard_c.data_ptr(), my_slot.data_ptr(),
+            int(shard_c.stride(0)), int(scale_off), S, H, int(eff_ag_ctas), stream_u64,
+        )
+        if rc1 != 0:
+            return None
+        # Wave-V10 Zero-Unpack Grouped Low-SM FP8 AG (`nccl_fp8_zcopy_lowsm`):
+        # Eliminates 100% of `rhd_ag_unpack` (-75.5..-113.2 MB D2D/call, -56.6 MiB staging)
+        # by issuing ONE grouped `pynccl.group_start(); all_gather(fp8); all_gather(scale); group_end()`!
+        if mode == "nccl_fp8_zcopy_lowsm" and fp8_direct:
+            x_fp8_s_u8 = my_slot[: S * H].view(S, H)
+            x_scale_s = my_slot[scale_off : scale_off + 4 * S].view(torch.float32).view(S, 1)
+            if pynccl_group_ag_fn is not None:
+                out_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=shard_c.device)
+                out_scale = torch.empty((T, 1), dtype=torch.float32, device=shard_c.device)
+                pynccl_group_ag_fn(
+                    (out_fp8.view(torch.uint8), x_fp8_s_u8),
+                    (out_scale, x_scale_s),
+                )
+                out_fp8._inkling_fp8_scale = out_scale  # type: ignore[attr-defined]
+                return out_fp8
+            from vllm.distributed import get_tp_group
+
+            _tp_grp = get_tp_group()
+            _comm = getattr(_tp_grp, "device_communicator", None)
+            _pynccl = getattr(_comm, "pynccl_comm", None) if _comm is not None else None
+            if _pynccl is not None and not getattr(_pynccl, "disabled", False):
+                out_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=shard_c.device)
+                out_scale = torch.empty((T, 1), dtype=torch.float32, device=shard_c.device)
+                _pynccl.group_start()
+                _pynccl.all_gather(out_fp8.view(torch.uint8), x_fp8_s_u8)
+                _pynccl.all_gather(out_scale, x_scale_s)
+                _pynccl.group_end()
+                out_fp8._inkling_fp8_scale = out_scale  # type: ignore[attr-defined]
+                return out_fp8
+        if all_gather_1d_fn is not None:
+            ag_flat = all_gather_1d_fn(my_slot.view(1, shard_bytes))
+        else:
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            ag_flat = tensor_model_parallel_all_gather(my_slot.view(1, shard_bytes), dim=0)
+        ag_buf = ag_flat.contiguous().view(world_size, shard_bytes)
+        wb_flag = int(SP_LOWSM_WB_OUT)
+        if fp8_direct:
+            out_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=shard_c.device)
+            out_scale = torch.empty((T, 1), dtype=torch.float32, device=shard_c.device)
+            rc2 = lib.rhd_ag_unpack_fp8_rowwise_lowsm_fwd(
+                ag_buf.data_ptr(), out_fp8.data_ptr(), out_scale.data_ptr(),
+                int(shard_bytes), int(scale_off), int(out_fp8.stride(0)),
+                S, H, world_size, wb_flag, int(eff_ag_ctas), stream_u64,
+            )
+            if rc2 != 0:
+                return None
+            out_fp8._inkling_fp8_scale = out_scale  # type: ignore[attr-defined]
+            return out_fp8
+        out_bf16 = torch.empty((T, H), dtype=torch.bfloat16, device=shard_c.device)
+        rc2 = lib.rhd_ag_dequant_fp8_rowwise_lowsm_fwd(
+            ag_buf.data_ptr(), out_bf16.data_ptr(),
+            int(shard_bytes), int(scale_off), int(out_bf16.stride(0)),
+            S, H, world_size, wb_flag, int(eff_ag_ctas), stream_u64,
+        )
+        if rc2 != 0:
+            return None
+        return out_bf16
+
+    # -----------------------------------------------------------------------
     # Direct FP8 Rowwise RHD AllGather (1 collective instead of 2!)
     # -----------------------------------------------------------------------
-    if mode == "rhd_fp8" and fp8_direct:
+    if mode in ("rhd_fp8", "rhd_fp8_lowsm") and fp8_direct:
         if H % 16 != 0:
             return None
         scale_off, shard_bytes = _rhd_rowwise_fp8_shard_bytes(S, H)
         ag_buf = _get_rhd_ag_scratch(shard_c.device, world_size, shard_bytes, "rhd_ag_fp8_dir")
+        if is_lowsm and has_lowsm_cu and lib is not None:
+            rc1 = lib.rhd_ag_quant_fp8_rowwise_lowsm_fwd(
+                shard_c.data_ptr(), ag_buf[rank].data_ptr(),
+                int(shard_c.stride(0)), int(scale_off), S, H, int(SP_LOWSM_CTAS), stream_u64,
+            )
+            if rc1 != 0:
+                return None
+            _run_doubling(ag_buf)
+            out_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=shard_c.device)
+            out_scale = torch.empty((T, 1), dtype=torch.float32, device=shard_c.device)
+            rc2 = lib.rhd_ag_unpack_fp8_rowwise_lowsm_fwd(
+                ag_buf.data_ptr(), out_fp8.data_ptr(), out_scale.data_ptr(),
+                int(shard_bytes), int(scale_off), int(out_fp8.stride(0)),
+                S, H, world_size, int(SP_LOWSM_WB_OUT), int(SP_LOWSM_CTAS), stream_u64,
+            )
+            if rc2 != 0:
+                return None
+            out_fp8._inkling_fp8_scale = out_scale  # type: ignore[attr-defined]
+            return out_fp8
         if lib is not None:
             rc1 = lib.rhd_ag_quant_fp8_rowwise_fwd(
                 shard_c.data_ptr(), ag_buf[rank].data_ptr(),
@@ -1913,10 +2300,29 @@ def compressed_all_gather_dim0(
     # -----------------------------------------------------------------------
     if H % 128 != 0:
         return None
-    is_fp8 = mode == "rhd_fp8"
+    is_fp8 = "fp8" in mode
     scale_off, shard_bytes = _rhd_g64_packed_bytes(S, H)
     ag_buf = _get_rhd_ag_scratch(shard_c.device, world_size, shard_bytes, f"rhd_ag_{mode}")
     out_bf16 = torch.empty((T, H), dtype=torch.bfloat16, device=shard_c.device)
+
+    if is_lowsm and has_lowsm_cu and lib is not None:
+        q_fn = lib.rhd_quant_slice_fp8_g64_lowsm_fwd if is_fp8 else lib.rhd_quant_slice_int8_g64_lowsm_fwd
+        d_fn = lib.rhd_ag_dequant_fp8_g64_lowsm_fwd if is_fp8 else lib.rhd_ag_dequant_int8_g64_lowsm_fwd
+        rc1 = q_fn(
+            shard_c.data_ptr(), ag_buf[rank].data_ptr(),
+            int(shard_c.stride(0)), 0, int(scale_off), S, H, int(SP_LOWSM_CTAS), stream_u64,
+        )
+        if rc1 != 0:
+            return None
+        _run_doubling(ag_buf)
+        rc2 = d_fn(
+            ag_buf.data_ptr(), out_bf16.data_ptr(),
+            int(shard_bytes), int(scale_off), int(out_bf16.stride(0)),
+            S, H, world_size, int(SP_LOWSM_WB_OUT), int(SP_LOWSM_CTAS), stream_u64,
+        )
+        if rc2 != 0:
+            return None
+        return out_bf16
 
     if lib is not None:
         q_fn = lib.rhd_quant_slice_fp8_g64_fwd if is_fp8 else lib.rhd_quant_slice_int8_g64_fwd

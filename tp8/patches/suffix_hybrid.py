@@ -254,10 +254,38 @@ def _load_sam_c_lib() -> ctypes.CDLL | None:
     return _SAM_LIB
 
 
+def agreement_conf_floor(
+    match_len: int,
+    *,
+    ml2_floor: float = 0.76,
+    ml3_floor: float = 0.85,
+    ml4_base: float = 0.92,
+    slope: float = 0.015,
+    cap: float = 0.985,
+) -> float:
+    """Calibrated confidence floor when DSpark agrees with a SAM verbatim continuation (ml >= 2).
+    Matched bit-for-bit by GPU `_sam_gpu_boost_extend_kernel` (`INKLING_SAM_CONF_BOOST=1`)."""
+    if match_len < 2:
+        return 0.0
+    if match_len == 2:
+        return float(ml2_floor)
+    if match_len == 3:
+        return float(ml3_floor)
+    return float(min(cap, ml4_base + slope * min(match_len, 4)))
+
+
 class FastSuffixAutomaton:
     """C99-accelerated Suffix Automaton (< 5 us/step) with seamless Pure-Python fallback."""
 
     def __init__(self, init_cap: int = 4096, force_python: bool = False):
+        env_cap = os.environ.get("INKLING_SAM_CPU_INIT_CAP", "").strip()
+        if env_cap:
+            try:
+                init_cap = max(init_cap, int(env_cap))
+            except ValueError:
+                pass
+        elif os.environ.get("INKLING_SAM_LONG_PROMPT", "0").strip().lower() in ("1", "on", "true", "yes"):
+            init_cap = max(init_cap, 131072)
         self._lib = None if force_python else _load_sam_c_lib()
         self._handle = self._lib.sam_create(init_cap) if self._lib is not None else None
         self._py = PurePythonSAM() if self._handle is None else None
@@ -385,19 +413,23 @@ class SuffixHybridAdvisor:
         self,
         dspark_tokens: Sequence[int],
         dspark_c: Sequence[float],
+        *,
+        conf_boost_floor: bool = False,
     ) -> dict:
         """Compute all three hybrid signals in <= 2 SAM queries (< 10 us total)."""
         k_base = len(dspark_tokens)
+        eff_min_boost = 2 if conf_boost_floor else self.min_boost_match
         # Query 1: Committed tail match (for agreement boost + parallel branch)
         m_tail = self.sam.query_tail_plus_ext(
             tail_win=self.tail_win,
             ext=(),
-            min_match_len=min(self.min_branch_match, self.min_boost_match),
+            min_match_len=min(self.min_branch_match, eff_min_boost),
             max_draft=max(k_base, 4),
         )
 
         # Agreement boost along matching prefix of dspark_tokens
         logit_boost = [0.0] * k_base
+        conf_floor = [0.0] * k_base
         branch_depth = -1
         branch_tokens: list[int] = []
         branch_hit_prob = 0.0
@@ -411,6 +443,8 @@ class SuffixHybridAdvisor:
                     if m_tail.match_len >= self.min_boost_match:
                         # Conservative calibrated boost: +0.6 to +1.4 logit
                         logit_boost[k] = min(1.4, 0.35 + 0.18 * (m_tail.match_len - 2))
+                    if conf_boost_floor and m_tail.match_len >= 2:
+                        conf_floor[k] = agreement_conf_floor(m_tail.match_len)
                 else:
                     break
             # If SAM diverges at depth `agree` (< k_base) and match length is strong, propose branch
@@ -442,6 +476,7 @@ class SuffixHybridAdvisor:
         return {
             "tail_match_len": m_tail.match_len,
             "logit_boost": logit_boost,
+            "conf_floor": conf_floor,
             "branch_depth": branch_depth,
             "branch_tokens": branch_tokens,
             "branch_hit_prob": branch_hit_prob,

@@ -34,6 +34,59 @@ from .ops import l2pf
 
 QuantFormat = Literal["nvfp4", "mxfp8"]
 
+_RAR_MOD_CACHE = None
+_S8_MOD_CACHE = None
+_S8_MOD_LOADED = False
+_C32_MOD_CACHE = None
+_C32_MOD_LOADED = False
+_PF_MOE_MOD_CACHE = None
+
+
+def _get_rar_mod():
+    global _RAR_MOD_CACHE
+    m = _RAR_MOD_CACHE
+    if m is None:
+        from vllm.distributed.device_communicators import rdma_all_reduce as m
+
+        _RAR_MOD_CACHE = m
+    return m
+
+
+def _get_s8_mod():
+    global _S8_MOD_CACHE, _S8_MOD_LOADED
+    if not _S8_MOD_LOADED:
+        _S8_MOD_LOADED = True
+        try:
+            from .ops import moe_s8_runtime as m
+
+            _S8_MOD_CACHE = m
+        except Exception:
+            _S8_MOD_CACHE = None
+    return _S8_MOD_CACHE
+
+
+def _get_c32_mod():
+    global _C32_MOD_CACHE, _C32_MOD_LOADED
+    if not _C32_MOD_LOADED:
+        _C32_MOD_LOADED = True
+        try:
+            from .ops import moe_c32_runtime as m
+
+            _C32_MOD_CACHE = m
+        except Exception:
+            _C32_MOD_CACHE = None
+    return _C32_MOD_CACHE
+
+
+def _get_pf_moe_mod():
+    global _PF_MOE_MOD_CACHE
+    m = _PF_MOE_MOD_CACHE
+    if m is None:
+        from .ops import pf_moe_native as m
+
+        _PF_MOE_MOD_CACHE = m
+    return m
+
 
 class ExpertsLoRA(Protocol):
     """Adds the routed experts' LoRA deltas (``lora.Inkling2MoEWithLoRA``),
@@ -253,24 +306,22 @@ class Inkling2Experts(nn.Module):
         or pushes their combine to the token shard owners."""
         out_dtype = torch.bfloat16 if x.dtype == torch.float8_e4m3fn else x.dtype
         src2dst, gammas, rows, tiles = routing
+        _fallback_sbuf = None
         # Dec160 S8 fused decode MoE fast path (Zero-Scatter + Fused W13 SiTU + W2 OTF Quant + Fused Combine)
         if (reduce or combine_only) and push is None and plan.tile <= 16:
-            try:
-                from .ops import moe_s8_runtime as _s8
-                _s8_active = (
-                    _s8.S8_ZERO_SCATTER
-                    or _s8.S8_FUSE_SITU
-                    or _s8.S8_FUSE_COMBINE
-                    or getattr(tiles, "_inkling_tile_mask", None) is not None
-                )
-            except Exception:
-                _s8 = None
-                _s8_active = False
+            _s8 = _get_s8_mod()
+            _s8_active = _s8 is not None and (
+                _s8.S8_ZERO_SCATTER
+                or _s8.S8_FUSE_SITU
+                or _s8.S8_FUSE_COMBINE
+                or getattr(tiles, "_inkling_tile_mask", None) is not None
+            )
             if _s8 is not None and _s8_active:
                 _sbuf = None
                 _nlive = None
+                _rar = None
                 if (reduce or (combine_only and use_sendbuf)) and self.ep_size > 1:
-                    from vllm.distributed.device_communicators import rdma_all_reduce as _rar
+                    _rar = _get_rar_mod()
                     _sbuf = _rar.get_send_buffer((x.shape[0], self.hidden_size), out_dtype)
                     if _rar.ROWAR.get("scope") == x.shape[0]:
                         _nlive = _rar.ROWAR.get("buf")
@@ -296,23 +347,31 @@ class Inkling2Experts(nn.Module):
                     _out = tensor_model_parallel_all_reduce(_out)
                     l2pf.join()
                     return _out
+                if _sbuf is not None and _rar is not None and getattr(_rar, "_SBUF_RING_V10", False):
+                    _fallback_sbuf = _sbuf
         # C=32 (B=32, M=17..256) opt-in 0-ULP fused MoE fast path (Zero-Scatter + Fused SiTU + 6-Wave L2 Combine)
         if (
             (reduce or combine_only)
             and push is None
-            and plan.tile in (16, 32)
+            and plan.tile in (8, 16, 32)
             and 17 <= x.shape[0] <= 256
         ):
-            try:
-                from .ops import moe_c32_runtime as _c32
-            except Exception:
-                _c32 = None
+            _c32 = _get_c32_mod()
             if _c32 is not None and _c32.C32_MASTER:
                 _sbuf = None
                 _nlive = None
+                _rar = None
                 if (reduce or (combine_only and use_sendbuf)) and self.ep_size > 1:
-                    from vllm.distributed.device_communicators import rdma_all_reduce as _rar
-                    _sbuf = _rar.get_send_buffer((x.shape[0], self.hidden_size), out_dtype)
+                    _rar = _get_rar_mod()
+                    _sbuf_shape = (x.shape[0], self.hidden_size)
+                    if (
+                        _fallback_sbuf is not None
+                        and _fallback_sbuf.shape == _sbuf_shape
+                        and _fallback_sbuf.dtype == out_dtype
+                    ):
+                        _sbuf = _fallback_sbuf
+                    else:
+                        _sbuf = _rar.get_send_buffer(_sbuf_shape, out_dtype)
                     if _rar.ROWAR.get("scope") == x.shape[0]:
                         _nlive = _rar.ROWAR.get("buf")
                 _out = _c32.forward_experts_c32(
@@ -333,26 +392,61 @@ class Inkling2Experts(nn.Module):
                     _out = tensor_model_parallel_all_reduce(_out)
                     l2pf.join()
                     return _out
-        gate_up = self._gemm(quantized, "w13", tiles, plan, 0)
-        m = plan.max_ctas
-        activated = swiglu_quantize(
-            gate_up,
-            gammas,
-            self.gate_cap,
-            self.up_cap,
-            (rows, tiles[2 * m + 2 :], tiles[:m]),
-            plan.tile,
-            *self.scales("w2"),
-        )
-        del gate_up
+                if _sbuf is not None and _rar is not None and getattr(_rar, "_SBUF_RING_V10", False):
+                    _fallback_sbuf = _sbuf
+        activated = None
+        if plan.tile >= 64 and not torch.cuda.is_current_stream_capturing():
+            pf_moe_native = _get_pf_moe_mod()
+            if pf_moe_native.is_w13_situ_v4_active(plan, tokens=x.shape[0]):
+                ensure_packed_for_pf_native(self.w13_weight, self.w13_weight_scale, 0)
+                m = plan.max_ctas
+                activated = pf_moe_native.w13_situ_pf_v4(
+                    quantized,
+                    self.w13_weight,
+                    self.w13_weight_scale,
+                    self.ones,
+                    gammas,
+                    tiles,
+                    plan,
+                    (rows, tiles[2 * m + 2 :], tiles[:m]),
+                    self.gate_cap,
+                    self.up_cap,
+                    *self.scales("w2"),
+                )
+        if activated is None:
+            gate_up = self._gemm(quantized, "w13", tiles, plan, 0)
+            m = plan.max_ctas
+            activated = swiglu_quantize(
+                gate_up,
+                gammas,
+                self.gate_cap,
+                self.up_cap,
+                (rows, tiles[2 * m + 2 :], tiles[:m]),
+                plan.tile,
+                *self.scales("w2"),
+            )
+            del gate_up
         if (reduce or combine_only) and push is None and plan.tile >= 64:
-            from .ops import pf_moe_native
+            pf_moe_native = _get_pf_moe_mod()
             if pf_moe_native.is_active(plan, tokens=x.shape[0]) and pf_moe_native.COMBINE_MODE != 0:
                 ensure_packed_for_pf_native(self.w2_weight, self.w2_weight_scale, 1)
                 sbuf = None
-                if reduce and self.ep_size > 1:
-                    from vllm.distributed.device_communicators.rdma_all_reduce import get_send_buffer
-                    sbuf = get_send_buffer((x.shape[0], self.hidden_size), out_dtype)
+                _rar_pf = _get_rar_mod() if self.ep_size > 1 else None
+                _pf_want_sbuf = (
+                    (reduce or (combine_only and use_sendbuf))
+                    if (_rar_pf is not None and getattr(_rar_pf, "_SBUF_RING_V10", False))
+                    else reduce
+                )
+                if _pf_want_sbuf and self.ep_size > 1:
+                    _pf_shape = (x.shape[0], self.hidden_size)
+                    if (
+                        _fallback_sbuf is not None
+                        and _fallback_sbuf.shape == _pf_shape
+                        and _fallback_sbuf.dtype == out_dtype
+                    ):
+                        sbuf = _fallback_sbuf
+                    else:
+                        sbuf = _rar_pf.get_send_buffer(_pf_shape, out_dtype)
                 use_prezero = (
                     sbuf is None
                     and prezeroed_out is not None
@@ -376,6 +470,8 @@ class Inkling2Experts(nn.Module):
                     if combine_only or self.ep_size == 1:
                         return out
                     return tensor_model_parallel_all_reduce(out)
+                if sbuf is not None and _rar_pf is not None and getattr(_rar_pf, "_SBUF_RING_V10", False):
+                    _fallback_sbuf = sbuf
         down = self._gemm(activated, "w2", tiles, plan, 1)
         if push is not None:
             # Each rank's fp32 combine is rounded once to bf16.
@@ -385,15 +481,29 @@ class Inkling2Experts(nn.Module):
             if combine_only:
                 sbuf = None
                 if use_sendbuf and self.ep_size > 1:
-                    from vllm.distributed.device_communicators.rdma_all_reduce import get_send_buffer
-                    sbuf = get_send_buffer((src2dst.numel() // self.topk, down.shape[1]), out_dtype)
+                    _fb_shape = (src2dst.numel() // self.topk, down.shape[1])
+                    if (
+                        _fallback_sbuf is not None
+                        and _fallback_sbuf.shape == _fb_shape
+                        and _fallback_sbuf.dtype == out_dtype
+                    ):
+                        sbuf = _fallback_sbuf
+                    else:
+                        sbuf = _get_rar_mod().get_send_buffer(_fb_shape, out_dtype)
                 return combine(down, src2dst, self.topk, out_dtype, out=sbuf)
             return down, src2dst
         # Each rank's fp32 combine is rounded once to bf16 before the all-reduce.
         sbuf = None
         if self.ep_size > 1:
-            from vllm.distributed.device_communicators.rdma_all_reduce import get_send_buffer
-            sbuf = get_send_buffer((src2dst.numel() // self.topk, down.shape[1]), out_dtype)
+            _fb_shape = (src2dst.numel() // self.topk, down.shape[1])
+            if (
+                _fallback_sbuf is not None
+                and _fallback_sbuf.shape == _fb_shape
+                and _fallback_sbuf.dtype == out_dtype
+            ):
+                sbuf = _fallback_sbuf
+            else:
+                sbuf = _get_rar_mod().get_send_buffer(_fb_shape, out_dtype)
         out = combine(down, src2dst, self.topk, out_dtype, out=sbuf)
         if self.ep_size == 1:
             return out
@@ -467,7 +577,9 @@ class Inkling2MoE(nn.Module):
             if (
                 pf_moe_native.ASYNC_ZERO
                 and pf_moe_native.COMBINE_MODE == 2
-                and not (pf_moe_native.PERSISTENT and pf_moe_native.L2_ZERO_SLICE)
+                and not pf_moe_native.uses_in_kernel_slice_zero(
+                    plan, tokens=x.shape[0], nvfp4=experts.nvfp4
+                )
                 and pf_moe_native.is_active(plan, tokens=x.shape[0])
             ):
                 prezeroed_out, zero_done_event = pf_moe_native.alloc_and_async_zero_out(

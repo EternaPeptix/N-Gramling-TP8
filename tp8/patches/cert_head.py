@@ -721,10 +721,15 @@ def _nlive_for(M: int, dev, num_tokens: int = 0) -> torch.Tensor:
         # just ran had num_tokens == M == _ROW_FULL (and rowar_begin has armed at least once),
         # _n_live_kernel ran on this exact step and updated ROWAR["buf"] even if an earlier prefill
         # cleared ROWAR["last_live"].
+        _c28_row_ok = (
+            getattr(ra, "_ROW_AR_C28", False)
+            and 1 <= M <= getattr(ra, "_ROW_C28_MAX", ra._ROW_FULL)
+            and num_tokens == M
+        )
         if (
             ra._ROW_AR
             and ra.ROWAR.get("begins", 0) > 0
-            and num_tokens == M == ra._ROW_FULL
+            and (num_tokens == M == ra._ROW_FULL or _c28_row_ok)
             and ra.ROWAR.get("buf") is not None
         ):
             return ra.ROWAR["buf"]

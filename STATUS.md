@@ -1,7 +1,7 @@
 # Status & Engineering Log — Inkling-2-Small on DGX Spark
 
-**Current Status (2026-11-25): PERMANENT LIVE PRODUCTION CHECKPOINT (`V17.2`, upgraded from `V17-FINAL`) on 8× DGX Spark (TP8, `0.0.0.0:8010`)**  
-**Promoted Production Config:** `tp8/config/live_champion_v17.env` (`V17.2`: `INKLING_SYNC_FREE_TEMP_V16_MIN_B=64`, `INKLING_VERIFY_W_TEMP=1`, `RDMA_AR_EXT=/rdma/rdma_ar_ext_c32_v17.so` idle-CPU fix)  
+**Current Status (2026-11-25): PERMANENT LIVE PRODUCTION CHECKPOINT (`V17.2` live on 8× DGX Spark TP8 `0.0.0.0:8010`; `V17.3` GPU SAM + `dsh-sptc` compat committed & staged for next restart)**  
+**Promoted Production Config:** `tp8/config/live_champion_v17.env` (`V17.2` live: `INKLING_SYNC_FREE_TEMP_V16_MIN_B=64`, `INKLING_VERIFY_W_TEMP=1`, `RDMA_AR_EXT=/rdma/rdma_ar_ext_c32_v17.so`; `V17.3` staged: GPU SAM `INKLING_SAM_HYBRID=1` for `B=1..8` + `inkling_renderer.py` `thinking`/`enable_thinking` compat for `dsh-sptc`)  
 **Launcher & Live Ops:** `tp8/ops/inkling-tp8-v17.sh` · `tp8/ops/spark-top.py` · `v16_metrics_exporter.py (:9108)`  
 **Preserved Rollback Baselines:**
 - `V16-FINAL`: `tp8/config/live_champion_v16.env` (sha256 `413f1ae7275d7d9992e4823793f285d6798c5e12e607a90d78b4a94eb6f2acfa`)
@@ -41,7 +41,8 @@ Measured on live 8-node GB10 silicon (`GMU=0.85`, `MAX_BATCHED=24576`, `0 MiB` n
   - `1M` (`1,048,144` tok): **`111.76 s`** cold (**`-1.26 s` faster than V16**; `9,378.8 tok/s`) / **`2.36 s`** warm (`47.4×`), **`75.7 tok/s`** decode, **3/3 needles**.
 - **APIServer CPU, Chaos Soak & Cluster Ops:**
   - `_inkling_arg_value_extender` (`tp8/patches/inkling_parser.py`): **`57.1×` faster** (`1551.1 ms → 27.15 ms` on 6 KB streaming tool arg, `4/4` 100% identical deltas).
-  - `InklingRenderer` LRU (`tp8/patches/inkling_renderer.py`, `INKLING_INCR_TOK=1`, `128 MiB`): 100% 0-ULP bit-exact, mutation-safe.
+  - `InklingRenderer` (`tp8/patches/inkling_renderer.py`): `INKLING_INCR_TOK=1` (`128 MiB` 0-ULP LRU) + `V17.3` `chat_template_kwargs.thinking` / `enable_thinking` → `reasoning_effort` compat for `dsh-sptc` `llm_query` (`thinking: false → "none"`, verified 8/8 unit tests; explicit `reasoning_effort` wins; 0-ULP neutral when unset).
+  - `V17.3` GPU SAM (`tp8/config/live_champion_v17.env`): `INKLING_SAM_HYBRID=1` (`gpu`, `MAX_B=8`, `MAX_SLOTS=32`, `ALLOW_TEMP=1`, `IMAGE_SAFE_V16=1`, `PREFIX_SEED_V16=1`, `LPC_CAP=262144`, `SHARED_POOL=0`) paired with `dsh-sptc` (`jit: true`, `layer3: true`; live SSE replay verified 2/2 mid-stream launches `660 ms` / `229 ms` early, `0` wasted).
   - `v15_chaos_soak.py` (`120` reqs, `C=16`, `20%` forced aborts): **`96/96` OK**, **`24/24` clean aborts**, **`7.2 req/s`**, `drift=0.543×`, `leak_ok=True`, `0` KV anomalies.
   - True **`7.0 GiB`** OS UMA reserve (`6.86×` 1M KV pool, `7,196,613` tokens, `37.88 GiB`), `0 MiB` new swap, `32/32` CX-7 HCAs ACTIVE (`0` IB errors), `sconv=1.0` phantom telemetry fixed (`FAST_KV_FREE=1`), `:9108` Prometheus exporter & `spark-top.py` live.
 

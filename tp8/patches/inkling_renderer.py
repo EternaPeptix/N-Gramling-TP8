@@ -194,6 +194,16 @@ class InklingRenderer(BaseRenderer[HfTokenizer]):
         if not self._is_inkling2 and kwargs.get("continue_final_message"):
             raise ValueError("Inkling renderer does not support continue_final_message")
 
+        raw_effort = kwargs.get("reasoning_effort")
+        if raw_effort is None:
+            # Compatibility with OpenAI/DSH-SPTC clients (e.g. dsh-sptc llm_query)
+            # that send chat_template_kwargs={"thinking": bool} or {"enable_thinking": bool}.
+            thinking = kwargs.get("thinking")
+            if thinking is None:
+                thinking = kwargs.get("enable_thinking")
+            if isinstance(thinking, bool):
+                raw_effort = "none" if not thinking else DEFAULT_REASONING_EFFORT
+
         try:
             # Swap point: to adopt a standalone Inkling input-processing
             # library, replace these calls (and the _HfBackedTmlTokenizer
@@ -203,9 +213,7 @@ class InklingRenderer(BaseRenderer[HfTokenizer]):
                     messages,
                     self._inkling_tokenizer,
                     tools=kwargs.get("tools"),
-                    reasoning_effort=_resolve_inkling2_reasoning_effort(
-                        kwargs.get("reasoning_effort")
-                    ),
+                    reasoning_effort=_resolve_inkling2_reasoning_effort(raw_effort),
                     continue_final_message=bool(kwargs.get("continue_final_message")),
                 )
             return render_inkling_messages(
@@ -213,9 +221,7 @@ class InklingRenderer(BaseRenderer[HfTokenizer]):
                 self._inkling_tokenizer,
                 add_generation_prompt=kwargs.get("add_generation_prompt", True),
                 tools=kwargs.get("tools"),
-                reasoning_effort=_resolve_reasoning_effort(
-                    kwargs.get("reasoning_effort")
-                ),
+                reasoning_effort=_resolve_reasoning_effort(raw_effort),
             )
         except ValueError:
             raise

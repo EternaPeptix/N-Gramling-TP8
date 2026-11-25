@@ -78,13 +78,36 @@ STATIC_RING_SLOTS = 4
 #   - Caches static [M, 1] dummy logits placeholder (eliminates 1 CUDA tensor alloc/step).
 #   - Defers Triton _kernels() lookup until Triton fallback + B=1 fast scalar check in step_armed.
 FAST_V11 = os.environ.get("INKLING_SYNC_FREE_FAST_V11", "0").strip().lower() not in _OFF
+# Wave-V14 opt-in zero-overhead sync_free host path (default OFF = 0, 100% 0-ULP exact!):
+#   - Zero-alloc B=1..8 scalar loop in step_armed (eliminates 4 NumPy temp arrays + 2 ufunc reduces @ C=2..8).
+#   - O(1) slot-indexed _StaticOutputRing.acquire_v14 with pre-cached data_ptr/stride/4-tuple (0 allocs/step).
+#   - Zero str(device) MRU dummy-logits cache + dead CROSS_BOUNDARY callback elision.
+#   - Localized tensor/dtype/pointer fast path in RejectionSampler._direct_call & target_logits.
+FAST_V14 = os.environ.get("INKLING_SYNC_FREE_FAST_V14", "0").strip().lower() not in _OFF
+# Wave-V16 Crown-Jewel Track 3: Unbiased Zero-Sync SM121a GPU temp > 0 Speculative Rejection Sampler
+# (default OFF = 0; pure temp == 0.0 ALWAYS stays 100.000% untouched on the 1dcfb306 greedy path!).
+TEMP_V16 = os.environ.get("INKLING_SYNC_FREE_TEMP_V16", "0").strip().lower() not in _OFF
+TEMP_V16_LIB_PATH = os.environ.get("INKLING_SYNC_FREE_TEMP_V16_LIB", "/rdma/libsync_free_temp_v16.so")
+TEMP_V16_PDL = os.environ.get("INKLING_SYNC_FREE_TEMP_V16_PDL", "1").strip().lower() not in _OFF
+TEMP_V16_MAX_M = max(1, int(os.environ.get("INKLING_SYNC_FREE_TEMP_V16_MAX_M", str(MAX_M)) or MAX_M))
+_SF_TEMP_V16_LIB = None
+_SF_TEMP_V16_TRIED = False
+_SF_TEMP_V16_QUAL: dict[int, bool] = {}
+_CACHED_CERT_HEAD_MOD = None
+_CACHED_CERT_V7_MOD = None
+_CACHED_CERT_PROBED = False
 _CACHED_DTG_REC_FN = None
 _CACHED_NO_LOGPROBS = None
 _CACHED_TP_AG = None
 _CACHED_L2PF_FORK_CB = None
 _CACHED_L2PF_PROBED = False
 _DUMMY_LOGITS_CACHE: dict[tuple, torch.Tensor] = {}
+_DUMMY_LAST: tuple | None = None
 _SF_LAST_RING_OBJ = None
+_SF_FAST_RING = None  # (d_idx, cols, ring) single-ring MRU fast reference
+_SF_LAST_RING_4TUP: tuple[int, int, int, int] | None = None
+_SF_V7_LIB_BY_DEV: dict[int, object] = {}
+_NLIVE_HAS_NT: bool | None = None
 
 
 def _fast_tp_all_gather():
@@ -103,7 +126,10 @@ def _fast_l2pf_fork_cb(tag: str) -> None:
         _CACHED_L2PF_PROBED = True
         try:
             from . import l2pf as _l2pf_cb
-            _CACHED_L2PF_FORK_CB = getattr(_l2pf_cb, "fork_cross_boundary", None)
+            if FAST_V14 and not getattr(_l2pf_cb, "CROSS_BOUNDARY", False):
+                _CACHED_L2PF_FORK_CB = None
+            else:
+                _CACHED_L2PF_FORK_CB = getattr(_l2pf_cb, "fork_cross_boundary", None)
         except Exception:
             _CACHED_L2PF_FORK_CB = None
     if _CACHED_L2PF_FORK_CB is not None:
@@ -111,6 +137,19 @@ def _fast_l2pf_fork_cb(tag: str) -> None:
 
 
 def _fast_dummy_logits(m: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    global _DUMMY_LAST
+    if FAST_V14:
+        d_idx = device.index
+        dl = _DUMMY_LAST
+        if dl is not None and dl[0] == m and dl[1] == dtype and dl[2] == d_idx and dl[3].device == device:
+            return dl[3]
+        dk = (m, dtype, device.type, d_idx)
+        dm = _DUMMY_LOGITS_CACHE.get(dk)
+        if dm is None:
+            dm = torch.empty((m, 1), dtype=dtype, device=device)
+            _DUMMY_LOGITS_CACHE[dk] = dm
+        _DUMMY_LAST = (m, dtype, d_idx, dm)
+        return dm
     dk = (m, dtype, str(device))
     dm = _DUMMY_LOGITS_CACHE.get(dk)
     if dm is None:
@@ -145,6 +184,46 @@ class _StaticOutputRing:
         self.acquires = 0
         self.waits = 0
         self._slice_cache: dict[tuple[int, int], tuple] = {}
+        self._is_cuda = is_cuda
+        self._d_idx = _sf_dev_idx(device) if is_cuda else -1
+        self._v14_by_nr: dict[int, tuple] = {}
+        self._v14_last_nr: int = -1
+        self._v14_last_slots: tuple | None = None
+
+    def _build_v14_slots(self, num_reqs: int) -> tuple:
+        slots = []
+        for s in range(STATIC_RING_SLOTS):
+            s_t = self.sampled[s][:num_reqs]
+            ns_t = self.num_sampled[s][:num_reqs]
+            nr_t = self.num_rejected[s][:num_reqs]
+            p_s = int(s_t.data_ptr())
+            p_ns = int(ns_t.data_ptr())
+            p_nr = int(nr_t.data_ptr())
+            slots.append((s, s_t, ns_t, nr_t, p_s, p_ns, p_nr, (s, p_s, p_ns, p_nr), int(s_t.stride(0))))
+        res = tuple(slots)
+        self._v14_by_nr[num_reqs] = res
+        return res
+
+    def acquire_v14(self, num_reqs: int):
+        """Zero-alloc O(1) slot acquire returning pre-cached views, data_ptrs, 4-tuple state & stride."""
+        slot = self.cursor
+        self.cursor = (slot + 1) & 3
+        if self.recorded[slot]:
+            ev = self.events[slot]
+            if ev is not None:
+                if not ev.query():
+                    ev.synchronize()
+                    self.waits += 1
+            self.recorded[slot] = False
+        self.acquires += 1
+        if num_reqs == self._v14_last_nr:
+            return self._v14_last_slots[slot]
+        slots = self._v14_by_nr.get(num_reqs)
+        if slots is None:
+            slots = self._build_v14_slots(num_reqs)
+        self._v14_last_nr = num_reqs
+        self._v14_last_slots = slots
+        return slots[slot]
 
     def acquire(self, num_reqs: int):
         slot = self.cursor
@@ -156,7 +235,7 @@ class _StaticOutputRing:
                 self.waits += 1
             self.recorded[slot] = False
         self.acquires += 1
-        if FAST_V11:
+        if FAST_V11 or FAST_V14:
             ck = (slot, num_reqs)
             res = self._slice_cache.get(ck)
             if res is None:
@@ -182,7 +261,7 @@ class _StaticOutputRing:
             return
         if stream is None:
             stream = torch.cuda.current_stream(self.device)
-        if FAST_V11:
+        if FAST_V11 or FAST_V14:
             rec_fn = _CACHED_DTG_REC_FN
             if rec_fn is None:
                 try:
@@ -205,14 +284,51 @@ _SF_RINGS: dict[tuple[int, int], _StaticOutputRing] = {}
 _SF_LAST_RING_STATE: tuple[int, int, int, int, int] | None = None  # (dev_idx, slot, p_s, p_ns, p_nr)
 
 
-def _acquire_static_ring_outputs(device: torch.device, num_reqs: int, cols: int):
-    global _SF_LAST_RING_STATE, _SF_LAST_RING_OBJ
+def _acquire_static_ring_outputs_v14(device: torch.device, num_reqs: int, cols: int):
+    """Zero-alloc V14 acquire returning 9-tuple (slot, s_t, ns_t, nr_t, p_s, p_ns, p_nr, st4, stride0)."""
+    global _SF_LAST_RING_STATE, _SF_LAST_RING_OBJ, _SF_FAST_RING, _SF_LAST_RING_4TUP
     if not STATIC_RING:
         _SF_LAST_RING_STATE = None
+        _SF_LAST_RING_4TUP = None
+        return None
+    is_cuda = device.type == "cuda"
+    if is_cuda and torch.cuda.is_current_stream_capturing():
+        _SF_LAST_RING_STATE = None
+        _SF_LAST_RING_4TUP = None
+        return None
+    d_idx = (device.index if device.index is not None else torch.cuda.current_device()) if is_cuda else -1
+    fr = _SF_FAST_RING
+    if fr is not None and fr[0] == d_idx and fr[1] == cols and fr[2].max_reqs >= num_reqs:
+        ring = fr[2]
+    else:
+        rkey = (d_idx, cols)
+        ring = _SF_RINGS.get(rkey)
+        if ring is None or ring.max_reqs < num_reqs:
+            ring = _StaticOutputRing(device, max(64, num_reqs), cols)
+            _SF_RINGS[rkey] = ring
+        _SF_FAST_RING = (d_idx, cols, ring)
+        _SF_LAST_RING_OBJ = (d_idx, ring)
+    entry = ring.acquire_v14(num_reqs)
+    _SF_LAST_RING_4TUP = entry[7]
+    _SF_LAST_RING_STATE = None
+    return entry
+
+
+def _acquire_static_ring_outputs(device: torch.device, num_reqs: int, cols: int):
+    global _SF_LAST_RING_STATE, _SF_LAST_RING_OBJ, _SF_LAST_RING_4TUP
+    if FAST_V14:
+        entry = _acquire_static_ring_outputs_v14(device, int(num_reqs), int(cols))
+        if entry is None:
+            return None
+        return entry[0], entry[1], entry[2], entry[3]
+    if not STATIC_RING:
+        _SF_LAST_RING_STATE = None
+        _SF_LAST_RING_4TUP = None
         return None
     is_cuda = getattr(device, "type", "") == "cuda"
     if is_cuda and torch.cuda.is_current_stream_capturing():
         _SF_LAST_RING_STATE = None
+        _SF_LAST_RING_4TUP = None
         return None
     d_idx = _sf_dev_idx(device) if is_cuda else -1
     rkey = (d_idx, int(cols))
@@ -222,6 +338,7 @@ def _acquire_static_ring_outputs(device: torch.device, num_reqs: int, cols: int)
         _SF_RINGS[rkey] = ring
     slot, s_t, ns_t, nr_t = ring.acquire(int(num_reqs))
     _SF_LAST_RING_OBJ = (d_idx, ring)
+    _SF_LAST_RING_4TUP = None
     _SF_LAST_RING_STATE = (
         d_idx,
         slot,
@@ -234,12 +351,15 @@ def _acquire_static_ring_outputs(device: torch.device, num_reqs: int, cols: int)
 
 def clear_static_ring_state() -> None:
     """Clear active-step static ring pointer state so fallback steps never leak stale pointers."""
-    global _SF_LAST_RING_STATE
+    global _SF_LAST_RING_STATE, _SF_LAST_RING_4TUP
     _SF_LAST_RING_STATE = None
+    _SF_LAST_RING_4TUP = None
 
 
 def get_static_ring_state() -> tuple[int, int, int, int] | None:
     """Return (slot, sampled_ptr, num_sampled_ptr, num_rejected_ptr) for the active step, or None."""
+    if _SF_LAST_RING_4TUP is not None:
+        return _SF_LAST_RING_4TUP
     st = _SF_LAST_RING_STATE
     if st is None:
         return None
@@ -248,9 +368,14 @@ def get_static_ring_state() -> tuple[int, int, int, int] | None:
 
 def fence_static_ring_slot(device: torch.device, slot: int, cols: int | None = None, stream=None) -> None:
     """Record completion event on ring slot `slot` strictly after AsyncOutput + Phase-2B td finish."""
+    if FAST_V14 and cols is None and _SF_FAST_RING is not None and len(_SF_RINGS) == 1:
+        d_idx = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else -1
+        if _SF_FAST_RING[0] == d_idx:
+            _SF_FAST_RING[2].fence(slot, stream=stream)
+            return
     is_cuda = getattr(device, "type", "") == "cuda"
     d_idx = _sf_dev_idx(device) if is_cuda else -1
-    if FAST_V11 and cols is None and _SF_LAST_RING_OBJ is not None and _SF_LAST_RING_OBJ[0] == d_idx and len(_SF_RINGS) == 1:
+    if (FAST_V11 or FAST_V14) and cols is None and _SF_LAST_RING_OBJ is not None and _SF_LAST_RING_OBJ[0] == d_idx and len(_SF_RINGS) == 1:
         _SF_LAST_RING_OBJ[1].fence(int(slot), stream=stream)
         return
     if cols is not None:
@@ -431,9 +556,455 @@ def qualify_sf_v7(device: torch.device, cap: float | None, dt: torch.dtype, fp32
     logger.info("INKLING_SYNC_FREE_CUDA_V7 qualify dev=%d: ok=%d (SPLIT=1 16B/row AG)", d, int(ok))
     return ok
 
+
+def _get_sf_temp_v16_lib():
+    global _SF_TEMP_V16_LIB, _SF_TEMP_V16_TRIED
+    if not _SF_TEMP_V16_TRIED:
+        _SF_TEMP_V16_TRIED = True
+        if TEMP_V16 and os.path.isfile(TEMP_V16_LIB_PATH):
+            try:
+                import ctypes
+                c_vp = ctypes.c_void_p
+                c_i = ctypes.c_int
+                c_i64 = ctypes.c_int64
+                c_u32 = ctypes.c_uint32
+                c_u64 = ctypes.c_uint64
+                lib = ctypes.CDLL(TEMP_V16_LIB_PATH)
+                sigs = {
+                    "sync_free_temp_v16_version": [],
+                    "sync_free_temp_v16_smem_cap": [],
+                    "sync_free_temp_reject_v16_fwd": [
+                        c_vp, c_i, c_i64, c_i, c_i, c_i,
+                        c_vp, c_vp, c_vp, c_vp, c_vp, c_u64,
+                        c_vp, c_i, c_i, c_i64,
+                        c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_u32,
+                        c_vp, c_i64, c_vp, c_vp, c_i, c_u64,
+                    ],
+                    "sync_free_temp_sample_k0_v16_fwd": [
+                        c_vp, c_i, c_i64, c_i, c_i,
+                        c_vp, c_vp, c_vp, c_vp, c_vp, c_u64,
+                        c_vp, c_vp, c_vp, c_u32,
+                        c_vp, c_vp, c_vp, c_i, c_u64,
+                    ],
+                    "sync_free_temp_verify_rows_v16_fwd": [
+                        c_vp, c_i, c_i64, c_i, c_i, c_i, c_i,
+                        c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_u64,
+                        c_vp, c_vp, c_i, c_i, c_i64,
+                        c_vp, c_vp, c_vp, c_i, c_u64,
+                    ],
+                }
+                for sym, argtypes in sigs.items():
+                    fn = getattr(lib, sym)
+                    fn.argtypes = argtypes
+                    fn.restype = c_i
+                if int(lib.sync_free_temp_v16_version()) == 16:
+                    _SF_TEMP_V16_LIB = lib
+                    logger.info(
+                        "INKLING_SYNC_FREE_TEMP_V16=1: loaded %s (smem_cap=%d, zero-sync SM121a temp>0 sampler)",
+                        TEMP_V16_LIB_PATH, int(lib.sync_free_temp_v16_smem_cap()),
+                    )
+            except (OSError, AttributeError):
+                _SF_TEMP_V16_LIB = None
+    return _SF_TEMP_V16_LIB
+
+
+@torch.no_grad()
+def qualify_sf_temp_v16(device: torch.device) -> bool:
+    """Fail-closed startup GPU qualification for Wave-V16 temp > 0 & mixed rejection sampler."""
+    d = _sf_dev_idx(device)
+    if d in _SF_TEMP_V16_QUAL:
+        return _SF_TEMP_V16_QUAL[d]
+    lib = _get_sf_temp_v16_lib()
+    if lib is None or device.type != "cuda" or _capturing():
+        _SF_TEMP_V16_QUAL[d] = False
+        return False
+    ok = False
+    try:
+        stream = int(torch.cuda.current_stream(device).cuda_stream)
+        V_q = 256
+        lg = torch.linspace(-2.0, 2.0, 4 * V_q, dtype=torch.float32, device=device).view(4, V_q).contiguous()
+        lg[0, 42] = 10.0
+        lg[1, 13] = 10.0
+        temps = torch.tensor([0.0, 0.7], dtype=torch.float32, device=device)
+        top_p = torch.tensor([1.0, 0.95], dtype=torch.float32, device=device)
+        top_k = torch.tensor([0, 64], dtype=torch.int32, device=device)
+        min_p = torch.tensor([0.0, 0.05], dtype=torch.float32, device=device)
+        seeds = torch.tensor([12345, 67890], dtype=torch.int64, device=device)
+        bpos = torch.tensor([10, 20], dtype=torch.int64, device=device)
+        drafts = torch.tensor([[42], [100]], dtype=torch.int64, device=device)
+        out1 = torch.zeros((2, 2), dtype=torch.int64, device=device)
+        ns1 = torch.zeros((2,), dtype=torch.int32, device=device)
+        nr1 = torch.zeros((2,), dtype=torch.int32, device=device)
+        out2 = torch.zeros_like(out1)
+        ns2 = torch.zeros_like(ns1)
+        nr2 = torch.zeros_like(nr1)
+        rc1 = lib.sync_free_temp_verify_rows_v16_fwd(
+            lg.data_ptr(), 1, V_q, 4, V_q, 2, 1,
+            temps.data_ptr(), top_p.data_ptr(), top_k.data_ptr(), min_p.data_ptr(),
+            seeds.data_ptr(), bpos.data_ptr(), 1,
+            drafts.data_ptr(), 0, 0, 0, 0,
+            out1.data_ptr(), ns1.data_ptr(), nr1.data_ptr(), 0, stream,
+        )
+        rc2 = lib.sync_free_temp_verify_rows_v16_fwd(
+            lg.data_ptr(), 1, V_q, 4, V_q, 2, 1,
+            temps.data_ptr(), top_p.data_ptr(), top_k.data_ptr(), min_p.data_ptr(),
+            seeds.data_ptr(), bpos.data_ptr(), 1,
+            drafts.data_ptr(), 0, 0, 0, 0,
+            out2.data_ptr(), ns2.data_ptr(), nr2.data_ptr(), 0, stream,
+        )
+        torch.cuda.synchronize(device)
+        ok = (
+            rc1 == 0
+            and rc2 == 0
+            and int(ns1[0].item()) == 2
+            and int(nr1[0].item()) == 0
+            and int(out1[0, 0].item()) == 42
+            and int(out1[0, 1].item()) == 13
+            and 0 <= int(out1[1, 0].item()) < V_q
+            and bool(torch.equal(out1, out2))
+            and bool(torch.equal(ns1, ns2))
+            and bool(torch.equal(nr1, nr2))
+        )
+    except Exception:
+        ok = False
+    _SF_TEMP_V16_QUAL[d] = ok
+    logger.info("INKLING_SYNC_FREE_TEMP_V16 qualify dev=%d: ok=%d", d, int(ok))
+    return ok
+
+
+def _sf_temp_v16_ok(device: torch.device) -> bool:
+    if not TEMP_V16 or device.type != "cuda":
+        return False
+    d = _sf_dev_idx(device)
+    q = _SF_TEMP_V16_QUAL.get(d)
+    if q is None:
+        if _capturing():
+            return False
+        q = qualify_sf_temp_v16(device)
+    return bool(q and _get_sf_temp_v16_lib() is not None)
+
+
+def _notify_cert_temp_direct(
+    active: bool, shared_prefix_n: int = 1, update_l2pf_hint: bool = True
+) -> None:
+    """Zero-sync notification to cert_head & cert_head_cuda_v7 on temp > 0 / greedy transitions."""
+    global _CACHED_CERT_HEAD_MOD, _CACHED_CERT_V7_MOD, _CACHED_CERT_PROBED
+    if not _CACHED_CERT_PROBED:
+        _CACHED_CERT_PROBED = True
+        try:
+            from . import cert_head as _ch_m
+            _CACHED_CERT_HEAD_MOD = _ch_m
+        except Exception:
+            try:
+                import cert_head as _ch_m  # type: ignore[no-redef]
+                _CACHED_CERT_HEAD_MOD = _ch_m
+            except Exception:
+                _CACHED_CERT_HEAD_MOD = None
+        try:
+            from . import cert_head_cuda_v7 as _ch7_m
+            _CACHED_CERT_V7_MOD = _ch7_m
+        except Exception:
+            try:
+                import cert_head_cuda_v7 as _ch7_m  # type: ignore[no-redef]
+                _CACHED_CERT_V7_MOD = _ch7_m
+            except Exception:
+                _CACHED_CERT_V7_MOD = None
+    if _CACHED_CERT_HEAD_MOD is not None and hasattr(_CACHED_CERT_HEAD_MOD, "set_temp_direct_step"):
+        _CACHED_CERT_HEAD_MOD.set_temp_direct_step(active, shared_prefix_n=shared_prefix_n)
+    if _CACHED_CERT_V7_MOD is not None and hasattr(_CACHED_CERT_V7_MOD, "set_temp_direct_step"):
+        _CACHED_CERT_V7_MOD.set_temp_direct_step(
+            active, shared_prefix_n=shared_prefix_n, update_l2pf_hint=update_l2pf_hint
+        )
+
+
+def _detect_shared_prefix_n(input_batch) -> int:
+    """Zero-sync CPU metadata probe for shared-prefix n>1 fanout (e.g. rollout_harvester --n 4)."""
+    if input_batch is None:
+        return 1
+    sp_n = getattr(input_batch, "shared_prefix_group_size", None)
+    if sp_n is not None:
+        try:
+            return max(1, int(sp_n))
+        except Exception:
+            return 1
+    p_hashes = getattr(input_batch, "prompt_prefix_hash_np", None)
+    if p_hashes is not None:
+        try:
+            n_tot = len(p_hashes)
+            if n_tot > 1:
+                counts: dict[int, int] = {}
+                for h in p_hashes:
+                    hi = int(h)
+                    counts[hi] = counts.get(hi, 0) + 1
+                return max(counts.values()) if counts else 1
+        except Exception:
+            return 1
+    return 1
+
+
+def _validate_temp_v16_sampling_states(ss, idx) -> bool:
+    """Zero-sync CPU sanity validation of temp > 0 sampling parameters (fail-closed on NaN/invalid)."""
+    if getattr(ss, "temperature", None) is None or getattr(ss.temperature, "gpu", None) is None:
+        return False
+    tp_obj = getattr(ss, "top_p", None)
+    if tp_obj is not None and getattr(tp_obj, "np", None) is not None:
+        tp_np = tp_obj.np
+        for s in idx:
+            v = float(tp_np[int(s)])
+            if not np.isfinite(v) or v <= 0.0 or v > 1.0:
+                return False
+    mp_obj = getattr(ss, "min_p", None)
+    if mp_obj is not None and getattr(mp_obj, "np", None) is not None:
+        mp_np = mp_obj.np
+        for s in idx:
+            v = float(mp_np[int(s)])
+            if not np.isfinite(v) or v < 0.0 or v >= 1.0:
+                return False
+    tk_obj = getattr(ss, "top_k", None)
+    if tk_obj is not None and getattr(tk_obj, "np", None) is not None:
+        tk_np = tk_obj.np
+        for s in idx:
+            if int(tk_np[int(s)]) < 0:
+                return False
+    return True
+
+
+def _extract_temp_v16_ptrs(ss):
+    """Extract GPU device pointers for per-slot sampling parameters (0 host syncs)."""
+    t_gpu = ss.temperature.gpu
+    if t_gpu is None or t_gpu.dtype != torch.float32:
+        return None
+    tp_gpu = getattr(getattr(ss, "top_p", None), "gpu", None)
+    tk_gpu = getattr(getattr(ss, "top_k", None), "gpu", None)
+    mp_gpu = getattr(getattr(ss, "min_p", None), "gpu", None)
+    sd_gpu = getattr(getattr(ss, "seeds", None), "gpu", None)
+    if tp_gpu is not None and tp_gpu.dtype != torch.float32:
+        return None
+    if tk_gpu is not None and tk_gpu.dtype != torch.int32:
+        return None
+    if mp_gpu is not None and mp_gpu.dtype != torch.float32:
+        return None
+    seeds_i64 = False
+    if sd_gpu is not None:
+        if sd_gpu.dtype == torch.int64:
+            seeds_i64 = True
+        elif sd_gpu.dtype == torch.int32:
+            seeds_i64 = False
+        else:
+            return None
+    return (
+        int(t_gpu.data_ptr()),
+        int(tp_gpu.data_ptr()) if tp_gpu is not None else 0,
+        int(tk_gpu.data_ptr()) if tk_gpu is not None else 0,
+        int(mp_gpu.data_ptr()) if mp_gpu is not None else 0,
+        int(sd_gpu.data_ptr()) if sd_gpu is not None else 0,
+        seeds_i64,
+    )
+
+
+def _try_temp_v16_sample_k0(self_sp, logits: torch.Tensor, input_batch):
+    """Zero-sync SM121a K=0 GPU sampler for temp > 0 & mixed batches (returns SamplerOutput or None)."""
+    if (
+        not TEMP_V16
+        or _capturing()
+        or not isinstance(logits, torch.Tensor)
+        or logits.dim() != 2
+        or logits.stride(1) != 1
+        or logits.dtype not in (torch.bfloat16, torch.float32)
+    ):
+        return None
+    M, V = int(logits.shape[0]), int(logits.shape[1])
+    num_reqs = int(getattr(input_batch, "num_reqs", 0) or 0)
+    if num_reqs <= 0 or M != num_reqs or M > TEMP_V16_MAX_M or V <= 0:
+        return None
+    if not _sf_temp_v16_ok(logits.device):
+        return None
+    ib_sl = input_batch.seq_lens
+    ib_idx = input_batch.idx_mapping
+    pf_gpu = self_sp.req_states.prefill_len.gpu
+    if (
+        ib_sl.dtype != torch.int32
+        or pf_gpu.dtype != torch.int32
+        or ib_idx.dtype not in (torch.int32, torch.int64)
+    ):
+        return None
+    ptrs = _extract_temp_v16_ptrs(self_sp.sampling_states)
+    if ptrs is None:
+        return None
+    t_ptr, tp_ptr, tk_ptr, mp_ptr, sd_ptr, seeds_i64 = ptrs
+    dflags = (8 if ib_idx.dtype == torch.int64 else 0) | (16 if seeds_i64 else 0)
+    tok = torch.empty((num_reqs,), dtype=torch.int64, device=logits.device)
+    ns = torch.empty((num_reqs,), dtype=torch.int32, device=logits.device)
+    nr = torch.empty((num_reqs,), dtype=torch.int32, device=logits.device)
+    lib = _get_sf_temp_v16_lib()
+    rc = lib.sync_free_temp_sample_k0_v16_fwd(
+        int(logits.data_ptr()),
+        1 if logits.dtype == torch.float32 else 0,
+        int(logits.stride(0)),
+        num_reqs,
+        V,
+        t_ptr, tp_ptr, tk_ptr, mp_ptr, sd_ptr,
+        int(_S.get("temp_step_id", 0)),
+        int(ib_sl.data_ptr()),
+        int(ib_idx.data_ptr()),
+        int(pf_gpu.data_ptr()),
+        int(dflags),
+        int(tok.data_ptr()),
+        int(ns.data_ptr()),
+        int(nr.data_ptr()),
+        1 if TEMP_V16_PDL else 0,
+        int(torch.cuda.current_stream(logits.device).cuda_stream),
+    )
+    if rc != 0:
+        return None
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+    return SamplerOutput(
+        sampled_token_ids=tok.view(-1, 1),
+        logprobs_tensors=None,
+        num_nans=None,
+        num_sampled=ns,
+        num_rejected=nr,
+        sampling_mask_tensors=None,
+    )
+
+
+def _try_temp_v16_reject(self_rs, logits: torch.Tensor, input_batch, draft_logits=None):
+    """Zero-sync SM121a speculative rejection sampler for temp > 0 & mixed batches (0 intermediate [M,V] allocs)."""
+    if (
+        not TEMP_V16
+        or _capturing()
+        or not isinstance(logits, torch.Tensor)
+        or logits.dim() != 2
+        or logits.stride(1) != 1
+        or logits.dtype not in (torch.bfloat16, torch.float32)
+    ):
+        return None
+    M, V = int(logits.shape[0]), int(logits.shape[1])
+    num_reqs = int(getattr(input_batch, "num_reqs", 0) or 0)
+    if num_reqs <= 0 or M <= 0 or M > TEMP_V16_MAX_M or V <= 0:
+        return None
+    if not _sf_temp_v16_ok(logits.device):
+        return None
+    ib_pos = input_batch.positions
+    ib_li = input_batch.logits_indices
+    ib_ids = input_batch.input_ids
+    ib_sl = input_batch.seq_lens
+    ib_cu = input_batch.cu_num_logits
+    ib_idx = input_batch.idx_mapping
+    pf_gpu = self_rs.sampler.req_states.prefill_len.gpu
+    if (
+        ib_pos.dim() != 1
+        or ib_li.shape[0] != M
+        or ib_ids.stride(0) != 1
+        or ib_pos.stride(0) != 1
+        or ib_li.stride(0) != 1
+        or ib_sl.dtype != torch.int32
+        or pf_gpu.dtype != torch.int32
+        or ib_cu.dtype != torch.int32
+        or ib_ids.dtype not in (torch.int32, torch.int64)
+        or ib_pos.dtype not in (torch.int32, torch.int64)
+        or ib_li.dtype not in (torch.int32, torch.int64)
+        or ib_idx.dtype not in (torch.int32, torch.int64)
+    ):
+        return None
+    ptrs = _extract_temp_v16_ptrs(self_rs.sampler.sampling_states)
+    if ptrs is None:
+        return None
+    t_ptr, tp_ptr, tk_ptr, mp_ptr, sd_ptr, seeds_i64 = ptrs
+
+    draft_mode = 0
+    draft_q_ptr = 0
+    draft_is_fp32 = 0
+    draft_stride = 0
+    if draft_logits is not None:
+        if (
+            isinstance(draft_logits, torch.Tensor)
+            and draft_logits.dim() == 2
+            and draft_logits.shape == logits.shape
+            and draft_logits.stride(1) == 1
+            and draft_logits.dtype in (torch.bfloat16, torch.float32)
+        ):
+            draft_mode = 2
+            draft_q_ptr = int(draft_logits.data_ptr())
+            draft_is_fp32 = 1 if draft_logits.dtype == torch.float32 else 0
+            draft_stride = int(draft_logits.stride(0))
+        elif (
+            isinstance(draft_logits, torch.Tensor)
+            and draft_logits.dim() == 1
+            and draft_logits.shape[0] == M
+            and draft_logits.dtype == torch.float32
+            and draft_logits.is_contiguous()
+        ):
+            draft_mode = 3
+            draft_q_ptr = int(draft_logits.data_ptr())
+        else:
+            return None
+
+    cols = int(self_rs.num_speculative_steps) + 1
+    _ring_out = _acquire_static_ring_outputs(logits.device, num_reqs, cols)
+    if _ring_out is not None:
+        _, sampled, num_sampled, num_rejected = _ring_out
+    else:
+        sampled = torch.empty((num_reqs, cols), dtype=torch.int64, device=logits.device)
+        num_sampled = torch.empty((num_reqs,), dtype=torch.int32, device=logits.device)
+        num_rejected = torch.empty((num_reqs,), dtype=torch.int32, device=logits.device)
+
+    dflags = (
+        (1 if ib_ids.dtype == torch.int64 else 0)
+        | (2 if ib_pos.dtype == torch.int64 else 0)
+        | (4 if ib_li.dtype == torch.int64 else 0)
+        | (8 if ib_idx.dtype == torch.int64 else 0)
+        | (16 if seeds_i64 else 0)
+    )
+    lib = _get_sf_temp_v16_lib()
+    rc = lib.sync_free_temp_reject_v16_fwd(
+        int(logits.data_ptr()),
+        1 if logits.dtype == torch.float32 else 0,
+        int(logits.stride(0)),
+        M,
+        V,
+        num_reqs,
+        t_ptr, tp_ptr, tk_ptr, mp_ptr, sd_ptr,
+        int(_S.get("temp_step_id", 0)),
+        draft_q_ptr,
+        draft_mode,
+        draft_is_fp32,
+        draft_stride,
+        int(ib_sl.data_ptr()),
+        int(ib_ids.data_ptr()),
+        int(ib_pos.data_ptr()),
+        int(ib_li.data_ptr()),
+        int(ib_idx.data_ptr()),
+        int(pf_gpu.data_ptr()),
+        int(ib_cu.data_ptr()),
+        int(dflags),
+        int(sampled.data_ptr()),
+        int(sampled.stride(0)),
+        int(num_sampled.data_ptr()),
+        int(num_rejected.data_ptr()),
+        1 if TEMP_V16_PDL else 0,
+        int(torch.cuda.current_stream(logits.device).cuda_stream),
+    )
+    if rc != 0:
+        clear_static_ring_state()
+        return None
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+    return SamplerOutput(
+        sampled_token_ids=sampled,
+        logprobs_tensors=None,
+        num_nans=None,
+        num_sampled=num_sampled,
+        num_rejected=num_rejected,
+        sampling_mask_tensors=None,
+    )
+
+
 _S: dict = {
     "armed": False,
     "armed_k0": False,
+    "temp_mode": "off",
+    "temp_step_id": 0,
+    "temp_shared_prefix_n": 1,
     "num_tokens": 0,
     "installed": False,
     "runner_hooked": False,
@@ -917,9 +1488,66 @@ def _tp_min(vals: list[int]) -> list[int]:
 
 def step_armed(runner, input_batch, grammar_output) -> tuple[bool, bool]:
     """Returns (armed, is_k0).
-    True only when the only consumer of this step's target logits is a greedy argmax.
-    Supports both speculative verification (num_draft_tokens > 0) and non-speculative /
-    Dynamic-SD K=0 greedy steps (num_draft_tokens == 0, when ALLOW_K0 is enabled)."""
+    - Pure `temp == 0.0` batches arm `_S['temp_mode'] = 'greedy'` (100.000% untouched 1dcfb306 path).
+    - When `INKLING_SYNC_FREE_TEMP_V16=1`, pure `temp > 0` and mixed `temp == 0` + `temp > 0` batches
+      arm `_S['temp_mode'] = 'temp' | 'mixed'` for zero-sync SM121a GPU rejection sampling, cleanly
+      disarming on logprobs, penalties/logits_processing, grammar_output, watermark, and prompt_logprobs."""
+    global _CACHED_NO_LOGPROBS
+    _S["temp_mode"] = "off"
+    _S["temp_shared_prefix_n"] = 1
+    if FAST_V14 and not TEMP_V16 and grammar_output is None and input_batch is not None:
+        try:
+            sp = runner.sampler
+            rs = runner.rejection_sampler
+            num_draft = input_batch.num_draft_tokens
+            if (
+                sp is not None
+                and rs is not None
+                and num_draft > 0
+                and getattr(runner, "batch_sharder", None) is None
+                and getattr(rs, "watermark_key", None) is None
+                and getattr(rs, "synthetic_conditional_rates", None) is None
+                and not getattr(rs, "use_block_verification", False)
+                and not getattr(rs, "fly_window_size", 0)
+                and not getattr(rs, "enable_adaptive_verification", False)
+                and not getattr(sp, "compute_nans", False)
+                and getattr(sp, "trace_replay_state", None) is None
+                and not getattr(sp, "return_sampling_mask", False)
+            ):
+                # V15 Track 8 LOW guard: disarm speculative prompt_logprobs / expanded logits
+                cu_np = getattr(input_batch, "cu_num_logits_np", None)
+                if cu_np is not None and len(cu_np) > 0 and int(cu_np[-1]) != int(input_batch.num_reqs) + int(num_draft):
+                    return False, False
+                idx = input_batch.idx_mapping_np
+                if idx is not None:
+                    n_idx = len(idx)
+                    if 0 < n_idx <= 8:
+                        ss = sp.sampling_states
+                        t_np = ss.temperature.np
+                        nlp_arr = sp.needs_logits_processing
+                        if n_idx == 1:
+                            i0 = int(idx[0])
+                            if t_np[i0] != 0.0 or nlp_arr[i0]:
+                                return False, False
+                        else:
+                            for _i in range(n_idx):
+                                _s = int(idx[_i])
+                                if t_np[_s] != 0.0 or nlp_arr[_s]:
+                                    return False, False
+                        no_lp = _CACHED_NO_LOGPROBS
+                        if no_lp is None:
+                            from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS as _nlp
+                            _CACHED_NO_LOGPROBS = _nlp
+                            no_lp = _nlp
+                        if ss.max_num_logprobs(idx) != no_lp:
+                            return False, False
+                        lts = getattr(sp, "logprob_token_ids_state", None)
+                        if lts is not None and lts.max_num_token_ids(idx) != 0:
+                            return False, False
+                        _S["temp_mode"] = "greedy"
+                        return True, False
+        except AttributeError:
+            pass
     try:
         if getattr(runner, "batch_sharder", None) is not None:
             return False, False
@@ -930,16 +1558,19 @@ def step_armed(runner, input_batch, grammar_output) -> tuple[bool, bool]:
             return False, False
         num_draft = int(getattr(input_batch, "num_draft_tokens", 0))
         is_k0 = (num_draft <= 0) or (rs is None)
+        cu_np = getattr(input_batch, "cu_num_logits_np", None)
         if is_k0:
             if not ALLOW_K0:
                 return False, False
             # Require exactly 1 logit per request (excludes prompt_logprobs / expanded logits)
-            cu_np = getattr(input_batch, "cu_num_logits_np", None)
             if cu_np is None or len(cu_np) == 0 or int(cu_np[-1]) != int(input_batch.num_reqs):
                 return False, False
             if getattr(sp, "watermark_key", None) is not None:
                 return False, False
         else:
+            # V15 Track 8 LOW guard: require exact num_reqs + num_draft logits (excludes speculative prompt_logprobs)
+            if cu_np is not None and len(cu_np) > 0 and int(cu_np[-1]) != int(input_batch.num_reqs) + num_draft:
+                return False, False
             if getattr(rs, "watermark_key", None) is not None or getattr(rs, "synthetic_conditional_rates", None) is not None:
                 return False, False
             if getattr(rs, "use_block_verification", False) or getattr(rs, "fly_window_size", 0):
@@ -954,19 +1585,45 @@ def step_armed(runner, input_batch, grammar_output) -> tuple[bool, bool]:
         if idx is None or len(idx) == 0:
             return False, False
         ss = sp.sampling_states
-        if FAST_V11 and len(idx) == 1:
+        n_idx = len(idx)
+        t_np = ss.temperature.np
+        nlp_arr = sp.needs_logits_processing
+        has_zero = False
+        has_pos = False
+        if n_idx <= 8 or TEMP_V16:
+            for _i in range(n_idx):
+                _s = int(idx[_i])
+                if nlp_arr[_s]:
+                    return False, False
+                _tv = float(t_np[_s])
+                if not np.isfinite(_tv) or _tv < 0.0:
+                    return False, False
+                if _tv == 0.0:
+                    has_zero = True
+                else:
+                    has_pos = True
+                    if not TEMP_V16:
+                        return False, False
+        elif FAST_V11 and n_idx == 1:
             i0 = int(idx[0])
-            if ss.temperature.np[i0] != 0.0:
+            if t_np[i0] != 0.0 or nlp_arr[i0]:
                 return False, False
-            if sp.needs_logits_processing[i0]:
-                return False, False
+            has_zero = True
         else:
-            if not bool(np.all(ss.temperature.np[idx] == 0.0)):
+            if not bool(np.all(t_np[idx] == 0.0)):
                 return False, False
-            if bool(np.any(sp.needs_logits_processing[idx])):
+            if bool(np.any(nlp_arr[idx])):
                 return False, False
-        if FAST_V11:
-            global _CACHED_NO_LOGPROBS
+            has_zero = True
+
+        # Defensive penalties check in addition to needs_logits_processing
+        pen_st = getattr(sp, "penalties_state", None)
+        if pen_st is not None:
+            _hp_fn = getattr(pen_st, "has_penalties", None)
+            if callable(_hp_fn) and bool(_hp_fn(idx)):
+                return False, False
+
+        if FAST_V11 or FAST_V14:
             no_lp = _CACHED_NO_LOGPROBS
             if no_lp is None:
                 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS as _nlp
@@ -980,8 +1637,20 @@ def step_armed(runner, input_batch, grammar_output) -> tuple[bool, bool]:
         lts = getattr(sp, "logprob_token_ids_state", None)
         if lts is not None and lts.max_num_token_ids(idx) != 0:
             return False, False
+
+        if has_pos:
+            if not TEMP_V16 or MODE != "argmax":
+                return False, False
+            if not _validate_temp_v16_sampling_states(ss, idx):
+                return False, False
+            _S["temp_mode"] = "mixed" if has_zero else "temp"
+            _S["temp_shared_prefix_n"] = _detect_shared_prefix_n(input_batch)
+            return True, is_k0
+
+        _S["temp_mode"] = "greedy"
         return True, is_k0
     except Exception as e:  # noqa: BLE001 - fail closed
+        _S["temp_mode"] = "off"
         if not _S.get("arm_warned"):
             _S["arm_warned"] = True
             logger.warning("INKLING_SYNC_FREE: arming check failed (%r); stock head", e)
@@ -1001,24 +1670,58 @@ def _install_runner_hook() -> None:
         orig = cls.sample
 
         def sample(self, *args, **kwargs):
-            hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
-            ib = kwargs.get("input_batch", args[1] if len(args) > 1 else None)
-            go = kwargs.get("grammar_output", args[2] if len(args) > 2 else None)
+            if FAST_V14 and not kwargs:
+                n_a = len(args)
+                hs = args[0] if n_a > 0 else None
+                ib = args[1] if n_a > 1 else None
+                go = args[2] if n_a > 2 else None
+            else:
+                hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
+                ib = kwargs.get("input_batch", args[1] if len(args) > 1 else None)
+                go = kwargs.get("grammar_output", args[2] if len(args) > 2 else None)
             armed, is_k0 = step_armed(self, ib, go)
-            _S["armed"] = armed
-            _S["armed_k0"] = is_k0
+            _s = _S
+            _s["armed"] = armed
+            _s["armed_k0"] = is_k0
+            _temp_mode = _s.get("temp_mode", "off")
+            if _temp_mode in ("temp", "mixed"):
+                _s["temp_step_id"] = int(_s.get("temp_step_id", 0)) + 1
+                _notify_cert_temp_direct(
+                    True,
+                    shared_prefix_n=int(_s.get("temp_shared_prefix_n", 1)),
+                    update_l2pf_hint=True,
+                )
+            elif _temp_mode == "greedy":
+                _notify_cert_temp_direct(False, shared_prefix_n=1, update_l2pf_hint=True)
             # Only pass num_tokens for pure-decode, unpadded-token-count batches so cert_head
             # nlive trimming safely falls back to M on prefill, mixed, or padded K=0 batches.
             nt = 0
             nt_raw = 0
-            if ib is not None and not getattr(ib, "has_prefill", False):
-                nt_pad = int(getattr(ib, "num_tokens_after_padding", 0) or 0)
-                nt_raw = int(getattr(ib, "num_tokens", 0) or 0)
-                if nt_pad > 0 and nt_raw == nt_pad:
-                    nt = nt_pad
-            _S["num_tokens"] = nt
-            _S["tok"] = None
-            _S["gathered"] = None
+            if FAST_V14 and ib is not None:
+                try:
+                    has_prefill = bool(ib.has_prefill)
+                    if not has_prefill:
+                        nt_pad = ib.num_tokens_after_padding or 0
+                        nt_raw = ib.num_tokens or 0
+                        if nt_pad > 0 and nt_raw == nt_pad:
+                            nt = nt_pad
+                except AttributeError:
+                    has_prefill = bool(getattr(ib, "has_prefill", False))
+                    if not has_prefill:
+                        nt_pad = int(getattr(ib, "num_tokens_after_padding", 0) or 0)
+                        nt_raw = int(getattr(ib, "num_tokens", 0) or 0)
+                        if nt_pad > 0 and nt_raw == nt_pad:
+                            nt = nt_pad
+            else:
+                has_prefill = True if ib is None else bool(getattr(ib, "has_prefill", False))
+                if ib is not None and not has_prefill:
+                    nt_pad = int(getattr(ib, "num_tokens_after_padding", 0) or 0)
+                    nt_raw = int(getattr(ib, "num_tokens", 0) or 0)
+                    if nt_pad > 0 and nt_raw == nt_pad:
+                        nt = nt_pad
+            _s["num_tokens"] = nt
+            _s["tok"] = None
+            _s["gathered"] = None
             try:
                 # Zero-copy slice fast path on pure-decode batches where every token produces a logit
                 # (sum(num_logits) == num_tokens -> logits_indices == [0, 1, ..., num_tokens - 1]):
@@ -1028,22 +1731,22 @@ def _install_runner_hook() -> None:
                     and armed
                     and go is None
                     and ib is not None
-                    and not getattr(ib, "has_prefill", True)
-                    and getattr(self, "batch_sharder", None) is None
+                    and not has_prefill
+                    and (FAST_V14 or getattr(self, "batch_sharder", None) is None)
                     and getattr(self, "adaptive_verification", None) is None
                     and getattr(ib, "dsv41_dead_drafts", None) is None
                     and isinstance(hs, torch.Tensor)
                     and hs.dim() == 2
                     and nt_raw > 0
-                    and nt_raw <= int(hs.shape[0])
-                    and int(getattr(ib, "num_reqs", 0) or 0) > 0
+                    and nt_raw <= hs.shape[0]
+                    and (ib.num_reqs if FAST_V14 else int(getattr(ib, "num_reqs", 0) or 0)) > 0
                 ):
-                    cu_np = getattr(ib, "cu_num_logits_np", None)
-                    nreqs = int(ib.num_reqs)
+                    cu_np = ib.cu_num_logits_np if FAST_V14 else getattr(ib, "cu_num_logits_np", None)
+                    nreqs = ib.num_reqs if FAST_V14 else int(ib.num_reqs)
                     if (
                         cu_np is not None
                         and len(cu_np) == nreqs + 1
-                        and int(cu_np[-1]) == nt_raw
+                        and cu_np[-1] == nt_raw
                         and (
                             (is_k0 and getattr(self, "sampler", None) is not None)
                             or (
@@ -1053,8 +1756,8 @@ def _install_runner_hook() -> None:
                             )
                         )
                     ):
-                        sample_hs = hs[:nt_raw]
-                        ms = getattr(self, "model_state", None)
+                        sample_hs = hs if (FAST_V14 and hs.shape[0] == nt_raw) else hs[:nt_raw]
+                        ms = self.model_state if FAST_V14 else getattr(self, "model_state", None)
                         if ms is not None and hasattr(ms, "compute_sample_logits"):
                             logits = ms.compute_sample_logits(sample_hs)
                         else:
@@ -1072,11 +1775,15 @@ def _install_runner_hook() -> None:
                         )
                 return orig(self, *args, **kwargs)
             finally:
-                _S["armed"] = False
-                _S["armed_k0"] = False
-                _S["num_tokens"] = 0
-                _S["tok"] = None
-                _S["gathered"] = None
+                _s["armed"] = False
+                _s["armed_k0"] = False
+                _s["temp_mode"] = "off"
+                _s["temp_shared_prefix_n"] = 1
+                _s["num_tokens"] = 0
+                _s["tok"] = None
+                _s["gathered"] = None
+                if _temp_mode in ("temp", "mixed"):
+                    _notify_cert_temp_direct(False, shared_prefix_n=1, update_l2pf_hint=False)
 
         cls.sample = sample
         cls._inkling_sync_free = True
@@ -1108,6 +1815,11 @@ def _install_sampler_hook() -> None:
         def _direct_sampler_call(self, logits, input_batch):
             tok = _S.get("tok")
             g_info = _S.get("gathered")
+            if tok is None and g_info is None and _S.get("temp_mode") in ("temp", "mixed") and TEMP_V16:
+                out_v16 = _try_temp_v16_sample_k0(self, logits, input_batch)
+                if out_v16 is not None:
+                    return out_v16
+                return orig_call(self, logits, input_batch)
             if tok is None and g_info is not None and _S.get("armed_k0", False):
                 _S["gathered"] = None
                 gathered, M_g, tp_g, split_g = g_info
@@ -1198,12 +1910,129 @@ def _install_rejection_hook() -> None:
             clear_static_ring_state()
             g_info = _S.get("gathered")
             tok = _S.get("tok")
+            if g_info is None and tok is None and _S.get("temp_mode") in ("temp", "mixed") and TEMP_V16:
+                out_v16 = _try_temp_v16_reject(self, logits, input_batch, draft_logits)
+                if out_v16 is not None:
+                    return out_v16
+                return orig_call(self, logits, input_batch, draft_logits)
             if g_info is not None:
                 _S["gathered"] = None
                 _S["tok"] = None
                 gathered, M_g, tp_g, split_g = g_info
                 num_reqs = input_batch.num_reqs
                 if M_g == logits.shape[0] and num_reqs > 0:
+                    if FAST_V14 and FUSE_REJECT and not getattr(input_batch, "has_prefill", True):
+                        ib_pos = input_batch.positions
+                        ib_li = input_batch.logits_indices
+                        ib_ids = input_batch.input_ids
+                        if (
+                            ib_pos.dim() == 1
+                            and ib_li.shape[0] == M_g
+                            and ib_ids.stride(0) == 1
+                            and ib_pos.stride(0) == 1
+                            and ib_li.stride(0) == 1
+                            and not (TREE_SPEC and num_reqs == 1)
+                        ):
+                            g_dev = gathered.device
+                            _ring_v14 = _acquire_static_ring_outputs_v14(
+                                g_dev, num_reqs, self.num_speculative_steps + 1
+                            )
+                            if _ring_v14 is not None:
+                                _, sampled, num_sampled, num_rejected, p_s, p_ns, p_nr, _, s_stride0 = _ring_v14
+                            else:
+                                sampled = torch.empty(
+                                    (num_reqs, self.num_speculative_steps + 1),
+                                    dtype=torch.int64,
+                                    device=g_dev,
+                                )
+                                num_sampled = torch.empty((num_reqs,), dtype=torch.int32, device=g_dev)
+                                num_rejected = torch.empty((num_reqs,), dtype=torch.int32, device=g_dev)
+                                p_s = int(sampled.data_ptr())
+                                p_ns = int(num_sampled.data_ptr())
+                                p_nr = int(num_rejected.data_ptr())
+                                s_stride0 = int(sampled.stride(0))
+                            d_idx = (g_dev.index if g_dev.index is not None else torch.cuda.current_device()) if g_dev.type == "cuda" else -1
+                            lib_r = _SF_V7_LIB_BY_DEV.get(d_idx)
+                            if lib_r is None and _sf_v7_ok(g_dev):
+                                lib_r = _get_sf_v7_lib()
+                                if lib_r is not None:
+                                    _SF_V7_LIB_BY_DEV[d_idx] = lib_r
+                            if lib_r is not None:
+                                i32 = torch.int32
+                                i64 = torch.int64
+                                ib_sl = input_batch.seq_lens
+                                ib_cu = input_batch.cu_num_logits
+                                ib_idx = input_batch.idx_mapping
+                                pf_gpu = self.sampler.req_states.prefill_len.gpu
+                                dt_ids = ib_ids.dtype
+                                dt_pos = ib_pos.dtype
+                                dt_li = ib_li.dtype
+                                dt_idx = ib_idx.dtype
+                                if (
+                                    ib_sl.dtype is i32
+                                    and pf_gpu.dtype is i32
+                                    and ib_cu.dtype is i32
+                                    and (dt_ids is i32 or dt_ids is i64)
+                                    and (dt_pos is i32 or dt_pos is i64)
+                                    and (dt_li is i32 or dt_li is i64)
+                                    and (dt_idx is i32 or dt_idx is i64)
+                                ):
+                                    dflags = (
+                                        (1 if dt_ids is i64 else 0)
+                                        | (2 if dt_pos is i64 else 0)
+                                        | (4 if dt_li is i64 else 0)
+                                        | (8 if dt_idx is i64 else 0)
+                                    )
+                                    rc_fr = lib_r.sync_free_fused_reject_v7_fwd(
+                                        gathered.data_ptr(), M_g, num_reqs, tp_g, split_g,
+                                        p_s, s_stride0, p_ns, p_nr,
+                                        ib_sl.data_ptr(), ib_ids.data_ptr(),
+                                        ib_pos.data_ptr(), ib_li.data_ptr(),
+                                        ib_idx.data_ptr(), pf_gpu.data_ptr(),
+                                        ib_cu.data_ptr(),
+                                        dflags, 1 if V7_PDL else 0,
+                                        torch.cuda.current_stream(g_dev).cuda_stream,
+                                    )
+                                    if rc_fr == 0:
+                                        return SamplerOutput(
+                                            sampled_token_ids=sampled,
+                                            logprobs_tensors=None,
+                                            num_nans=None,
+                                            num_sampled=num_sampled,
+                                            num_rejected=num_rejected,
+                                            sampling_mask_tensors=None,
+                                        )
+                            # Fallback to Triton fused_reject preserving the acquired ring tensors
+                            k = _kernels()
+                            k["fused_reject"][(num_reqs,)](
+                                gathered,
+                                M_g,
+                                sampled,
+                                s_stride0,
+                                num_sampled,
+                                num_rejected,
+                                input_batch.seq_lens,
+                                ib_ids,
+                                ib_pos,
+                                ib_li,
+                                input_batch.idx_mapping,
+                                self.sampler.req_states.prefill_len.gpu,
+                                input_batch.cu_num_logits,
+                                TP=tp_g,
+                                SPLIT=split_g,
+                                NP=triton_np2(tp_g * split_g),
+                                PDL=True,
+                                num_warps=1,
+                                launch_pdl=True,
+                            )
+                            return SamplerOutput(
+                                sampled_token_ids=sampled,
+                                logprobs_tensors=None,
+                                num_nans=None,
+                                num_sampled=num_sampled,
+                                num_rejected=num_rejected,
+                                sampling_mask_tensors=None,
+                            )
                     if (
                         FUSE_REJECT
                         and not getattr(input_batch, "has_prefill", True)
@@ -1230,7 +2059,7 @@ def _install_rejection_hook() -> None:
                             num_rejected = torch.empty(
                                 (num_reqs,), dtype=torch.int32, device=gathered.device
                             )
-                        k = None if FAST_V11 else _kernels()
+                        k = None if (FAST_V11 or FAST_V14) else _kernels()
                         tree_st = None
                         tsr_mod = None
                         if TREE_SPEC and num_reqs == 1:
@@ -1498,6 +2327,8 @@ def _state(model, hidden_states: torch.Tensor):
             st["fp32_divmode"] = -1
         if CUDA_V7:
             qualify_sf_v7(hidden_states.device, cap, dt, st["fp32_divmode"])
+        if TEMP_V16:
+            qualify_sf_temp_v16(hidden_states.device)
         dummy = torch.zeros((2, V), dtype=dt, device=hidden_states.device)
         p = sf_local_pairs(dummy, valid, rank * V, cap, split, st["fuse"], fp32_divmode=st["fp32_divmode"])
         eff_sp_dum = max(1, int(p.shape[0]) // 2)
@@ -1734,6 +2565,8 @@ def _head_local(model, st, lp, head, hidden_states: torch.Tensor):
         cert = cs.ch.certified_local(cs, hidden_states, num_tokens=_S.get("num_tokens", 0))
     except TypeError:
         cert = cs.ch.certified_local(cs, hidden_states)
+    if cert is None:
+        return lp._apply_head(head, hidden_states, None)
     if CERT == "check":
         stock = lp._apply_head(head, hidden_states, None)
         pc = sf_local_pairs(cert, st["valid"], st["vstart"], st["cap"], st["split"], st["fuse"])
@@ -1819,8 +2652,69 @@ def _audit(model, st, local: torch.Tensor, hidden_states: torch.Tensor):
 
 def target_logits(model, hidden_states: torch.Tensor):
     """Hook for Inkling2ForCausalLM.compute_logits. None -> the caller runs the stock path."""
+    global _NLIVE_HAS_NT
     if MODE == "off":
         return None
+    _s = _S
+    # Wave-V16: temp > 0 and mixed batches hand off straight to exact full-vocab BF16/FP32 logits
+    # (skipping greedy-only CertHead screening) and execute zero-sync GPU rejection sampling in
+    # RejectionSampler / Sampler! Pure temp == 0.0 stays 100.000% on the untouched greedy path below.
+    if _s.get("temp_mode") in ("temp", "mixed"):
+        return None
+    if FAST_V14 and MODE == "argmax" and not AGREE and DIRECT and _s["installed"]:
+        armed = _s["armed"]
+        if armed and not _s.get("force") and not torch.cuda.is_current_stream_capturing():
+            try:
+                st = model._inkling_sf
+                if st and isinstance(hidden_states, torch.Tensor) and hidden_states.dim() == 2 and hidden_states.dtype is torch.bfloat16:
+                    M = hidden_states.shape[0]
+                    is_k0 = _s["armed_k0"]
+                    if 2 <= M <= MAX_M and (_s.get("sp_hooked") if is_k0 else _s.get("rs_hooked")):
+                        cs = st.get("cs")
+                        if cs is not None and not cs.disabled:
+                            cs_cu = cs.cuda_state
+                            if cs_cu is not None and cs_cu.is_v7 and cs_cu._c32_state is None and M <= cs_cu.max_m:
+                                h_dev = hidden_states.device
+                                if _NLIVE_HAS_NT is True:
+                                    nlive = cs.ch._nlive_for(M, h_dev, num_tokens=_s["num_tokens"])
+                                elif _NLIVE_HAS_NT is False:
+                                    nlive = cs.ch._nlive_for(M, h_dev)
+                                else:
+                                    try:
+                                        nlive = cs.ch._nlive_for(M, h_dev, num_tokens=_s["num_tokens"])
+                                        _NLIVE_HAS_NT = True
+                                    except TypeError:
+                                        nlive = cs.ch._nlive_for(M, h_dev)
+                                        _NLIVE_HAS_NT = False
+                                pair = cs_cu.local_pairs(hidden_states, nlive=nlive)
+                                if pair is not None:
+                                    tp_ag = _CACHED_TP_AG if _CACHED_TP_AG is not None else _fast_tp_all_gather()
+                                    calls = _s.get("calls", 0) + 1
+                                    _s["calls"] = calls
+                                    _s["armed_calls"] = _s.get("armed_calls", 0) + 1
+                                    if calls % 20000 == 0:
+                                        try:
+                                            _r0 = _tp()[0]
+                                        except Exception:
+                                            _r0 = 0
+                                        if _r0 == 0:
+                                            logger.info("INKLING_SYNC_FREE: %d head calls, %d armed", calls, _s["armed_calls"])
+                                    if not is_k0 and M <= 16 and (not _CACHED_L2PF_PROBED or _CACHED_L2PF_FORK_CB is not None):
+                                        _fast_l2pf_fork_cb("draft_l0")
+                                    gathered = tp_ag(pair, dim=0)
+                                    if (FUSE_REJECT and not is_k0) or (is_k0 and _sf_v7_ok(h_dev)):
+                                        _s["gathered"] = (gathered.contiguous(), M, st["tp"], 1)
+                                        _s["tok"] = None
+                                    else:
+                                        _s["tok"] = sf_tok_only(gathered.contiguous(), M, st["tp"], split=1, pdl=True)
+                                        _s["gathered"] = None
+                                    if not _s.get("logged"):
+                                        _s["logged"] = True
+                                        logger.info("INKLING_SYNC_FREE: first armed CUDA cert_head step (M=%d, k0=%d, fuse_reject=%d): 16 B/row (SPLIT=1) AG + direct greedy",
+                                                    M, int(is_k0), int(FUSE_REJECT and not is_k0))
+                                    return _fast_dummy_logits(M, st["dt"], h_dev)
+            except (AttributeError, KeyError):
+                pass
     if not _S["installed"]:
         _S["installed"] = True
         _install_runner_hook()
@@ -1847,7 +2741,10 @@ def target_logits(model, hidden_states: torch.Tensor):
     direct_ok = _S.get("sp_hooked") if is_k0 else _S.get("rs_hooked")
     cs = st.get("cs")
     cs_cu = getattr(cs, "cuda_state", None) if (cs is not None and not cs.disabled) else None
-    _cu_max_m = cs_cu.active_max_m() if (cs_cu is not None and hasattr(cs_cu, "active_max_m")) else 16
+    if FAST_V14 and cs_cu is not None and getattr(cs_cu, "_c32_state", None) is None and hasattr(cs_cu, "max_m"):
+        _cu_max_m = cs_cu.max_m
+    else:
+        _cu_max_m = cs_cu.active_max_m() if (cs_cu is not None and hasattr(cs_cu, "active_max_m")) else 16
     if (
         cs_cu is not None
         and DIRECT
@@ -1859,23 +2756,39 @@ def target_logits(model, hidden_states: torch.Tensor):
     ):
         nlive = None
         if M <= _cu_max_m:
-            try:
-                nlive = cs.ch._nlive_for(M, hidden_states.device, num_tokens=_S.get("num_tokens", 0))
-            except TypeError:
-                nlive = cs.ch._nlive_for(M, hidden_states.device)
+            if FAST_V14:
+                if _NLIVE_HAS_NT is None:
+                    try:
+                        nlive = cs.ch._nlive_for(M, hidden_states.device, num_tokens=_S.get("num_tokens", 0))
+                        _NLIVE_HAS_NT = True
+                    except TypeError:
+                        nlive = cs.ch._nlive_for(M, hidden_states.device)
+                        _NLIVE_HAS_NT = False
+                elif _NLIVE_HAS_NT:
+                    nlive = cs.ch._nlive_for(M, hidden_states.device, num_tokens=_S.get("num_tokens", 0))
+                else:
+                    nlive = cs.ch._nlive_for(M, hidden_states.device)
+            else:
+                try:
+                    nlive = cs.ch._nlive_for(M, hidden_states.device, num_tokens=_S.get("num_tokens", 0))
+                except TypeError:
+                    nlive = cs.ch._nlive_for(M, hidden_states.device)
         if getattr(cs_cu, "is_v7", False):
             pair = cs_cu.local_pairs(hidden_states, nlive=nlive)
         else:
             from . import cert_head_cuda as chc
             pair = chc.certified_local_pairs(cs_cu, hidden_states, nlive=nlive)
         if pair is not None:
-            if FAST_V11:
-                tp_ag = _fast_tp_all_gather()
+            if FAST_V11 or FAST_V14:
+                tp_ag = _CACHED_TP_AG if _CACHED_TP_AG is not None else _fast_tp_all_gather()
             else:
                 from vllm.distributed import tensor_model_parallel_all_gather as tp_ag
             _stats_tick(True)
             if not is_k0 and M <= 16:
-                if FAST_V11:
+                if FAST_V14:
+                    if not _CACHED_L2PF_PROBED or _CACHED_L2PF_FORK_CB is not None:
+                        _fast_l2pf_fork_cb("draft_l0")
+                elif FAST_V11:
                     _fast_l2pf_fork_cb("draft_l0")
                 else:
                     try:
@@ -1897,7 +2810,7 @@ def target_logits(model, hidden_states: torch.Tensor):
                 logger.info("INKLING_SYNC_FREE: first armed CUDA cert_head step (M=%d, k0=%d, fuse_reject=%d): 16 B/row (SPLIT=1) AG + direct greedy",
                             M, int(is_k0), int(FUSE_REJECT and not is_k0))
             dt_out = st.get("dt", torch.bfloat16)
-            if FAST_V11:
+            if FAST_V11 or FAST_V14:
                 return _fast_dummy_logits(M, dt_out, hidden_states.device)
             return torch.empty((M, 1), dtype=dt_out, device=hidden_states.device)
     local = _head_local(model, st, lp, head, hidden_states)
@@ -1908,8 +2821,8 @@ def target_logits(model, hidden_states: torch.Tensor):
         return _audit(model, st, local, hidden_states)
     direct_ok = _S.get("sp_hooked") if is_k0 else _S.get("rs_hooked")
     if DIRECT and direct_ok and armed and not _S.get("force"):
-        if FAST_V11:
-            tp_ag = _fast_tp_all_gather()
+        if FAST_V11 or FAST_V14:
+            tp_ag = _CACHED_TP_AG if _CACHED_TP_AG is not None else _fast_tp_all_gather()
         else:
             from vllm.distributed import tensor_model_parallel_all_gather as tp_ag
         M_l = int(local.shape[0])
@@ -1919,7 +2832,10 @@ def target_logits(model, hidden_states: torch.Tensor):
         )
         eff_split = max(1, int(pair.shape[0]) // M_l)
         if not is_k0 and M_l <= 16:
-            if FAST_V11:
+            if FAST_V14:
+                if not _CACHED_L2PF_PROBED or _CACHED_L2PF_FORK_CB is not None:
+                    _fast_l2pf_fork_cb("draft_l0")
+            elif FAST_V11:
                 _fast_l2pf_fork_cb("draft_l0")
             else:
                 try:
@@ -1941,7 +2857,7 @@ def target_logits(model, hidden_states: torch.Tensor):
             logger.info("INKLING_SYNC_FREE: first armed direct step (M=%d, k0=%d, fuse_reject=%d): %d B/row all-gather + direct greedy %s (no [M,V] one-hot)",
                         M_l, int(is_k0), int(FUSE_REJECT and not is_k0), 16 * eff_split, "sample" if is_k0 else "reject")
         dt_out = st.get("dt", torch.bfloat16)
-        if FAST_V11:
+        if FAST_V11 or FAST_V14:
             return _fast_dummy_logits(M_l, dt_out, local.device)
         return torch.empty((M_l, 1), dtype=dt_out, device=local.device)
     out, _tok = compact_logits(lp, head, st, local)

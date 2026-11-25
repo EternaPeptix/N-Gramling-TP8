@@ -1,0 +1,430 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource scraping v16_metrics_exporter.py (:9108/metrics)",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "enable": true,
+        "expr": "changes(inkling_v16_crash_recovery_restarts_window[1m]) > 0",
+        "iconColor": "rgba(255, 96, 96, 1)",
+        "name": "Crash Recovery Events",
+        "titleFormat": "Watchdog Recovery"
+      }
+    ]
+  },
+  "description": "Wave-V16 24/7 Production Observability for 8x NVIDIA DGX Spark (GB10 TP8) serving 594B Inkling-2-Small",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "1. Cluster Overview, Throughput & Speculative Acceptance Length (AL)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "color": "red", "text": "DOWN" }, "1": { "color": "green", "text": "UP" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "inkling_v16_vllm_up", "legendFormat": "vLLM API", "refId": "A" }],
+      "title": "vLLM API Status",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 8 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 2,
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "sum(inkling_v16_node_up)", "legendFormat": "Nodes Up", "refId": "A" }],
+      "title": "Healthy Sparks (of 8)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }, { "color": "green", "value": 4.0 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "inkling_v16_spec_accept_len", "legendFormat": "Mean AL", "refId": "A" }],
+      "title": "Speculative Accept Length (AL)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "inkling_v16_requests_running", "legendFormat": "Running", "refId": "A" },
+        { "expr": "inkling_v16_requests_waiting", "legendFormat": "Waiting", "refId": "B" }
+      ],
+      "title": "In-Flight Requests",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5.0 }, { "color": "red", "value": 15.0 }] },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "id": 5,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "inkling_v16_canary_latency_seconds", "legendFormat": "Canary", "refId": "A" }],
+      "title": "Canary Probe Latency",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "id": 6,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "inkling_v16_kv_audit_anomalies_total", "legendFormat": "Anomalies", "refId": "A" }],
+      "title": "KV Audit Anomalies",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "id": 7,
+      "targets": [
+        { "expr": "rate(inkling_v16_throughput_gen_tokens_total[1m])", "legendFormat": "Decode tok/s", "refId": "A" },
+        { "expr": "rate(inkling_v16_throughput_prompt_tokens_total[1m])", "legendFormat": "Prefill tok/s", "refId": "B" }
+      ],
+      "title": "Token Throughput (Decode & Prefill tok/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "id": 8,
+      "targets": [
+        { "expr": "inkling_v16_spec_accept_len", "legendFormat": "Speculative Mean AL", "refId": "A" },
+        { "expr": "inkling_v16_requests_running", "legendFormat": "Requests Running", "refId": "B" },
+        { "expr": "inkling_v16_requests_waiting", "legendFormat": "Requests Waiting", "refId": "C" }
+      ],
+      "title": "Speculative Acceptance Length (AL) & Concurrency",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "id": 200,
+      "title": "2. 8-Node GB10 UMA Memory, Buddy Order-13 Contiguous Pools & Swap",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 5 }, { "color": "green", "value": 7 }] },
+          "unit": "gibibytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
+      "id": 9,
+      "targets": [{ "expr": "inkling_v16_node_uma_avail_gib{rank=~\"$rank\"}", "legendFormat": "r{{rank}} ({{host}})", "refId": "A" }],
+      "title": "8-Node UMA MemAvailable (GiB)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 256 }, { "color": "red", "value": 1024 }] },
+          "unit": "mebibytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
+      "id": 10,
+      "targets": [{ "expr": "inkling_v16_node_swap_mib{rank=~\"$rank\"}", "legendFormat": "r{{rank}} ({{host}})", "refId": "A" }],
+      "title": "8-Node Swap Used (MiB — Alert > 256 MiB)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 1500 }, { "color": "green", "value": 2500 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "id": 11,
+      "targets": [{ "expr": "inkling_v16_node_buddy_order13{rank=~\"$rank\"}", "legendFormat": "r{{rank}} ({{host}})", "refId": "A" }],
+      "title": "8-Node Buddy Order-13 Contiguous 32 MiB Blocks",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "id": 300,
+      "title": "3. RoCEv2 4-HCA Fabric & GB10 GPU Thermals / Power / Xids",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "max": 4,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 4 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 23 },
+      "id": 12,
+      "targets": [{ "expr": "inkling_v16_node_roce_active_hcas{rank=~\"$rank\"}", "legendFormat": "r{{rank}} ({{host}})", "refId": "A" }],
+      "title": "Active RoCEv2 ConnectX-7 HCAs (Target 4/4)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 80 }, { "color": "red", "value": 85 }] },
+          "unit": "celsius"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 6, "x": 6, "y": 23 },
+      "id": 13,
+      "targets": [{ "expr": "inkling_v16_node_gpu_temp_c{rank=~\"$rank\"}", "legendFormat": "r{{rank}} ({{host}})", "refId": "A" }],
+      "title": "8-Node GB10 GPU Temperature (C)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "watt" },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 23 },
+      "id": 14,
+      "targets": [{ "expr": "inkling_v16_node_gpu_power_w{rank=~\"$rank\"}", "legendFormat": "r{{rank}} ({{host}})", "refId": "A" }],
+      "title": "8-Node GB10 GPU Power Draw (W)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 23 },
+      "id": 15,
+      "targets": [{ "expr": "inkling_v16_node_xid_count{rank=~\"$rank\"}", "legendFormat": "r{{rank}} ({{host}})", "refId": "A" }],
+      "title": "Fatal NVIDIA Xid Count (Target 0)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
+      "id": 400,
+      "title": "4. Hybrid 14-Group KV Cache Pool, Prefix Hits & Evictions",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "max": 1, "min": 0, "unit": "percentunit" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 31 },
+      "id": 16,
+      "targets": [
+        { "expr": "inkling_v16_kv_utilization_ratio", "legendFormat": "Total Pool Util", "refId": "A" },
+        { "expr": "inkling_v16_kv_group_utilization_ratio", "legendFormat": "Group {{group}}", "refId": "B" }
+      ],
+      "title": "KV Pool & Hybrid SWA/Global/SConv/Drafter Utilization",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "max": 1, "min": 0, "unit": "percentunit" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 31 },
+      "id": 17,
+      "targets": [{ "expr": "inkling_v16_kv_prefix_hit_ratio", "legendFormat": "Prefix Hit Ratio", "refId": "A" }],
+      "title": "Prefix Cache Hit Ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 31 },
+      "id": 18,
+      "targets": [
+        { "expr": "increase(inkling_v16_kv_evictions_total[5m])", "legendFormat": "Evictions (5m)", "refId": "A" },
+        { "expr": "inkling_v16_kv_evictions_total", "legendFormat": "Cumulative Evictions", "refId": "B" }
+      ],
+      "title": "KV Cache Evictions & Churn",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "id": 500,
+      "title": "5. Crash-Recovery Events, Watchdog State & Worker Process Health",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 40 },
+      "id": 19,
+      "targets": [
+        { "expr": "inkling_v16_crash_recovery_restarts_window", "legendFormat": "Restarts in 15m Window", "refId": "A" },
+        { "expr": "inkling_v16_watchdog_circuit_open", "legendFormat": "Circuit Breaker Open", "refId": "B" },
+        { "expr": "inkling_v16_watchdog_using_fallback", "legendFormat": "Fallback Profile Active", "refId": "C" },
+        { "expr": "increase(inkling_v16_preemptions_total[5m])", "legendFormat": "Preemptions (5m)", "refId": "D" }
+      ],
+      "title": "Crash-Recovery Events, Circuit Breaker & Preemptions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "mebibytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 40 },
+      "id": 20,
+      "targets": [
+        { "expr": "inkling_v16_node_rss_mib{rank=~\"$rank\"}", "legendFormat": "r{{rank}} RSS MiB", "refId": "A" }
+      ],
+      "title": "8-Node Worker RSS Memory Footprint (MiB)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["inkling-2-small", "dgx-spark", "gb10", "tp8", "wave-v16"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(inkling_v16_node_up, rank)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Rank",
+        "multi": true,
+        "name": "rank",
+        "query": { "query": "label_values(inkling_v16_node_up, rank)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-3h", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "Inkling-2-Small TP8 Wave-V16 — 8x DGX Spark 24/7 Production Telemetry",
+  "uid": "inkling-v16-tp8-ops",
+  "version": 1
+}

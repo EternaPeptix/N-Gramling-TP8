@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import json
 import os
+import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
@@ -25,10 +28,46 @@ from vllm.v1.core.kv_cache_utils import (
 _FAST_SPARSE_SW_BLOCKS = os.environ.get("INKLING_FAST_SPARSE_SW_BLOCKS", "0").strip().lower() in (
     "1", "on", "true", "yes",
 )
+_KV_AUDIT_V15 = os.environ.get("INKLING_KV_AUDIT_V15", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_KV_AUDIT_V15_INTERVAL = max(
+    1, int(os.environ.get("INKLING_KV_AUDIT_V15_INTERVAL", "1000") or "1000")
+)
+_TELEMETRY_V16 = os.environ.get("INKLING_TELEMETRY_V16", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_TELEMETRY_V16_INTERVAL_S = max(
+    0.1, float(os.environ.get("INKLING_TELEMETRY_V16_INTERVAL_S", "5.0") or "5.0")
+)
 
 
-def _fast_group_block_ids(group: Sequence[KVCacheBlock]) -> list[int]:
+def _is_cuda_graph_capturing_v16() -> bool:
+    """Capture guard without triggering a lazy torch import."""
+    mod = sys.modules.get("torch")
+    if mod is None:
+        return False
+    try:
+        cuda = getattr(mod, "cuda", None)
+        if cuda is not None and cuda.is_available():
+            return bool(cuda.is_current_stream_capturing())
+    except Exception:
+        pass
+    return False
+
+
+def _fast_group_block_ids(
+    group: Sequence[KVCacheBlock], nhl_hint: int = 0
+) -> list[int]:
     n = len(group)
+    if n == 0:
+        return []
+    if nhl_hint > 0 and group[0].is_null:
+        nhl = min(nhl_hint, n)
+        res = [group[0].block_id] * n
+        for j in range(nhl, n):
+            res[j] = group[j].block_id
+        return res
     if _FAST_SPARSE_SW_BLOCKS and n >= 256:
         nhl = null_head_len(group)
         if nhl > 0:
@@ -250,7 +289,52 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        # Opt-in low-overhead V15 KV invariant & telemetry hook (default OFF).
+        self._kv_audit_enabled: bool = _KV_AUDIT_V15
+        self._kv_audit_interval: int = _KV_AUDIT_V15_INTERVAL
+        self._kv_audit_stats: dict[str, int] = {
+            "requests_allocated": 0,
+            "requests_freed": 0,
+            "allocate_failures": 0,
+            "allocate_rollbacks": 0,
+            "prefix_lookups": 0,
+            "prefix_hit_tokens": 0,
+            "prefix_query_tokens": 0,
+            "prefix_full_misses": 0,
+            "blocks_allocated": 0,
+            "blocks_freed": 0,
+            "blocks_skipped_freed": 0,
+            "eviction_events": 0,
+            "anomalies_detected": 0,
+            "anomalies_healed": 0,
+            "full_audits_run": 0,
+        }
         import os
+
+        # Opt-in zero-hot-path-overhead Wave-V16 atomic /dev/shm telemetry hook (default OFF).
+        self._telemetry_v16_enabled: bool = _TELEMETRY_V16 or (
+            os.environ.get("INKLING_TELEMETRY_V16", "0").strip().lower()
+            in ("1", "on", "true", "yes")
+        )
+        self._telemetry_v16_interval_s: float = max(
+            0.1,
+            float(
+                os.environ.get(
+                    "INKLING_TELEMETRY_V16_INTERVAL_S",
+                    str(_TELEMETRY_V16_INTERVAL_S),
+                )
+                or "5.0"
+            ),
+        )
+        self._telemetry_v16_last_ts: float = 0.0
+        self._telemetry_v16_evictions_total: int = 0
+        self._telemetry_v16_prefix_lookups: int = 0
+        self._telemetry_v16_prefix_query_tokens: int = 0
+        self._telemetry_v16_prefix_hit_tokens: int = 0
+        self._telemetry_v16_group_roles: tuple[str, ...] = ()
+        if self._telemetry_v16_enabled:
+            self._telemetry_v16_group_roles = self._classify_kv_group_roles()
+            self._register_telemetry_v16_provider()
 
         if os.environ.get("INKLING_PIN_ENGINE_API", "0").strip().lower() in (
             "1",
@@ -306,7 +390,7 @@ class KVCacheManager:
             The number of cached tokens, or 0 if lookup is disabled.
 
         """
-        if not self.prefix_cache_lookup_enabled(request):
+        if not self.prefix_cache_lookup_enabled(request) or request.num_tokens <= 1:
             return 0
         # Mirrors `get_computed_blocks`: the last token is always recomputed.
         _, num_computed_tokens, _ = self.coordinator.find_longest_cache_hit(
@@ -361,12 +445,25 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
+        max_cache_hit_length = max(
+            0, request.get_max_cache_hit_length(max_cache_hit_length)
+        )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if self._kv_audit_enabled:
+            st = self._kv_audit_stats
+            st["prefix_lookups"] += 1
+            st["prefix_query_tokens"] += max_cache_hit_length
+            st["prefix_hit_tokens"] += num_new_computed_tokens
+            if num_new_computed_tokens == 0 and max_cache_hit_length > 0:
+                st["prefix_full_misses"] += 1
+        if self._telemetry_v16_enabled:
+            self._telemetry_v16_prefix_lookups += 1
+            self._telemetry_v16_prefix_query_tokens += max_cache_hit_length
+            self._telemetry_v16_prefix_hit_tokens += num_new_computed_tokens
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -542,6 +639,19 @@ class KVCacheManager:
         # tokens: an async KV load, or a chunk that ends inside the replayed
         # range of a hit (SWA bounded replay).
         if (
+            num_new_tokens < 0
+            or num_lookahead_tokens < 0
+            or num_new_computed_tokens < 0
+            or num_external_computed_tokens < 0
+        ):
+            raise ValueError(
+                "Token counts passed to allocate_slots must be non-negative: "
+                f"num_new_tokens={num_new_tokens}, "
+                f"num_lookahead_tokens={num_lookahead_tokens}, "
+                f"num_new_computed_tokens={num_new_computed_tokens}, "
+                f"num_external_computed_tokens={num_external_computed_tokens}"
+            )
+        if (
             num_new_tokens == 0
             and num_external_computed_tokens == 0
             and num_new_computed_tokens == 0
@@ -575,6 +685,9 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        effective_external_computed_tokens = max(
+            0, total_computed_tokens - num_local_computed_tokens
+        )
 
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
@@ -606,10 +719,14 @@ class KVCacheManager:
                 request=request,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if required_blocks > self.block_pool.get_num_free_blocks() - reserved_blocks:
+                if self._kv_audit_enabled:
+                    self._kv_audit_stats["allocate_failures"] += 1
                 return None
 
-        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        num_tokens_main_model = min(
+            total_computed_tokens + num_new_tokens, self.max_model_len
+        )
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
@@ -630,19 +747,27 @@ class KVCacheManager:
         if not delay_cache_blocks:
             self._cache_settled_tokens_before_evict(request)
 
+        free_before_skip = (
+            self.block_pool.get_num_free_blocks() if self._kv_audit_enabled else 0
+        )
         self.coordinator.remove_skipped_blocks(
             request.request_id,
             max(0, total_computed_tokens - request.num_in_flight_tokens),
             num_prompt_tokens=request.num_prompt_tokens,
         )
+        if self._kv_audit_enabled:
+            free_after_skip = self.block_pool.get_num_free_blocks()
+            if free_after_skip > free_before_skip:
+                self._kv_audit_stats["blocks_skipped_freed"] += (
+                    free_after_skip - free_before_skip
+                )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=num_local_computed_tokens
-            + num_external_computed_tokens,
+            total_computed_tokens=total_computed_tokens,
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
             prefill_end=prefill_end,
@@ -655,29 +780,64 @@ class KVCacheManager:
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            if self._kv_audit_enabled:
+                self._kv_audit_stats["allocate_failures"] += 1
             return None
 
-        if (
-            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or num_external_computed_tokens > 0
-        ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.allocate_new_computed_blocks(
-                request_id=request.request_id,
-                new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=num_external_computed_tokens,
-                skip_zeroing_group_ids=skip_zeroing_group_ids,
-            )
-
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-            request=request,
+        free_before_alloc = (
+            self.block_pool.get_num_free_blocks() if self._kv_audit_enabled else 0
         )
+        _track_cached_v16 = self._kv_audit_enabled or self._telemetry_v16_enabled
+        cached_before_alloc = (
+            self._audit_cached_entry_count() if _track_cached_v16 else -1
+        )
+        alloc_snap = self.coordinator.snapshot_request_allocation(request.request_id)
+        try:
+            if (
+                new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+                or effective_external_computed_tokens > 0
+            ):
+                # Append the new computed blocks to the request blocks until now to
+                # avoid the case where the new blocks cannot be allocated.
+                self.coordinator.allocate_new_computed_blocks(
+                    request_id=request.request_id,
+                    new_computed_blocks=new_computed_block_list,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=effective_external_computed_tokens,
+                    skip_zeroing_group_ids=skip_zeroing_group_ids,
+                )
+
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
+                request=request,
+            )
+        except BaseException:
+            self.coordinator.rollback_request_allocation(
+                request.request_id, alloc_snap
+            )
+            if self._kv_audit_enabled:
+                self._kv_audit_stats["allocate_rollbacks"] += 1
+                self._audit_inline_check()
+            raise
+
+        if _track_cached_v16 and cached_before_alloc >= 0:
+            cached_after_alloc = self._audit_cached_entry_count()
+            if cached_after_alloc >= 0 and cached_before_alloc > cached_after_alloc:
+                evicted_now = cached_before_alloc - cached_after_alloc
+                if self._kv_audit_enabled:
+                    self._kv_audit_stats["eviction_events"] += evicted_now
+                if self._telemetry_v16_enabled:
+                    self._telemetry_v16_evictions_total += evicted_now
+        if self._kv_audit_enabled:
+            st = self._kv_audit_stats
+            st["requests_allocated"] += 1
+            free_after_alloc = self.block_pool.get_num_free_blocks()
+            if free_before_alloc > free_after_alloc:
+                st["blocks_allocated"] += free_before_alloc - free_after_alloc
+            self._audit_inline_check()
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -704,7 +864,12 @@ class KVCacheManager:
         if not self.enable_caching or request.num_computed_tokens <= 0:
             return
         managers = self.coordinator.single_type_managers
-        if not managers or request.request_id not in managers[0].req_to_blocks:
+        if not managers:
+            return
+        rid = request.request_id
+        if rid not in managers[0].req_to_blocks and not any(
+            rid in m.req_to_blocks for m in managers[1:]
+        ):
             return
         settled_tokens = min(
             max(0, request.num_computed_tokens - request.num_in_flight_tokens),
@@ -723,7 +888,21 @@ class KVCacheManager:
 
         """
         self._cache_settled_tokens_before_evict(request)
+        free_before = (
+            self.block_pool.get_num_free_blocks() if self._kv_audit_enabled else 0
+        )
         self.coordinator.free(request.request_id)
+        if self._kv_audit_enabled:
+            st = self._kv_audit_stats
+            st["requests_freed"] += 1
+            free_after = self.block_pool.get_num_free_blocks()
+            if free_after > free_before:
+                st["blocks_freed"] += free_after - free_before
+            self._audit_inline_check()
+            if st["requests_freed"] % self._kv_audit_interval == 0:
+                self.run_kv_audit(full=True, self_heal=True)
+        if self._telemetry_v16_enabled:
+            self.maybe_emit_telemetry_v16()
 
     def remove_skipped_blocks(
         self,
@@ -758,7 +937,15 @@ class KVCacheManager:
 
         """
         self._cache_settled_tokens_before_evict(request)
-        return self.coordinator.pop_blocks_for_free(request.request_id)
+        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
+        if self._kv_audit_enabled:
+            st = self._kv_audit_stats
+            st["requests_freed"] += 1
+            st["blocks_freed"] += len(blocks)
+            self._audit_inline_check()
+            if st["requests_freed"] % self._kv_audit_interval == 0:
+                self.run_kv_audit(full=True, self_heal=True)
+        return blocks
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
@@ -767,6 +954,8 @@ class KVCacheManager:
             block_ids: Set of block IDs to evict from cache.
 
         """
+        if self._telemetry_v16_enabled and block_ids:
+            self._telemetry_v16_evictions_total += len(block_ids)
         self.block_pool.evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
@@ -819,6 +1008,15 @@ class KVCacheManager:
 
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
+        managers = self.coordinator.single_type_managers
+        if _FAST_SPARSE_SW_BLOCKS:
+            return tuple(
+                _fast_group_block_ids(
+                    mgr.req_to_blocks.get(request_id) or (),
+                    nhl_hint=mgr._null_head_idx.get(request_id, 0),
+                )
+                for mgr in managers
+            )
         return self.get_blocks(request_id).get_block_ids()
 
     def get_block_ids_for_computed_tokens(
@@ -844,9 +1042,10 @@ class KVCacheManager:
     def estimate_cached_tokens(self, request: Request) -> int:
         """Estimate the number of tokens cached by the request."""
         cached_tokens: int | None = None
-        for group, blocks in zip(
+        rid = request.request_id
+        for group, mgr in zip(
             self.kv_cache_config.kv_cache_groups,
-            self.get_blocks(request.request_id).blocks,
+            self.coordinator.single_type_managers,
         ):
             if not group.kv_cache_spec.prefix_cacheable:
                 continue
@@ -857,11 +1056,16 @@ class KVCacheManager:
                 # Cross-attention and encoder-only groups are not prefix cached.
                 continue
 
+            blocks = mgr.req_to_blocks.get(rid) or ()
             # Coverage grows along the block table: the last hashed block has the most.
+            # Stop at the tracked leading-null prefix to avoid O(262K) scans at 1M.
+            nhl = mgr._null_head_idx.get(rid, 0)
+            hi = min(len(blocks), mgr.num_cached_block.get(rid, len(blocks)))
             group_cached_tokens = 0
-            for block in reversed(blocks):
-                if block.block_hash_num_tokens:
-                    group_cached_tokens = block.block_hash_num_tokens
+            for idx in range(hi - 1, nhl - 1, -1):
+                blk = blocks[idx]
+                if blk.block_hash_num_tokens:
+                    group_cached_tokens = blk.block_hash_num_tokens
                     break
 
             cached_tokens = (
@@ -941,7 +1145,9 @@ class KVCacheManager:
             if mgr.records_new_block_ids:
                 assert start_token % mgr.block_size == 0
                 start_idx = start_token // mgr.block_size
-                blocks = mgr.req_to_blocks[request_id]
+                blocks = mgr.req_to_blocks.get(request_id)
+                if not blocks:
+                    continue
                 mgr.new_block_ids.extend(
                     blk.block_id
                     for blk in blocks[start_idx:]
@@ -1017,3 +1223,482 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()
+        if self._telemetry_v16_enabled:
+            self.maybe_emit_telemetry_v16()
+
+    # ------------------------------------------------------------------
+    # Wave-V15 opt-in low-overhead KV invariant & leak telemetry hook
+    # (`INKLING_KV_AUDIT_V15=1`, default OFF -> 0 hot-path overhead).
+    # ------------------------------------------------------------------
+
+    def _audit_cached_entry_count(self) -> int:
+        """O(1) count of cached hash entries on block_pool, or -1 if unavailable."""
+        cmap = getattr(self.block_pool, "cached_block_hash_to_block", None)
+        if cmap is None:
+            return -1
+        if isinstance(cmap, dict):
+            return len(cmap)
+        inner = getattr(cmap, "_cached_blocks", None)
+        if isinstance(inner, dict):
+            return len(inner)
+        try:
+            return len(cmap)
+        except TypeError:
+            return -1
+
+    def _audit_inline_check(self) -> list[str]:
+        """O(1) inline integrity check on null_block, discard_block, and free count."""
+        anomalies: list[str] = []
+        pool = self.block_pool
+        null_blk = pool.null_block
+        if null_blk.ref_cnt != 0:
+            anomalies.append(
+                f"null_block ref_cnt mutated to {null_blk.ref_cnt}; self-healing to 0"
+            )
+            null_blk.ref_cnt = 0
+            self._kv_audit_stats["anomalies_healed"] += 1
+        if null_blk.block_hash is not None or null_blk.block_hash_num_tokens is not None:
+            anomalies.append("null_block received a block_hash; self-healing")
+            null_blk.reset_hash()
+            self._kv_audit_stats["anomalies_healed"] += 1
+        if null_blk.prev_free_block is not None or null_blk.next_free_block is not None:
+            anomalies.append("null_block linked into free_block_queue")
+
+        discard_blk = getattr(pool, "_sparse_discard_block", None)
+        discard_users = getattr(pool, "_sparse_discard_users", None)
+        if discard_blk is not None:
+            if not discard_users:
+                anomalies.append(
+                    f"orphan _sparse_discard_block {discard_blk.block_id} with 0 users; self-healing"
+                )
+                discard_blk.is_discard = False
+                pool._sparse_discard_block = None  # type: ignore[attr-defined]
+                if discard_blk.ref_cnt > 0:
+                    pool.free_blocks([discard_blk])
+                self._kv_audit_stats["anomalies_healed"] += 1
+            elif discard_blk.ref_cnt != 1 or discard_blk.block_hash is not None:
+                anomalies.append(
+                    f"_sparse_discard_block {discard_blk.block_id} invalid state: "
+                    f"ref_cnt={discard_blk.ref_cnt}, hash={discard_blk.block_hash!r}"
+                )
+
+        usable = max(0, pool.num_gpu_blocks - 1)
+        num_free = pool.get_num_free_blocks()
+        if num_free < 0 or num_free > usable:
+            anomalies.append(
+                f"num_free_blocks={num_free} out of bounds [0, {usable}]"
+            )
+        if anomalies:
+            self._kv_audit_stats["anomalies_detected"] += len(anomalies)
+            logger.error("INKLING_KV_AUDIT_V15 inline anomaly: %s", "; ".join(anomalies))
+        return anomalies
+
+    def get_kv_audit_stats(self) -> dict[str, int | float]:
+        """Return a snapshot of KV audit counters and derived rates."""
+        st = dict(self._kv_audit_stats)
+        pool = self.block_pool
+        total_usable = max(0, pool.num_gpu_blocks - 1)
+        num_free = pool.get_num_free_blocks()
+        st["total_usable_blocks"] = total_usable
+        st["free_blocks"] = num_free
+        st["active_blocks"] = max(0, total_usable - num_free)
+        q_tok = st["prefix_query_tokens"]
+        st["prefix_hit_rate"] = (
+            st["prefix_hit_tokens"] / q_tok if q_tok > 0 else 0.0
+        )
+        allocs = st["blocks_allocated"]
+        st["eviction_rate"] = (
+            st["eviction_events"] / allocs if allocs > 0 else 0.0
+        )
+        return st
+
+    def run_kv_audit(
+        self,
+        *,
+        full: bool = True,
+        self_heal: bool = True,
+        check_quiescent: bool = False,
+    ) -> dict[str, object]:
+        """Verify block conservation (`free_uncached + free_cached + active == total_usable`),
+        free-queue linked-list integrity, refcount bounds, and sparse-manager parity.
+
+        When `self_heal=True`, safely repairs null_block refcount drift, orphan
+        discard blocks, and unlinked `ref_cnt == 0` leaked blocks.
+        """
+        anomalies = list(self._audit_inline_check())
+        inline_anomaly_count = len(anomalies)
+        pool = self.block_pool
+        total_usable = max(0, pool.num_gpu_blocks - 1)
+        report: dict[str, object] = {
+            "ok": True,
+            "total_usable": total_usable,
+            "free_uncached": 0,
+            "free_cached": 0,
+            "active": 0,
+            "anomalies": anomalies,
+            "stats": self.get_kv_audit_stats(),
+        }
+        if not full:
+            report["ok"] = len(anomalies) == 0
+            return report
+
+        self._kv_audit_stats["full_audits_run"] += 1
+        free_q = getattr(pool, "free_block_queue", None)
+        all_blocks: Sequence[KVCacheBlock] | None = getattr(pool, "blocks", None)
+
+        free_ids: set[int] = set()
+        if free_q is not None:
+            curr = free_q.fake_free_list_head.next_free_block
+            tail = free_q.fake_free_list_tail
+            walked = 0
+            while curr is not None and curr is not tail:
+                if curr.block_id in free_ids:
+                    anomalies.append(
+                        f"free_block_queue cycle detected at block_id={curr.block_id}"
+                    )
+                    break
+                if curr.is_null:
+                    anomalies.append("null_block found inside free_block_queue")
+                if curr.ref_cnt != 0:
+                    anomalies.append(
+                        f"block {curr.block_id} in free_block_queue has ref_cnt={curr.ref_cnt}"
+                    )
+                free_ids.add(curr.block_id)
+                walked += 1
+                if walked > total_usable + 1:
+                    anomalies.append("free_block_queue exceeds total_usable blocks")
+                    break
+                curr = curr.next_free_block
+            if walked != free_q.num_free_blocks:
+                anomalies.append(
+                    f"free_block_queue count drift: walked={walked}, "
+                    f"num_free_blocks={free_q.num_free_blocks}"
+                )
+
+        free_uncached = 0
+        free_cached = 0
+        active = 0
+        if all_blocks is not None:
+            for blk in all_blocks:
+                if blk.is_null:
+                    if blk.ref_cnt != 0:
+                        anomalies.append(f"null_block ref_cnt={blk.ref_cnt}")
+                    continue
+                if blk.ref_cnt < 0:
+                    anomalies.append(
+                        f"negative ref_cnt={blk.ref_cnt} on block {blk.block_id}"
+                    )
+                    if self_heal:
+                        blk.ref_cnt = 0
+                        self._kv_audit_stats["anomalies_healed"] += 1
+                if blk.ref_cnt == 0:
+                    in_free = blk.block_id in free_ids
+                    if not in_free:
+                        anomalies.append(
+                            f"leaked orphan block {blk.block_id} (ref_cnt=0, not in free queue)"
+                        )
+                        if (
+                            self_heal
+                            and free_q is not None
+                            and not blk.is_discard
+                            and blk.prev_free_block is None
+                            and blk.next_free_block is None
+                        ):
+                            blk.reset_hash()
+                            free_q.append(blk)
+                            free_ids.add(blk.block_id)
+                            self._kv_audit_stats["anomalies_healed"] += 1
+                            free_uncached += 1
+                        continue
+                    if blk.block_hash is None:
+                        free_uncached += 1
+                    else:
+                        free_cached += 1
+                else:
+                    if blk.block_id in free_ids:
+                        anomalies.append(
+                            f"active block {blk.block_id} (ref_cnt={blk.ref_cnt}) also in free queue"
+                        )
+                    active += 1
+
+            if free_uncached + free_cached + active != total_usable:
+                anomalies.append(
+                    f"block conservation violated: free_uncached({free_uncached}) + "
+                    f"free_cached({free_cached}) + active({active}) != total_usable({total_usable})"
+                )
+
+            if check_quiescent:
+                expected_refs: dict[int, int] = {}
+                for mgr in self.coordinator.single_type_managers:
+                    if mgr.block_pool is not pool:
+                        continue
+                    for req_id, blks in mgr.req_to_blocks.items():
+                        nhl = mgr._null_head_idx.get(req_id, 0)
+                        if nhl > 0 and any(not blks[k].is_null for k in range(min(nhl, len(blks)))):
+                            anomalies.append(
+                                f"manager group {mgr.kv_cache_group_id} req {req_id} "
+                                f"_null_head_idx={nhl} exceeds leading null run"
+                            )
+                        rmap = getattr(mgr, "_sparse_real_blocks", {}).get(req_id)
+                        if rmap is not None:
+                            actual_real = [
+                                (idx, b.block_id)
+                                for idx, b in enumerate(blks)
+                                if not b.is_null and not b.is_discard
+                            ]
+                            tracked_real = [
+                                (idx, b.block_id) for idx, b in rmap.items()
+                            ]
+                            if actual_real != tracked_real:
+                                anomalies.append(
+                                    f"manager group {mgr.kv_cache_group_id} req {req_id} "
+                                    f"_sparse_real_blocks drift: tracked={len(tracked_real)} vs actual={len(actual_real)}"
+                                )
+                        for b in blks:
+                            if not b.is_null and not b.is_discard:
+                                expected_refs[b.block_id] = (
+                                    expected_refs.get(b.block_id, 0) + 1
+                                )
+                    for src_b, dst_b in mgr._pending_cow_copies:
+                        expected_refs[src_b.block_id] = (
+                            expected_refs.get(src_b.block_id, 0) + 1
+                        )
+                        expected_refs[dst_b.block_id] = (
+                            expected_refs.get(dst_b.block_id, 0) + 1
+                        )
+                discard_blk = getattr(pool, "_sparse_discard_block", None)
+                if discard_blk is not None:
+                    expected_refs[discard_blk.block_id] = (
+                        expected_refs.get(discard_blk.block_id, 0) + 1
+                    )
+                for blk in all_blocks:
+                    if blk.is_null:
+                        continue
+                    exp = expected_refs.get(blk.block_id, 0)
+                    if blk.ref_cnt != exp:
+                        anomalies.append(
+                            f"ref_cnt drift on block {blk.block_id}: "
+                            f"actual={blk.ref_cnt} != expected={exp}"
+                        )
+
+        if anomalies:
+            new_anomalies = len(anomalies) - inline_anomaly_count
+            if new_anomalies > 0:
+                self._kv_audit_stats["anomalies_detected"] += new_anomalies
+            logger.error(
+                "INKLING_KV_AUDIT_V15 FULL AUDIT FAILED (%d anomalies): %s",
+                len(anomalies),
+                "; ".join(anomalies[:8]),
+            )
+        else:
+            stats = self.get_kv_audit_stats()
+            logger.info(
+                "INKLING_KV_AUDIT_V15 OK: usable=%d free=%d (cached=%d uncached=%d) "
+                "active=%d prefix_hit=%.2f%% evict_rate=%.2f%% allocs=%d frees=%d",
+                total_usable,
+                free_uncached + free_cached,
+                free_cached,
+                free_uncached,
+                active,
+                float(stats["prefix_hit_rate"]) * 100.0,
+                float(stats["eviction_rate"]) * 100.0,
+                int(stats["requests_allocated"]),
+                int(stats["requests_freed"]),
+            )
+
+        report["free_uncached"] = free_uncached
+        report["free_cached"] = free_cached
+        report["active"] = active
+        report["ok"] = len(anomalies) == 0
+        report["stats"] = self.get_kv_audit_stats()
+        return report
+
+    # ------------------------------------------------------------------
+    # Wave-V16 opt-in zero-hot-path-overhead atomic /dev/shm KV snapshot
+    # (`INKLING_TELEMETRY_V16=1`, default OFF -> 0.00 us hot-path tax).
+    # ------------------------------------------------------------------
+
+    def _classify_kv_group_roles(self) -> tuple[str, ...]:
+        """Classify each hybrid KV cache group as global, swa, sconv, or drafter."""
+        eagle_ids = getattr(self.coordinator, "eagle_group_ids", ()) or ()
+        roles: list[str] = []
+        for idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            if getattr(spec, "is_draft", False) or idx in eagle_ids:
+                roles.append("drafter")
+                continue
+            win = get_kv_cache_spec_sliding_window(spec)
+            if win is not None:
+                roles.append("sconv" if win <= 8 else "swa")
+                continue
+            kind = get_kv_cache_spec_kind(spec).value
+            if kind == "mamba":
+                roles.append("sconv")
+            else:
+                roles.append("global")
+        return tuple(roles)
+
+    def _resolve_host_pin_mod(self) -> Any:
+        for mod_name in ("vllm.models.inkling2.ops.host_pin", "host_pin"):
+            mod = sys.modules.get(mod_name)
+            if mod is not None:
+                return mod
+        try:
+            from vllm.models.inkling2.ops import host_pin
+
+            return host_pin
+        except Exception:
+            return None
+
+    def _register_telemetry_v16_provider(self) -> None:
+        hp = self._resolve_host_pin_mod()
+        if hp is not None:
+            reg = getattr(hp, "register_kv_metrics_provider", None)
+            if callable(reg):
+                try:
+                    reg(self.get_kv_telemetry_v16)
+                except Exception:
+                    pass
+
+    def get_kv_telemetry_v16(self) -> dict[str, Any]:
+        """Collect O(C) KV pool, prefix-hit, eviction, hybrid-role & audit anomaly metrics."""
+        pool = self.block_pool
+        total_usable = max(0, pool.num_gpu_blocks - 1)
+        num_free = max(0, int(pool.get_num_free_blocks()))
+        active_blocks = max(0, total_usable - num_free)
+        cached_blocks = max(0, int(self._audit_cached_entry_count()))
+        try:
+            util_ratio = float(pool.get_usage())
+        except Exception:
+            util_ratio = (active_blocks / total_usable) if total_usable > 0 else 0.0
+        util_ratio = min(1.0, max(0.0, util_ratio))
+
+        roles = self._telemetry_v16_group_roles or self._classify_kv_group_roles()
+        role_blocks: dict[str, int] = {
+            "global": 0,
+            "swa": 0,
+            "sconv": 0,
+            "drafter": 0,
+        }
+        active_reqs = 0
+        managers = self.coordinator.single_type_managers
+        for idx, mgr in enumerate(managers):
+            role = roles[idx] if idx < len(roles) else "global"
+            req_map = getattr(mgr, "req_to_blocks", {}) or {}
+            if len(req_map) > active_reqs:
+                active_reqs = len(req_map)
+            rmap_all = getattr(mgr, "_sparse_real_blocks", None)
+            nhl_map = getattr(mgr, "_null_head_idx", {}) or {}
+            grp_active = 0
+            for req_id, blks in req_map.items():
+                if rmap_all is not None and req_id in rmap_all:
+                    grp_active += len(rmap_all[req_id])
+                else:
+                    nhl = int(nhl_map.get(req_id, 0))
+                    grp_active += max(0, len(blks) - nhl)
+            role_blocks[role] = role_blocks.get(role, 0) + grp_active
+
+        hybrid_util = {
+            role: {
+                "blocks": cnt,
+                "utilization_ratio": round(
+                    min(1.0, cnt / total_usable) if total_usable > 0 else 0.0, 6
+                ),
+            }
+            for role, cnt in role_blocks.items()
+        }
+
+        q_tok = self._telemetry_v16_prefix_query_tokens
+        h_tok = self._telemetry_v16_prefix_hit_tokens
+        prefix_hit_rate = (h_tok / q_tok) if q_tok > 0 else 0.0
+
+        return {
+            "ts_unix": round(time.time(), 3),
+            "total_usable_blocks": total_usable,
+            "free_blocks": num_free,
+            "active_blocks": active_blocks,
+            "cached_blocks": cached_blocks,
+            "utilization_ratio": round(util_ratio, 6),
+            "prefix_lookups": self._telemetry_v16_prefix_lookups,
+            "prefix_query_tokens": q_tok,
+            "prefix_hit_tokens": h_tok,
+            "prefix_hit_rate": round(prefix_hit_rate, 6),
+            "evictions_total": self._telemetry_v16_evictions_total,
+            "kv_audit_anomalies": int(self._kv_audit_stats.get("anomalies_detected", 0)),
+            "kv_audit_healed": int(self._kv_audit_stats.get("anomalies_healed", 0)),
+            "active_requests": active_reqs,
+            "hybrid_utilization": hybrid_util,
+        }
+
+    def maybe_emit_telemetry_v16(
+        self,
+        *,
+        force: bool = False,
+        shm_dir: str | None = None,
+        rank: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Rate-limited atomic `/dev/shm/inkling_v16_rank{r}_metrics.json` KV snapshot writer.
+
+        Strictly opt-in (`INKLING_TELEMETRY_V16=1`), rate-limited to at most once every
+        `INKLING_TELEMETRY_V16_INTERVAL_S` seconds, and NEVER runs inside CUDA graph capture.
+        """
+        if not force and not self._telemetry_v16_enabled:
+            return None
+        if _is_cuda_graph_capturing_v16():
+            return None
+        now = time.monotonic()
+        if (
+            not force
+            and self._telemetry_v16_last_ts > 0.0
+            and (now - self._telemetry_v16_last_ts) < self._telemetry_v16_interval_s
+        ):
+            return None
+        self._telemetry_v16_last_ts = now
+
+        kv_snap = self.get_kv_telemetry_v16()
+        hp = self._resolve_host_pin_mod()
+        if hp is not None:
+            writer = getattr(hp, "maybe_write_metrics_snapshot", None)
+            if callable(writer):
+                try:
+                    return writer(
+                        rank=rank,
+                        kv_metrics=kv_snap,
+                        shm_dir=shm_dir,
+                        force=True,
+                        tag="kv_cache_manager",
+                    )
+                except Exception:
+                    pass
+
+        # Pure-stdlib atomic fallback if host_pin is unavailable in standalone harnesses
+        r = 0 if rank is None else int(rank)
+        out_dir = (
+            shm_dir
+            or os.environ.get("INKLING_TELEMETRY_V16_DIR")
+            or os.environ.get("INKLING_SHM_DIR")
+            or "/dev/shm"
+        )
+        if not os.path.isdir(out_dir):
+            return None
+        dst = os.path.join(out_dir, f"inkling_v16_rank{r}_metrics.json")
+        tmp = os.path.join(out_dir, f".inkling_v16_rank{r}_metrics.json.{os.getpid()}.tmp")
+        payload: dict[str, Any] = {
+            "schema": "inkling.telemetry.v16",
+            "ts_unix": kv_snap["ts_unix"],
+            "rank": r,
+            "pid": os.getpid(),
+            "kv": kv_snap,
+        }
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
+            os.replace(tmp, dst)
+            return payload
+        except OSError:
+            try:
+                if os.path.lexists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            return None

@@ -145,6 +145,98 @@ _C28_DELAY_LO_NS = int(float(os.environ.get("INKLING_L2PF_C28_DELAY_US", "0.5") 
 _C28_DELAY_HI_NS = int(float(os.environ.get("INKLING_L2PF_C28_DELAY_HI_US", "0.75") or "0.75") * 1000)
 _C28_DELAY_64_NS = int(float(os.environ.get("INKLING_L2PF_C28_DELAY_64_US", "1.0") or "1.0") * 1000)
 
+# Wave-V14 opt-in Post-V13 L2 (+4 MiB BF11 Split-First) & SM (6-20 SMs RDMA V13) Synergy (ALL default OFF = 0):
+#   - INKLING_L2PF_C28_V14=1: re-budgets C=2..8 (M=10..64) L2PF tiers now that BF11 V13 live partials
+#     shrank from 4.2..5.6 MiB -> 0.00..1.12 MiB and RDMA V13 runs FUSED_AR_SCONV_C28=0 with 13..20 free
+#     SMs at C=2 (M=12..16). Strictly preserves ar_done_cnt hard-stop (0 us collision) and caps pace <= 185 GB/s
+#     so (TMA + CX-7 <= 232 GB/s < 244 GB/s) and Peak Live L2 WS <= 19.8 MiB < 20 MiB < 24 MiB!
+#   - INKLING_L2PF_C28_V14_C2=1: unlocks C=2 (10 <= M <= 16) Attn-AR disjoint QKVR tail chaining
+#     (skip=MAX_BYTES=5.5 MiB, tail=5.5 MiB -> ~9.3 MiB/11.73 MiB resident) leaving C=1 (M<=8) 100% untouched!
+#   - INKLING_L2PF_C28_V14_WO_CHAIN=1: chains L_{i+1} wo_ud (<=2.5 MiB BF11) as a 3rd segment AFTER
+#     (router, qkvr_tail) inside Attn AR for M <= 32 (C=3..4) where BF11 V13 P_live=0.56 MiB leaves >5 MiB L2 free.
+#   - INKLING_L2PF_HEAD_V14=1: fixes Layer-47 CertHead V7/V12/V14 _seg_cache capture miss at M=37..48 (C=7..8!),
+#     fixes lockstep scale caps (128K big_s + 640K ms_u4 -> +512 KiB slabs), adds V14 slab auto-discovery,
+#     and lifts Layer-47 head budget to 10.0/14.5/13.5/12.5 MiB (no competing next-layer QKVR on Layer 47!).
+C28_V14 = os.environ.get("INKLING_L2PF_C28_V14", "0").strip().lower() in ("1", "on", "true", "yes")
+C28_V14_C2 = os.environ.get(
+    "INKLING_L2PF_C28_V14_C2", "1" if C28_V14 else "0"
+).strip().lower() in ("1", "on", "true", "yes")
+C28_V14_WO_CHAIN = os.environ.get(
+    "INKLING_L2PF_C28_V14_WO_CHAIN", "1" if C28_V14 else "0"
+).strip().lower() in ("1", "on", "true", "yes")
+HEAD_V14 = os.environ.get(
+    "INKLING_L2PF_HEAD_V14", "1" if C28_V14 else "0"
+).strip().lower() in ("1", "on", "true", "yes")
+C28_V14_WO_CHAIN_MAX_M = max(17, min(64, int(os.environ.get("INKLING_L2PF_C28_V14_WO_CHAIN_MAX_M", "32") or "32")))
+_C28_V14_WO_CHAIN_BYTES = int(float(os.environ.get("INKLING_L2PF_C28_V14_WO_MB", "2.5") or "2.5") * (1 << 20))
+_C28_V14_C2_TAIL_BYTES = int(float(os.environ.get("INKLING_L2PF_C28_V14_C2_TAIL_MB", "5.5") or "5.5") * (1 << 20))
+_C28_V14_QKVR_LO_BYTES = int(float(os.environ.get("INKLING_L2PF_C28_V14_QKVR_MB", "7.5") or "7.5") * (1 << 20))
+_C28_V14_QKVR_HI_BYTES = int(float(os.environ.get("INKLING_L2PF_C28_V14_QKVR_HI_MB", "7.8") or "7.8") * (1 << 20))
+_C28_V14_QKVR_64_BYTES = int(float(os.environ.get("INKLING_L2PF_C28_V14_QKVR_64_MB", "7.0") or "7.0") * (1 << 20))
+_C28_V14_TAIL_LO_BYTES = int(float(os.environ.get("INKLING_L2PF_C28_V14_TAIL_MB", "4.25") or "4.25") * (1 << 20))
+_C28_V14_TAIL_HI_BYTES = int(float(os.environ.get("INKLING_L2PF_C28_V14_TAIL_HI_MB", "3.5") or "3.5") * (1 << 20))
+_C28_V14_TAIL_64_BYTES = int(float(os.environ.get("INKLING_L2PF_C28_V14_TAIL_64_MB", "3.0") or "3.0") * (1 << 20))
+_C28_V14_PACE_LO_GBPS = min(185.0, float(os.environ.get("INKLING_L2PF_C28_V14_PACE_LO_GBPS", "185") or "185"))
+_C28_V14_PACE_HI_GBPS = min(185.0, float(os.environ.get("INKLING_L2PF_C28_V14_PACE_HI_GBPS", "175") or "175"))
+_C28_V14_PACE_64_GBPS = min(185.0, float(os.environ.get("INKLING_L2PF_C28_V14_PACE_64_GBPS", "165") or "165"))
+_C28_V14_DELAY_LO_NS = int(float(os.environ.get("INKLING_L2PF_C28_V14_DELAY_US", "0.25") or "0.25") * 1000)
+_C28_V14_DELAY_HI_NS = int(float(os.environ.get("INKLING_L2PF_C28_V14_DELAY_HI_US", "0.50") or "0.50") * 1000)
+_C28_V14_DELAY_64_NS = int(float(os.environ.get("INKLING_L2PF_C28_V14_DELAY_64_US", "0.50") or "0.50") * 1000)
+_HEAD_V14_C2_BYTES = int(float(os.environ.get("INKLING_L2PF_HEAD_V14_C2_MB", "10.0") or "10.0") * (1 << 20))
+_HEAD_V14_LO_BYTES = int(float(os.environ.get("INKLING_L2PF_HEAD_V14_LO_MB", "14.5") or "14.5") * (1 << 20))
+_HEAD_V14_HI_BYTES = int(float(os.environ.get("INKLING_L2PF_HEAD_V14_HI_MB", "13.5") or "13.5") * (1 << 20))
+_HEAD_V14_64_BYTES = int(float(os.environ.get("INKLING_L2PF_HEAD_V14_64_MB", "12.5") or "12.5") * (1 << 20))
+_HEAD_V14_BS_CAP = int(os.environ.get("INKLING_L2PF_HEAD_V14_BS_KB", "128") or "128") * 1024
+_HEAD_V14_MS_CAP = int(os.environ.get("INKLING_L2PF_HEAD_V14_MS_KB", "640") or "640") * 1024
+
+# Wave-V16 opt-in Post-V15 Synergy (ALL strictly default OFF = 0):
+#   - Track 2 (`v16-moe-lpt-evict`) adds PTX `L2::evict_first` across all 40 NVFP4 MoE layers
+#     so NVFP4 weights no longer evict prefetched QKVR/wo_ud/Router/CertHead slabs from 24 MiB L2!
+#   - Track 1 (`v16-spec-dynk-tree`) adds Dynamic K=7..15 (M=8, 12, 16 at C=1; M=16..48 at C=2..8).
+#   - Track 5 (`v16-rdma-sconv-fuse`) compresses C=4..8 RDMA wire bytes by -24.2% -> tighten L2PF
+#     delay to 0.15 us while strictly enforcing Peak Live & Conservative L2 WS <= 19.5 MiB < 24 MiB
+#     and Peak Bus (TMA + CX-7) <= 232 GB/s < 244 GB/s (ar_done_cnt hard-stop preserved!).
+#   - Layer-47 CertHead V14 exact slab registration & 100% capture-safe prewarm across ALL
+#     M in {8, 12, 16, 24, 28, 32, 36, 42, 48, 64, 96, 128} (incl. 128 KiB / 768 KiB C=32 lockstep).
+L2PF_V16 = os.environ.get("INKLING_L2PF_V16", "0").strip().lower() in ("1", "on", "true", "yes")
+HEAD_V16 = os.environ.get(
+    "INKLING_L2PF_HEAD_V16", "1" if L2PF_V16 else "0"
+).strip().lower() in ("1", "on", "true", "yes")
+C28_V16 = os.environ.get(
+    "INKLING_L2PF_C28_V16", "1" if L2PF_V16 else "0"
+).strip().lower() in ("1", "on", "true", "yes")
+C28_V16_WO_CHAIN = os.environ.get(
+    "INKLING_L2PF_C28_V16_WO_CHAIN", "1" if C28_V16 else "0"
+).strip().lower() in ("1", "on", "true", "yes")
+C28_V16_WO_CHAIN_MAX_M = max(12, min(64, int(os.environ.get("INKLING_L2PF_C28_V16_WO_CHAIN_MAX_M", "36") or "36")))
+_V16_C2_QKVR_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_C2_QKVR_MB", "7.5") or "7.5") * (1 << 20))
+_V16_C2_TAIL_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_C2_TAIL_MB", "4.0") or "4.0") * (1 << 20))
+_V16_C2_WO_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_C2_WO_MB", "2.5") or "2.5") * (1 << 20))
+_V16_QKVR_LO_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_QKVR_MB", "7.75") or "7.75") * (1 << 20))
+_V16_TAIL_LO_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_TAIL_MB", "3.75") or "3.75") * (1 << 20))
+_V16_TAIL_36_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_TAIL_36_MB", "3.5") or "3.5") * (1 << 20))
+_V16_WO_LO_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_WO_MB", "3.0") or "3.0") * (1 << 20))
+_V16_WO_36_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_WO_36_MB", "2.0") or "2.0") * (1 << 20))
+_V16_QKVR_HI_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_QKVR_HI_MB", "7.5") or "7.5") * (1 << 20))
+_V16_TAIL_HI_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_TAIL_HI_MB", "3.4") or "3.4") * (1 << 20))
+_V16_QKVR_64_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_QKVR_64_MB", "7.25") or "7.25") * (1 << 20))
+_V16_TAIL_64_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_TAIL_64_MB", "2.75") or "2.75") * (1 << 20))
+_V16_C32_QKVR_BYTES = int(float(os.environ.get("INKLING_L2PF_V16_C32_QKVR_MB", "14.0") or "14.0") * (1 << 20))
+_V16_PACE_LO_GBPS = min(185.0, float(os.environ.get("INKLING_L2PF_V16_PACE_LO_GBPS", "185") or "185"))
+_V16_PACE_HI_GBPS = min(185.0, float(os.environ.get("INKLING_L2PF_V16_PACE_HI_GBPS", "185") or "185"))
+_V16_PACE_64_GBPS = min(180.0, float(os.environ.get("INKLING_L2PF_V16_PACE_64_GBPS", "180") or "180"))
+_V16_PACE_C32_GBPS = min(185.0, float(os.environ.get("INKLING_L2PF_V16_PACE_C32_GBPS", "185") or "185"))
+_V16_DELAY_NS = int(float(os.environ.get("INKLING_L2PF_V16_DELAY_US", "0.15") or "0.15") * 1000)
+_HEAD_V16_C2_BYTES = int(float(os.environ.get("INKLING_L2PF_HEAD_V16_C2_MB", "11.5") or "11.5") * (1 << 20))
+_HEAD_V16_LO_BYTES = int(float(os.environ.get("INKLING_L2PF_HEAD_V16_LO_MB", "15.5") or "15.5") * (1 << 20))
+_HEAD_V16_HI_BYTES = int(float(os.environ.get("INKLING_L2PF_HEAD_V16_HI_MB", "14.5") or "14.5") * (1 << 20))
+_HEAD_V16_64_BYTES = int(float(os.environ.get("INKLING_L2PF_HEAD_V16_64_MB", "13.5") or "13.5") * (1 << 20))
+_HEAD_V16_128_BYTES = int(float(os.environ.get("INKLING_L2PF_HEAD_V16_128_MB", "17.25") or "17.25") * (1 << 20))
+_HEAD_V16_BS_CAP = int(os.environ.get("INKLING_L2PF_HEAD_V16_BS_KB", "128") or "128") * 1024
+_HEAD_V16_MS_CAP = int(os.environ.get("INKLING_L2PF_HEAD_V16_MS_KB", "640") or "640") * 1024
+_HEAD_V16_C32_MS_CAP = int(os.environ.get("INKLING_L2PF_HEAD_V16_C32_MS_KB", "768") or "768") * 1024
+_V16_HEAD_PREWARM_MS = (8, 10, 12, 14, 16, 18, 21, 24, 28, 30, 32, 36, 40, 42, 48, 56, 64, 65, 72, 80, 96, 112, 128, 256)
+
 # Legacy Triton burst config
 _BLOCK, _ITERS = 1024, 8
 _CTAS = int(os.environ.get("INKLING_L2PF_CTAS", "8"))
@@ -169,22 +261,55 @@ _seg_cache: dict[tuple, torch.Tensor] = {}
 _head_ref = None  # optional lm_head module reference for Layer-47 cert_head/lm_head prefetch
 _cuda_head_slabs = None  # optional live CUDA cert_head multi-seg target (or slabs Tensor) for 2 <= M <= 16
 _cuda_head_slabs_c32 = None  # optional C=32 multi-seg head target (larger scales cap for 17.5 MiB window)
+_cuda_head_slabs_v16_c32 = None  # Wave-V16 lockstep M=65..128 CertHead V14 target (128 KiB big_s + 768 KiB ms_u4)
 _CUDA_HEAD_SCALES_CAP = int(os.environ.get("INKLING_L2PF_HEAD_SCALES_KB", "768")) * 1024
 
 
-def _cuda_head_segments(target, scales_cap: int = _CUDA_HEAD_SCALES_CAP):
-    """Build multi-segment prefetch target (nv, rt, (scales, cap), slabs) from a CudaCertTable,
-    or pass through an existing tuple/list/Tensor."""
+def _cuda_head_segments(target, scales_cap: int = _CUDA_HEAD_SCALES_CAP, *, v16_c32_lockstep: bool = False):
+    """Build multi-segment prefetch target (nv, rt, (scales, cap), slabs) from a CudaCertTable
+    or CudaCertTableV7, or pass through an existing tuple/list/Tensor."""
     if target is None:
         return None
+    _head_modern = HEAD_V14 or HEAD_V16
+    _bs_cap_eff = _HEAD_V16_BS_CAP if HEAD_V16 else _HEAD_V14_BS_CAP
+    _ms_cap_eff = (_HEAD_V16_C32_MS_CAP if v16_c32_lockstep else _HEAD_V16_MS_CAP) if HEAD_V16 else _HEAD_V14_MS_CAP
+    if _head_modern and not isinstance(target, (torch.Tensor, tuple, list)):
+        if hasattr(target, "l2pf_segments") and callable(target.l2pf_segments):
+            target = target.l2pf_segments()
+        elif hasattr(target, "slabs_u4"):
+            nv1 = getattr(target, "nv1", None)
+            rt1 = getattr(target, "rt1", None)
+            big_s = getattr(target, "big_s", None)
+            ms_u4 = getattr(target, "ms_u4", None)
+            slabs_u4 = getattr(target, "slabs_u4", None)
+            if nv1 is not None and rt1 is not None and big_s is not None and ms_u4 is not None and slabs_u4 is not None:
+                target = (nv1, rt1, (big_s, _bs_cap_eff), (ms_u4, _ms_cap_eff), slabs_u4)
     if isinstance(target, (tuple, list)):
-        if scales_cap != _CUDA_HEAD_SCALES_CAP:
+        if scales_cap != _CUDA_HEAD_SCALES_CAP or v16_c32_lockstep:
             if len(target) == 4 and isinstance(target[2], tuple):
                 return (target[0], target[1], (target[2][0], scales_cap), target[3])
+            if _head_modern and len(target) == 5:
+                bs_t = target[2][0] if isinstance(target[2], tuple) else target[2]
+                ms_t = target[3][0] if isinstance(target[3], tuple) else target[3]
+                if isinstance(bs_t, torch.Tensor) and isinstance(ms_t, torch.Tensor):
+                    return (
+                        target[0],
+                        target[1],
+                        (bs_t, _bs_cap_eff),
+                        (ms_t, _ms_cap_eff),
+                        target[4],
+                    )
             if len(target) == 5 and isinstance(target[2], tuple) and isinstance(target[3], tuple):
                 bs_cap = max(int(target[2][1]), min(262144, scales_cap // 4))
                 ms_cap = max(int(target[3][1]), min(1048576, (scales_cap * 2) // 3))
                 return (target[0], target[1], (target[2][0], bs_cap), (target[3][0], ms_cap), target[4])
+        elif _head_modern and len(target) == 5:
+            bs_t = target[2][0] if isinstance(target[2], tuple) else target[2]
+            ms_t = target[3][0] if isinstance(target[3], tuple) else target[3]
+            if isinstance(bs_t, torch.Tensor) and isinstance(ms_t, torch.Tensor):
+                bs_cap = int(target[2][1]) if isinstance(target[2], tuple) else _bs_cap_eff
+                ms_cap = int(target[3][1]) if isinstance(target[3], tuple) else min(524288, _ms_cap_eff)
+                return (target[0], target[1], (bs_t, bs_cap), (ms_t, ms_cap), target[4])
         return tuple(target)
     if hasattr(target, "slabs"):
         segs = []
@@ -207,15 +332,54 @@ def _cuda_head_segments(target, scales_cap: int = _CUDA_HEAD_SCALES_CAP):
 def set_cuda_head_slabs(slabs) -> None:
     """Register CUDA cert_head prefetch target for 2 <= M <= 16 (and C=32 when INKLING_L2PF_C32=1).
 
-    Accepts a CudaCertTable (preferred: builds multi-seg (nv, rt, (scales, 768 KiB), slabs)
-    covering first-wave cert_screen CTAs), a tuple of tensors/(tensor, max_bytes), or a
-    single slabs Tensor. Auto-prewarms the segment descriptor cache outside graph capture.
+    Accepts a CudaCertTable / CudaCertTableV7 (preferred: builds multi-seg covering first-wave
+    cert_screen CTAs), a tuple of tensors/(tensor, max_bytes), or a single slabs Tensor.
+    Auto-prewarms the segment descriptor cache across all active M tiers outside graph capture.
     """
-    global _cuda_head_slabs, _cuda_head_slabs_c32
+    global _cuda_head_slabs, _cuda_head_slabs_c32, _cuda_head_slabs_v16_c32
     _cuda_head_slabs = _cuda_head_segments(slabs, _CUDA_HEAD_SCALES_CAP)
     _cuda_head_slabs_c32 = _cuda_head_segments(slabs, _C32_HEAD_SCALES_CAP)
+    _cuda_head_slabs_v16_c32 = (
+        _cuda_head_segments(slabs, _C32_HEAD_SCALES_CAP, v16_c32_lockstep=True)
+        if HEAD_V16
+        else None
+    )
     if _cuda_head_slabs is not None:
         prewarm(_cuda_head_slabs, kind="head")
+    if HEAD_V16:
+        _max_pw_m = max(C32_MAX_M if C32 else 128, 128)
+        for _m in _V16_HEAD_PREWARM_MS:
+            if _m <= 16:
+                if _cuda_head_slabs is not None:
+                    prewarm(_cuda_head_slabs, kind="head", num_tokens=_m)
+            elif _m <= 64:
+                _tgt_m = _cuda_head_slabs_c32 if (C32 and _cuda_head_slabs_c32 is not None) else _cuda_head_slabs
+                if _tgt_m is not None:
+                    prewarm(_tgt_m, kind="head", num_tokens=_m)
+                if _cuda_head_slabs is not None and _tgt_m is not _cuda_head_slabs:
+                    prewarm(_cuda_head_slabs, kind="head", num_tokens=_m)
+            elif _m <= _max_pw_m:
+                _tgt_hi = _cuda_head_slabs_v16_c32 if _cuda_head_slabs_v16_c32 is not None else _cuda_head_slabs_c32
+                if _tgt_hi is not None:
+                    prewarm(_tgt_hi, kind="head", num_tokens=_m)
+                if _cuda_head_slabs_c32 is not None and _tgt_hi is not _cuda_head_slabs_c32:
+                    prewarm(_cuda_head_slabs_c32, kind="head", num_tokens=_m)
+                if _cuda_head_slabs is not None:
+                    prewarm(_cuda_head_slabs, kind="head", num_tokens=_m)
+        return
+    if HEAD_V14:
+        if C28_V14 and C28_V14_C2 and _cuda_head_slabs is not None:
+            for _m in (10, 12, 14, 16):
+                prewarm(_cuda_head_slabs, kind="head", num_tokens=_m)
+        _head_prewarm_ms = (18, 24, 28, 32, 36, 42, 48, 56, 64, 96, 128, 256)
+        if C32 and _cuda_head_slabs_c32 is not None:
+            for _m in _head_prewarm_ms:
+                if _m <= C32_MAX_M:
+                    prewarm(_cuda_head_slabs_c32, kind="head", num_tokens=_m)
+        elif _cuda_head_slabs is not None:
+            for _m in (24, 32, 48, 64, 128):
+                prewarm(_cuda_head_slabs, kind="head", num_tokens=_m)
+        return
     if C32 and _cuda_head_slabs_c32 is not None:
         for _m in (32, 64, 128, 256):
             if _m <= C32_MAX_M:
@@ -271,7 +435,7 @@ def _get_ar_done_ptr() -> int:
     global _ar_done_ptr, _ar_done_checked, _rdma_comm_ref
     if _ar_done_checked:
         return _ar_done_ptr
-    if not (STOP_FLAG or DRAFT_STOP_FLAG or (C32 and (C32_STOP_FLAG or C28_STOP_FLAG))) or not _has_paced_stop:
+    if not (STOP_FLAG or DRAFT_STOP_FLAG or (C32 and (C32_STOP_FLAG or C28_STOP_FLAG)) or ((C28_V14 or C28_V16) and C28_STOP_FLAG)) or not _has_paced_stop:
         _ar_done_checked = True
         return 0
     try:
@@ -355,18 +519,56 @@ def set_head_ref(lm_head) -> None:
     _head_ref = lm_head
 
 
+def _import_chv7():
+    """Import cert_head_cuda_v7 cleanly in both vLLM package and standalone contexts."""
+    try:
+        from . import cert_head_cuda_v7 as chv7
+        return chv7
+    except Exception:
+        try:
+            import cert_head_cuda_v7 as chv7  # type: ignore
+            return chv7
+        except Exception:
+            return None
+
+
+def _resolve_v7_slabs_fallback(chv7):
+    """Discover active CertHead V7/V12/V14 L2PF segments if not yet registered via set_cuda_head_slabs."""
+    if chv7 is None:
+        return None
+    segs = None
+    if hasattr(chv7, "get_active_l2pf_segments") and callable(chv7.get_active_l2pf_segments):
+        try:
+            segs = chv7.get_active_l2pf_segments()
+        except Exception:
+            segs = None
+    if segs is None:
+        ad = getattr(chv7, "_ACTIVE_ADAPTER", None)
+        tbl = getattr(ad, "tbl", None) if ad is not None else None
+        if tbl is not None:
+            segs = tbl.l2pf_segments() if hasattr(tbl, "l2pf_segments") else tbl
+    if segs is not None and not torch.cuda.is_current_stream_capturing():
+        set_cuda_head_slabs(segs)
+    return segs
+
+
 def get_head_weight(num_tokens: int | None = None):
     """Resolve Layer-47 prefetch target.
     - M == 1: raw lm_head.weight (stock head always).
     - 2 <= M <= 16: registered CUDA cert_head slabs (or Triton cert_head / raw lm_head).
-    - 17 <= M <= C32_MAX_M (when INKLING_L2PF_C32=1): C=32 CUDA cert_head slabs if CertHead-C32
-      is active for M, else exact active raw BF16 lm_head.weight!
-    - M > 64 (when C32=0) or M > C32_MAX_M (prefill): None."""
+    - 17 <= M <= C32_MAX_M (when INKLING_L2PF_C32=1 or CertHead V7/V12/V14 active): active
+      CertHead V7/V12/V14 slabs (or C32 slabs) if qualified for M, else exact raw BF16 lm_head.weight!
+    - M > 64 (when C32=0 and V7/V14 cap <= 64) or M > max_head_m (prefill): None."""
     if not HEAD or _head_ref is None:
         return None
+    _head_modern = HEAD_V14 or HEAD_V16
+    chv7 = _import_chv7() if _head_modern else None
     _v7_cap = 0
     try:
-        from . import cert_head_cuda_v7 as _chv7_lim
+        if chv7 is None:
+            from . import cert_head_cuda_v7 as _chv7_lim
+        else:
+            _chv7_lim = chv7
         _v7_cap = int(_chv7_lim.active_max_m_global()) if hasattr(_chv7_lim, "active_max_m_global") else 0
     except Exception:
         _v7_cap = 0
@@ -378,12 +580,37 @@ def get_head_weight(num_tokens: int | None = None):
         return None
     if num_tokens is not None and num_tokens < 2:
         return w  # M=1 is never qualified for cert_head; stock bf16 lm_head runs
-    if _cuda_head_slabs is not None and (num_tokens is None or num_tokens <= 16):
-        return _cuda_head_slabs
-    if num_tokens is not None and num_tokens > 16:
-        if _cuda_head_slabs is not None:
+    if HEAD_V16 and chv7 is not None:
+        try:
+            if hasattr(chv7, "is_temp_direct_l2pf_bypass") and chv7.is_temp_direct_l2pf_bypass():
+                return w  # Wave-V16 Track 3 temp>0 direct logit handoff: prefetch raw lm_head.weight, not INT6 slabs!
+        except Exception:
+            pass
+    slabs_lo = _cuda_head_slabs
+    slabs_hi = _cuda_head_slabs_c32
+    slabs_v16_hi = _cuda_head_slabs_v16_c32
+    if _head_modern and slabs_lo is None and chv7 is not None and _v7_cap >= 2:
+        auto_segs = _resolve_v7_slabs_fallback(chv7)
+        slabs_lo = _cuda_head_slabs if _cuda_head_slabs is not None else _cuda_head_segments(auto_segs, _CUDA_HEAD_SCALES_CAP)
+        slabs_hi = _cuda_head_slabs_c32 if _cuda_head_slabs_c32 is not None else _cuda_head_segments(auto_segs, _C32_HEAD_SCALES_CAP)
+        slabs_v16_hi = (
+            _cuda_head_slabs_v16_c32
+            if _cuda_head_slabs_v16_c32 is not None
+            else (_cuda_head_segments(auto_segs, _C32_HEAD_SCALES_CAP, v16_c32_lockstep=True) if HEAD_V16 else None)
+        )
+    if slabs_lo is not None and (num_tokens is None or num_tokens <= 16):
+        if HEAD_V16 and num_tokens is not None and chv7 is not None and _v7_cap >= 2:
             try:
-                from . import cert_head_cuda_v7 as chv7
+                if hasattr(chv7, "is_m_qualified_global") and not chv7.is_m_qualified_global(num_tokens):
+                    return w
+            except Exception:
+                pass
+        return slabs_lo
+    if num_tokens is not None and num_tokens > 16:
+        if slabs_lo is not None:
+            try:
+                if chv7 is None:
+                    from . import cert_head_cuda_v7 as chv7
                 _v7_max_m = (
                     int(chv7.active_max_m_global())
                     if hasattr(chv7, "active_max_m_global")
@@ -395,16 +622,18 @@ def get_head_weight(num_tokens: int | None = None):
                     else True
                 )
                 if _v7_max_m > 16 and num_tokens <= _v7_max_m and _v7_m_ok:
-                    if C32 and _cuda_head_slabs_c32 is not None:
-                        return _cuda_head_slabs_c32
-                    return _cuda_head_slabs
+                    if HEAD_V16 and num_tokens > 64 and slabs_v16_hi is not None:
+                        return slabs_v16_hi
+                    if C32 and slabs_hi is not None:
+                        return slabs_hi
+                    return slabs_lo
             except Exception:
                 pass
-        if C32 and _cuda_head_slabs is not None:
+        if C32 and slabs_lo is not None:
             try:
                 from . import cert_head_cuda as chc
                 if getattr(chc, "C32_ENABLED", False) and getattr(chc, "_HAS_C32", False) and num_tokens <= getattr(chc, "C32_MAX_M", 16):
-                    return _cuda_head_slabs_c32 if _cuda_head_slabs_c32 is not None else _cuda_head_slabs
+                    return slabs_hi if slabs_hi is not None else slabs_lo
             except Exception:
                 pass
         if num_tokens <= 64:
@@ -552,6 +781,122 @@ def _c28_tier_params(num_tokens: int) -> tuple[int, int, float, int, int]:
     return _C28_QKVR_64_BYTES, _C28_TAIL_64_BYTES, _C28_PACE_64_GBPS, _C28_DELAY_64_NS, 54_000
 
 
+def _c28_v14_tier_params(num_tokens: int) -> tuple[int, int, float, int, int, int, int]:
+    """Return (head_bytes, tail_bytes, pace_gbps, delay_ns, win_ns, wo_chain_bytes, head_l47_bytes)
+    for Post-V13 C=2..8 (10 <= M <= 64). Hard-caps pace <= 185 GB/s so (TMA + CX-7) <= 232 < 244 GB/s
+    and Peak Live L2 WS <= 19.8 MiB < 20 MiB < 24 MiB with BF11 V13 Split-First (P_live <= 1.12 MiB)."""
+    if num_tokens <= 16:
+        return (
+            MAX_BYTES,
+            _C28_V14_C2_TAIL_BYTES,
+            _C28_V14_PACE_LO_GBPS,
+            _C28_V14_DELAY_LO_NS,
+            42_000,
+            0,
+            _HEAD_V14_C2_BYTES,
+        )
+    if num_tokens <= 36:
+        wo_b = _C28_V14_WO_CHAIN_BYTES if (C28_V14_WO_CHAIN and num_tokens <= C28_V14_WO_CHAIN_MAX_M) else 0
+        win_ns = 46_000 if num_tokens <= 32 else 48_000
+        return (
+            _C28_V14_QKVR_LO_BYTES,
+            _C28_V14_TAIL_LO_BYTES,
+            _C28_V14_PACE_LO_GBPS,
+            _C28_V14_DELAY_LO_NS,
+            win_ns,
+            wo_b,
+            _HEAD_V14_LO_BYTES,
+        )
+    if num_tokens <= 48:
+        return (
+            _C28_V14_QKVR_HI_BYTES,
+            _C28_V14_TAIL_HI_BYTES,
+            _C28_V14_PACE_HI_GBPS,
+            _C28_V14_DELAY_HI_NS,
+            52_000,
+            0,
+            _HEAD_V14_HI_BYTES,
+        )
+    return (
+        _C28_V14_QKVR_64_BYTES,
+        _C28_V14_TAIL_64_BYTES,
+        _C28_V14_PACE_64_GBPS,
+        _C28_V14_DELAY_64_NS,
+        56_000,
+        0,
+        _HEAD_V14_64_BYTES,
+    )
+
+
+def _c28_v16_tier_params(num_tokens: int) -> tuple[int, int, float, int, int, int, int]:
+    """Return (head_bytes, tail_bytes, pace_gbps, delay_ns, win_ns, wo_chain_bytes, head_l47_bytes)
+    for Post-V15 Wave-V16 synergy (Track 1 Dyn-K M=12/16, Track 2 NVFP4 L2::evict_first, Track 5
+    -24.2% RDMA compression). Guarantees Peak Live & Conservative L2 WS <= 19.5 MiB < 24 MiB and
+    Peak Bus (TMA + CX-7) <= 232 GB/s < 244 GB/s across all M=10..128 with 0.15 us delay."""
+    if num_tokens <= 16:
+        wo_b = _V16_C2_WO_BYTES if (C28_V16_WO_CHAIN and num_tokens <= C28_V16_WO_CHAIN_MAX_M) else 0
+        return (
+            _V16_C2_QKVR_BYTES,
+            _V16_C2_TAIL_BYTES,
+            _V16_PACE_LO_GBPS,
+            _V16_DELAY_NS,
+            36_000,
+            wo_b,
+            _HEAD_V16_C2_BYTES,
+        )
+    if num_tokens <= 32:
+        wo_b = _V16_WO_LO_BYTES if (C28_V16_WO_CHAIN and num_tokens <= C28_V16_WO_CHAIN_MAX_M) else 0
+        return (
+            _V16_QKVR_LO_BYTES,
+            _V16_TAIL_LO_BYTES,
+            _V16_PACE_LO_GBPS,
+            _V16_DELAY_NS,
+            44_000,
+            wo_b,
+            _HEAD_V16_LO_BYTES,
+        )
+    if num_tokens <= 36:
+        wo_b = _V16_WO_36_BYTES if (C28_V16_WO_CHAIN and num_tokens <= C28_V16_WO_CHAIN_MAX_M) else 0
+        return (
+            _V16_QKVR_LO_BYTES,
+            _V16_TAIL_36_BYTES,
+            _V16_PACE_LO_GBPS,
+            _V16_DELAY_NS,
+            46_000,
+            wo_b,
+            _HEAD_V16_LO_BYTES,
+        )
+    if num_tokens <= 48:
+        return (
+            _V16_QKVR_HI_BYTES,
+            _V16_TAIL_HI_BYTES,
+            _V16_PACE_HI_GBPS,
+            _V16_DELAY_NS,
+            48_000,
+            0,
+            _HEAD_V16_HI_BYTES,
+        )
+    if num_tokens <= 64:
+        return (
+            _V16_QKVR_64_BYTES,
+            _V16_TAIL_64_BYTES,
+            _V16_PACE_64_GBPS,
+            _V16_DELAY_NS,
+            52_000,
+            0,
+            _HEAD_V16_64_BYTES,
+        )
+    return (
+        _V16_C32_QKVR_BYTES,
+        0,
+        _V16_PACE_C32_GBPS,
+        _V16_DELAY_NS,
+        110_000 if num_tokens <= 128 else 160_000,
+        0,
+        _HEAD_V16_128_BYTES,
+    )
+
+
 def _slice_segments_tail(target, skip_bytes: int, max_tail_bytes: int) -> tuple:
     """Extract strictly disjoint 3-tuple (tensor, byte_offset, max_bytes) tail segments
     starting after `skip_bytes` of `target` (zero tensor allocation, 16B-aligned)."""
@@ -626,19 +971,46 @@ def resolve_next_wo_segments(layer, num_tokens: int, max_wo_bytes: int) -> tuple
     return _slice_segments_tail(tgt, 0, max_wo_bytes)
 
 
+def _resolve_router_gate_v16(layer, num_tokens: int | None):
+    """Resolve active BF11 (2.43 MB) or BF12 (2.65 MB) router slabs dynamically for M=1..128."""
+    raw_gw = layer.mlp.gate.weight
+    try:
+        from . import router_bf12 as _rb12
+        if getattr(_rb12, "ENABLED", False) and hasattr(_rb12, "l2pf_tensor"):
+            return _rb12.l2pf_tensor(raw_gw, num_tokens=num_tokens)
+    except Exception:
+        pass
+    return getattr(layer, "_l2pf_gate_w", raw_gw)
+
+
 def resolve_gate_target(layer, num_tokens: int | None = None):
     """Resolve Attn AR-window prefetch target:
-    - M <= 16: exact C=1 gate tensor (BF12 slabs or BF16 weight).
+    - M <= 9 (incl. C=1 M=8): exact C=1 gate tensor (BF11/BF12 slabs or BF16 weight).
+    - 10 <= M <= 16 (Dyn-K M=12/16 & C=2, when C28_V16=1 or C28_V14=1 & C28_V14_C2=1): active gate
+      tensor + strictly disjoint L_{i+1} QKVR tail (+ 3rd-seg wo_ud under C28_V16_WO_CHAIN=1).
     - 17 <= M <= 64 (C28): active gate tensor + optional disjoint L_{i+1} QKVR tail
-      (INKLING_L2PF_C28_QKVR_TAIL=1) or L_{i+1} wo_ud (INKLING_L2PF_C28_WO=1, M <= C28_WO_MAX_M)
-      when C28_MOE_W13=0.
-    - 65 <= M <= C32_MAX_M (C32=1): active gate tensor + first ~14-15 MiB of active MoE W13 slabs!"""
+      (INKLING_L2PF_C28_QKVR_TAIL=1, plus 3rd-seg L_{i+1} wo_ud for M<=36 under C28_V16 / M<=32 under C28_V14)
+      or L_{i+1} wo_ud (INKLING_L2PF_C28_WO=1, M <= C28_WO_MAX_M) when C28_MOE_W13=0.
+    - 65 <= M <= C32_MAX_M (C32=1): active gate tensor (BF11/BF12/BF16) + active MoE W13 slabs!"""
     if num_tokens is None or num_tokens <= 16:
-        return getattr(layer, "_l2pf_gate_w", layer.mlp.gate.weight)
+        gw0 = _resolve_router_gate_v16(layer, num_tokens) if L2PF_V16 else getattr(layer, "_l2pf_gate_w", layer.mlp.gate.weight)
+        if C28_V16 and num_tokens is not None and 10 <= num_tokens <= 16 and C28_QKVR_TAIL:
+            head_b, tail_b, _, _, _, wo_chain_b, _ = _c28_v16_tier_params(num_tokens)
+            tail_segs = resolve_qkvr_tail_segments(layer.mlp.experts, num_tokens, head_b, tail_b)
+            if wo_chain_b >= 16 and num_tokens <= C28_V16_WO_CHAIN_MAX_M:
+                wo_segs = resolve_next_wo_segments(layer, num_tokens, wo_chain_b)
+                extra_c2 = (*tail_segs, *wo_segs)
+            else:
+                extra_c2 = tail_segs
+            return (gw0, *extra_c2) if extra_c2 else gw0
+        if C28_V14 and C28_V14_C2 and num_tokens is not None and 10 <= num_tokens <= 16 and C28_QKVR_TAIL:
+            tail_segs = resolve_qkvr_tail_segments(layer.mlp.experts, num_tokens, MAX_BYTES, _C28_V14_C2_TAIL_BYTES)
+            return (gw0, *tail_segs) if tail_segs else gw0
+        return gw0
     raw_gw = layer.mlp.gate.weight
-    bf12_gw = getattr(layer, "_l2pf_gate_w", raw_gw)
+    bf12_gw = _resolve_router_gate_v16(layer, num_tokens) if L2PF_V16 else getattr(layer, "_l2pf_gate_w", raw_gw)
     raw_live = _tensor_live_bytes(raw_gw) >= 16
-    use_bf12 = not raw_live
+    use_bf12 = (bf12_gw is not raw_gw) if L2PF_V16 else (not raw_live)
     if not use_bf12:
         try:
             from . import moe_c32_runtime as _c32_moe
@@ -653,8 +1025,25 @@ def resolve_gate_target(layer, num_tokens: int | None = None):
     if use_w13:
         extra_segs = moe_w13_segments(layer.mlp.experts, num_tokens)
     elif is_c28 and C28_QKVR_TAIL:
-        head_b, tail_b, _, _, _ = _c28_tier_params(num_tokens)
-        extra_segs = resolve_qkvr_tail_segments(layer.mlp.experts, num_tokens, head_b, tail_b)
+        if C28_V16:
+            head_b, tail_b, _, _, _, wo_chain_b, _ = _c28_v16_tier_params(num_tokens)
+            tail_segs = resolve_qkvr_tail_segments(layer.mlp.experts, num_tokens, head_b, tail_b)
+            if wo_chain_b >= 16 and num_tokens <= C28_V16_WO_CHAIN_MAX_M:
+                wo_segs = resolve_next_wo_segments(layer, num_tokens, wo_chain_b)
+                extra_segs = (*tail_segs, *wo_segs)
+            else:
+                extra_segs = tail_segs
+        elif C28_V14:
+            head_b, tail_b, _, _, _, wo_chain_b, _ = _c28_v14_tier_params(num_tokens)
+            tail_segs = resolve_qkvr_tail_segments(layer.mlp.experts, num_tokens, head_b, tail_b)
+            if wo_chain_b >= 16 and num_tokens <= C28_V14_WO_CHAIN_MAX_M:
+                wo_segs = resolve_next_wo_segments(layer, num_tokens, wo_chain_b)
+                extra_segs = (*tail_segs, *wo_segs)
+            else:
+                extra_segs = tail_segs
+        else:
+            head_b, tail_b, _, _, _ = _c28_tier_params(num_tokens)
+            extra_segs = resolve_qkvr_tail_segments(layer.mlp.experts, num_tokens, head_b, tail_b)
     elif is_c28 and C28_WO and num_tokens <= C28_WO_MAX_M:
         extra_segs = resolve_next_wo_segments(layer, num_tokens, _C28_WO_BYTES)
     target = (gw, *extra_segs) if extra_segs else gw
@@ -680,7 +1069,9 @@ def _normalize_segments(target, budget: int) -> tuple[list[tuple[int, int]], tor
     """Accept a single Tensor, CudaCertTable, or sequence of Tensors/(Tensor, max_bytes) and build 16B-aligned segments."""
     if target is None or budget < 16:
         return [], None
-    if not isinstance(target, (torch.Tensor, tuple, list)) and hasattr(target, "slabs"):
+    if not isinstance(target, (torch.Tensor, tuple, list)) and (
+        hasattr(target, "slabs") or ((HEAD_V14 or HEAD_V16) and (hasattr(target, "slabs_u4") or hasattr(target, "l2pf_segments")))
+    ):
         target = _cuda_head_segments(target)
         if target is None:
             return [], None
@@ -752,8 +1143,64 @@ def _l2pf_kernel(X, N, O, BLOCK: tl.constexpr, ITERS: tl.constexpr):
 
 
 def _kind_params(kind: str, max_bytes: int | None, num_tokens: int | None = None):
+    if (C28_V16 or HEAD_V16) and num_tokens is not None and 10 <= num_tokens <= max(C32_MAX_M if C32 else 128, 128):
+        head_b, tail_b, tier_pace, tier_delay, tier_win, wo_chain_b, head_l47_b = _c28_v16_tier_params(num_tokens)
+        if num_tokens <= 16:
+            if C28_V16 and kind == "moe":
+                return (head_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
+            if C28_V16 and kind == "gate" and C28_QKVR_TAIL:
+                gate_b = (3 << 20) + (512 << 10) + tail_b + wo_chain_b
+                return (gate_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
+            if HEAD_V16 and kind == "head":
+                return (head_l47_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
+        elif num_tokens <= 64 and C32:
+            if C28_V16 and kind == "gate":
+                if C28_QKVR_TAIL:
+                    gate_b = (3 << 20) + (512 << 10) + tail_b + wo_chain_b
+                elif C28_WO and num_tokens <= C28_WO_MAX_M:
+                    gate_b = (3 << 20) + (512 << 10) + _C28_WO_BYTES
+                else:
+                    gate_b = min(_C32_GATE_BYTES, _C32_WIN32_BYTES if num_tokens <= 32 else _C32_WIN64_BYTES)
+                return (gate_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
+            if C28_V16 and kind == "moe":
+                return (head_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
+            if HEAD_V16 and kind == "head":
+                h_b = min(_C32_HEAD_BYTES, head_l47_b)
+                return (h_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
+        elif num_tokens > 64 and C32 and num_tokens <= C32_MAX_M:
+            if C28_V16 and kind == "moe":
+                b = min(_C32_MOE_BYTES, head_b) if max_bytes is None else max_bytes
+                return b, tier_pace, tier_win, tier_delay
+            if C28_V16 and kind == "gate":
+                b = min(_C32_GATE_BYTES, head_b + (3 << 20)) if max_bytes is None else max_bytes
+                return b, tier_pace, tier_win, tier_delay
+            if HEAD_V16 and kind == "head":
+                b = min(_C32_HEAD_BYTES, head_l47_b) if max_bytes is None else max_bytes
+                return b, tier_pace, tier_win, tier_delay
+    if C28_V14 and C28_V14_C2 and num_tokens is not None and 10 <= num_tokens <= 16:
+        head_b, tail_b, tier_pace, tier_delay, tier_win, _, head_l47_b = _c28_v14_tier_params(num_tokens)
+        if kind == "gate" and C28_QKVR_TAIL:
+            gate_b = (3 << 20) + (512 << 10) + tail_b
+            return (gate_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
+        if kind == "head" and HEAD_V14:
+            return (head_l47_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
     if C32 and num_tokens is not None and 17 <= num_tokens <= C32_MAX_M:
         is_c28 = num_tokens <= 64
+        if is_c28 and C28_V14:
+            head_b, tail_b, tier_pace, tier_delay, tier_win, wo_chain_b, head_l47_b = _c28_v14_tier_params(num_tokens)
+            if kind == "gate":
+                if C28_QKVR_TAIL:
+                    gate_b = (3 << 20) + (512 << 10) + tail_b + wo_chain_b
+                elif C28_WO and num_tokens <= C28_WO_MAX_M:
+                    gate_b = (3 << 20) + (512 << 10) + _C28_WO_BYTES
+                else:
+                    gate_b = min(_C32_GATE_BYTES, _C32_WIN32_BYTES if num_tokens <= 32 else _C32_WIN64_BYTES)
+                return (gate_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
+            if kind == "moe":
+                return (head_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
+            if kind == "head":
+                h_b = min(_C32_HEAD_BYTES, head_l47_b if HEAD_V14 else (head_b + (4 << 20)))
+                return (h_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
         if is_c28 and C28_ADAPTIVE:
             head_b, tail_b, tier_pace, tier_delay, tier_win = _c28_tier_params(num_tokens)
             if kind == "gate":
@@ -767,7 +1214,11 @@ def _kind_params(kind: str, max_bytes: int | None, num_tokens: int | None = None
             if kind == "moe":
                 return (head_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
             if kind == "head":
-                h_b = min(_C32_HEAD_BYTES, head_b + (4 << 20))
+                if HEAD_V14:
+                    _, _, _, _, _, _, head_l47_b = _c28_v14_tier_params(num_tokens)
+                    h_b = min(_C32_HEAD_BYTES, head_l47_b)
+                else:
+                    h_b = min(_C32_HEAD_BYTES, head_b + (4 << 20))
                 return (h_b if max_bytes is None else max_bytes), tier_pace, tier_win, tier_delay
         pace_gbps = _C28_PACE_GBPS if (is_c28 and _C28_PACE_GBPS > 0.0) else _C32_PACE_GBPS
         if num_tokens <= 32:
@@ -877,8 +1328,23 @@ def fork(
         if gbps > 0:
             period_ps = max(1, int(_CHUNK * 1000.0 / gbps))
             use_stop = (kind in ("moe", "gate", "head", "draft")) if stop is None else bool(stop)
-            is_c28_call = is_c32_call and num_tokens <= 64
-            if is_c32_call:
+            is_c28_v14_c2 = (
+                (
+                    C28_V16
+                    and num_tokens is not None
+                    and 10 <= num_tokens <= 16
+                    and kind in ("moe", "gate", "head")
+                )
+                or (
+                    C28_V14
+                    and C28_V14_C2
+                    and num_tokens is not None
+                    and 10 <= num_tokens <= 16
+                    and kind in ("gate", "head")
+                )
+            )
+            is_c28_call = (is_c32_call and num_tokens <= 64) or is_c28_v14_c2
+            if is_c32_call or is_c28_v14_c2:
                 c_stop_flag = C28_STOP_FLAG if is_c28_call else C32_STOP_FLAG
                 c_stop_soft = C28_STOP_SOFT if is_c28_call else C32_STOP_SOFT
                 stop_ok = use_stop and c_stop_flag and _rdma_handles_ar(num_tokens)

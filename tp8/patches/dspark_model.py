@@ -175,6 +175,129 @@ _L2PF_DRAFT_ATTN_MAX_M = int(os.environ.get("INKLING_L2PF_DRAFT_ATTN_MAX_M", "16
 _PF_TRIM_DRAFT_CTXKV = os.environ.get("INKLING_PF_TRIM_DRAFT_CTXKV", "0").strip().lower() not in (
     "0", "", "off", "false", "no"
 )
+# Wave-V16 opt-in non-tail DSpark drafter prefill skip (strictly default OFF!):
+# DSpark's global attention window is `INKLING_DRAFT_GLOBAL_WINDOW` (4,096 tok).
+# On non-final solo prefill chunks with `remaining_prompt_tokens > max_draft_window + margin`
+# (e.g., chunks 0..41 of a 1M cold prefill), 100% of drafter context KV computed on that chunk
+# is evicted before decode step 0 -> skipping it saves ~2.9-3.4 s with 0-ULP / 0-AL impact!
+# Strictly NEVER skips final chunk, short prompts, penultimate chunks <= window+margin,
+# unwindowed draft layers, multi-req / mixed-decode batches, or CUDA graph capture!
+_PF_SKIP_NONTAIL_DRAFT_V16 = os.environ.get(
+    "INKLING_PF_SKIP_NONTAIL_DRAFT_V16", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_PF_SKIP_NONTAIL_DRAFT_MARGIN = max(
+    256, int(os.environ.get("INKLING_PF_SKIP_NONTAIL_DRAFT_MARGIN", "256") or "256")
+)
+_PF_SKIP_NONTAIL_DRAFT_MIN_CHUNK = max(
+    512, int(os.environ.get("INKLING_PF_SKIP_NONTAIL_DRAFT_MIN_CHUNK", "2048") or "2048")
+)
+
+
+def should_skip_nontail_draft_prefill(
+    *,
+    enabled: bool,
+    single_req_chunk: bool,
+    chunk_tokens: int,
+    remaining_prompt_tokens: int | None,
+    layer_windows: Iterable[tuple[bool, int]],
+    num_decode_reqs: int = 0,
+    num_prefill_reqs: int = 1,
+    is_capturing: bool = False,
+    margin: int = _PF_SKIP_NONTAIL_DRAFT_MARGIN,
+    min_chunk_tokens: int = _PF_SKIP_NONTAIL_DRAFT_MIN_CHUNK,
+) -> bool:
+    """Pure safety predicate for Wave-V16 non-tail DSpark drafter context-KV skip.
+
+    Returns True ONLY when ALL of the following hold simultaneously:
+      1. Feature explicitly opted in (`enabled=True`).
+      2. Not inside CUDA graph capture (`not is_capturing`).
+      3. Current chunk is a non-final solo prefill chunk (`single_req_chunk=True`,
+         `num_decode_reqs == 0`, `num_prefill_reqs == 1`, `chunk_tokens > min_chunk_tokens`).
+      4. EVERY drafter layer is sliding-windowed with positive finite window (`is_local and win > 0`).
+         If ANY drafter layer is full unwindowed global attention, returns False.
+      5. `remaining_prompt_tokens` is explicitly known (not None) AND strictly exceeds
+         `max_draft_window + max(256, margin)` (e.g., `> 4096 + 256 = 4352`), guaranteeing that
+         ZERO tokens from this chunk survive in any drafter KV window at decode step 0.
+    """
+    if not enabled or is_capturing or not single_req_chunk:
+        return False
+    if int(chunk_tokens) <= int(min_chunk_tokens):
+        return False
+    if int(num_decode_reqs) != 0 or int(num_prefill_reqs) != 1:
+        return False
+    if remaining_prompt_tokens is None:
+        return False
+    rem = int(remaining_prompt_tokens)
+    if rem <= 0:
+        return False
+    win_list = list(layer_windows)
+    if not win_list:
+        return False
+    max_win = 0
+    for is_local, win in win_list:
+        w = int(win)
+        if (not is_local) or w <= 0:
+            return False
+        if w > max_win:
+            max_win = w
+    eff_margin = max(256, int(margin))
+    return rem > (max_win + eff_margin)
+
+
+def _resolve_nontail_draft_batch_info(
+    model_obj: object,
+    chunk_tokens: int,
+    explicit_remaining: int | None = None,
+) -> tuple[int | None, int, int]:
+    """Zero-GPU-sync resolution of `(remaining_prompt_tokens, num_decode_reqs, num_prefill_reqs)`."""
+    n_dec = 0
+    n_pf = 1
+    rem: int | None = int(explicit_remaining) if explicit_remaining is not None else None
+    attr_rem = getattr(model_obj, "_pf_remaining_prompt_tokens", None)
+    if rem is None and attr_rem is not None:
+        rem = int(attr_rem)
+    am = None
+    try:
+        from vllm.forward_context import is_forward_context_available
+
+        if is_forward_context_available():
+            fc = get_forward_context()
+            am = getattr(fc, "attn_metadata", None)
+            if rem is None:
+                fc_rem = getattr(fc, "remaining_prompt_tokens", None)
+                if fc_rem is not None:
+                    rem = int(fc_rem)
+            if am is not None:
+                metas = am.values() if isinstance(am, dict) else (am,)
+                saw_meta = False
+                for m in metas:
+                    if m is None:
+                        continue
+                    nd = getattr(m, "num_decode_reqs", None)
+                    if nd is None:
+                        nd = getattr(m, "num_decodes", None)
+                    np_r = getattr(m, "num_prefill_reqs", None)
+                    if np_r is None:
+                        np_r = getattr(m, "num_prefills", None)
+                    if nd is not None or np_r is not None:
+                        saw_meta = True
+                        n_dec = max(n_dec, int(nd or 0))
+                        n_pf = int(np_r or 0)
+                        break
+                if not saw_meta:
+                    n_pf = 1
+    except Exception:
+        pass
+    if rem is None:
+        try:
+            from . import prefill_sp as _pf_sp
+
+            rem = _pf_sp.get_active_prefill_remaining_tokens(
+                chunk_tokens=chunk_tokens, attn_metadata=am
+            )
+        except Exception:
+            rem = None
+    return rem, n_dec, n_pf
 _DRAFT_FP8_HI_CAP: tuple[str, bool] | None = None
 
 
@@ -1478,6 +1601,8 @@ class Inkling2DSparkModel(nn.Module):
             dspark_ops.prealloc_fold_sem(dev)
             try:
                 from .ops import skinny_int4 as _si4_v5
+                _si4_v5._get_draft_u4_v14_lib()
+                _si4_v5.qualify_draft_u4_v14(dev)
                 _si4_v5._get_draft_u4_v9_lib()
                 _si4_v5._get_draft_u4_v7_lib()
                 _si4_v5._get_draft_u4_v5_lib()
@@ -1708,8 +1833,37 @@ class Inkling2DSparkModel(nn.Module):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mappings: list[torch.Tensor | None] | None = None,
+        *,
+        remaining_prompt_tokens: int | None = None,
     ) -> None:
         m_tot = int(context_states.shape[0])
+        _single_chunk = bool(getattr(self, "_pf_single_req_chunk", False))
+        _capturing = bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+        if _PF_SKIP_NONTAIL_DRAFT_V16 and _single_chunk and not _capturing:
+            _rem_toks, _n_dec, _n_pf = _resolve_nontail_draft_batch_info(
+                self, m_tot, explicit_remaining=remaining_prompt_tokens
+            )
+            _layer_wins = [
+                (
+                    bool(getattr(layer.self_attn, "_effective_is_local", False)),
+                    int(getattr(layer.self_attn, "window", 0)),
+                )
+                for layer in self.model.layers
+            ]
+            if should_skip_nontail_draft_prefill(
+                enabled=_PF_SKIP_NONTAIL_DRAFT_V16,
+                single_req_chunk=_single_chunk,
+                chunk_tokens=m_tot,
+                remaining_prompt_tokens=_rem_toks,
+                layer_windows=_layer_wins,
+                num_decode_reqs=_n_dec,
+                num_prefill_reqs=_n_pf,
+                is_capturing=_capturing,
+            ):
+                self._pf_nontail_draft_skips = int(getattr(self, "_pf_nontail_draft_skips", 0)) + 1
+                self._pf_remaining_prompt_tokens = None
+                return
+        self._pf_remaining_prompt_tokens = None
         can_trim = (
             _PF_TRIM_DRAFT_CTXKV
             and bool(getattr(self, "_pf_single_req_chunk", False))

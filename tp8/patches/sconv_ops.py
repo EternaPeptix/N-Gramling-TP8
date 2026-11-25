@@ -39,6 +39,84 @@ _SCONV_NLIVE = os.environ.get("INKLING_SCONV_NLIVE", "1").strip().lower() not in
     "0", "", "off", "false", "no"
 )
 _SCONV_PDL = int(os.environ.get("INKLING_SCONV_PDL", "1"))
+# Wave-V14 standalone ShortConv (opt-in, default OFF): covers T=1..64 (closing the 33..64 gap!)
+# with NLivePtr, TreeAnc, fused AuxOut (all combos), pre-wait ConvAdd/ConvRes/cached-tap overlap, & PDL.
+_SCONV_V14 = os.environ.get("INKLING_SCONV_V14", "0").strip().lower() in ("1", "true", "on", "yes")
+_SCONV_V14_LIB_PATH = os.environ.get(
+    "INKLING_SCONV_V14_LIB", "/rdma/libfused_sconv_attnres_v14.so"
+).strip()
+_SCONV_V14_LIB = None
+_SCONV_V14_TRIED = False
+# Wave-V16 standalone ShortConv (opt-in, default OFF): adds T==1 full 576-line CW prefetch
+# on top of V14 T=1..64 exact ShortConv (+ NLivePtr, TreeAnc, AuxOut, #206-safe PDL).
+_SCONV_V16 = os.environ.get("INKLING_SCONV_V16", "0").strip().lower() in ("1", "true", "on", "yes")
+_SCONV_V16_LIB_PATH = os.environ.get(
+    "INKLING_SCONV_V16_LIB", "/rdma/libfused_sconv_attnres_v16.so"
+).strip()
+_SCONV_V16_LIB = None
+_SCONV_V16_TRIED = False
+
+
+def _get_sconv_v16_lib():
+    global _SCONV_V16_LIB, _SCONV_V16_TRIED
+    if not _SCONV_V16:
+        return None
+    if not _SCONV_V16_TRIED:
+        _SCONV_V16_TRIED = True
+        if _SCONV_V16_LIB_PATH and os.path.exists(_SCONV_V16_LIB_PATH):
+            try:
+                lib = ctypes.CDLL(_SCONV_V16_LIB_PATH)
+                if hasattr(lib, "sconv_exact_v16_fwd"):
+                    lib.sconv_exact_v16_fwd.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_int, ctypes.c_int,
+                        ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_float,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_uint64,
+                    ]
+                    lib.sconv_exact_v16_fwd.restype = ctypes.c_int
+                    _SCONV_V16_LIB = lib
+                    print(f"[inkling-sconv-v16] loaded 0-ULP T=1..64 ShortConv V16: {_SCONV_V16_LIB_PATH}", flush=True)
+            except Exception as e:
+                print(f"[inkling-sconv-v16] load failed ({e!r}); falling back", flush=True)
+                _SCONV_V16_LIB = None
+    return _SCONV_V16_LIB
+
+
+def _get_sconv_v14_lib():
+    global _SCONV_V14_LIB, _SCONV_V14_TRIED
+    if not _SCONV_V14:
+        return None
+    if not _SCONV_V14_TRIED:
+        _SCONV_V14_TRIED = True
+        if _SCONV_V14_LIB_PATH and os.path.exists(_SCONV_V14_LIB_PATH):
+            try:
+                lib = ctypes.CDLL(_SCONV_V14_LIB_PATH)
+                if hasattr(lib, "sconv_exact_v14_fwd"):
+                    lib.sconv_exact_v14_fwd.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_int, ctypes.c_int,
+                        ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_float,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_uint64,
+                    ]
+                    lib.sconv_exact_v14_fwd.restype = ctypes.c_int
+                    _SCONV_V14_LIB = lib
+                    print(f"[inkling-sconv-v14] loaded 0-ULP T=1..64 ShortConv V14: {_SCONV_V14_LIB_PATH}", flush=True)
+            except Exception as e:
+                print(f"[inkling-sconv-v14] load failed ({e!r}); falling back", flush=True)
+                _SCONV_V14_LIB = None
+    return _SCONV_V14_LIB
 _PROLOGUE_CUDA = os.environ.get("INKLING_PROLOGUE_CUDA", "0") == "1"
 # Wave-V5 0-ULP CUDA Target Attention Prologue (`M = 17..256` C=32, optional `M = 1..16`):
 # clips R ONCE per token (vs 5x), eliminates 75% wasted TILE=4 K/V conv rows at M=17..32,
@@ -626,6 +704,130 @@ def short_conv(
     width = weight.shape[1]
     _tsr = _get_tree_runtime()
     tree_st = _tsr.get_active_tree_state(num_tokens) if _tsr is not None else None
+    if (
+        _SCONV_V16
+        and 0 < num_tokens <= 64
+        and channels == 4608
+        and width == 4
+        and num_heads == 1
+        and stream_offset % 8 == 0
+        and x.stride(0) % 8 == 0
+        and cache.stride(0) % 8 == 0
+        and cache.stride(2) % 8 == 0
+        and x.dtype == torch.bfloat16
+        and cache.dtype == torch.bfloat16
+        and out.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and (addend is None or addend.dtype == torch.bfloat16)
+        and (residual is None or residual.dtype == torch.bfloat16)
+        and (aux_out is None or aux_out.dtype == torch.bfloat16)
+        and (tree_st is None or getattr(tree_st, "tree_sconv_anc", None) is not None)
+    ):
+        v16lib = _get_sconv_v16_lib()
+        if v16lib is not None:
+            nl_buf = _rowar_nlive_buf(num_tokens) if _SCONV_NLIVE else None
+            pdl_mode = (
+                (2 if (_SCONV_PDL == 2 and addend is None) or _SCONV_PDL >= 3 else _SCONV_PDL)
+                if tree_st is None
+                else (1 if nl_buf is not None else 0)
+            )
+            rc = v16lib.sconv_exact_v16_fwd(
+                x.data_ptr(),
+                cache.data_ptr(),
+                weight.data_ptr(),
+                out.data_ptr(),
+                aux_out.data_ptr() if aux_out is not None else 0,
+                residual.data_ptr() if residual is not None else 0,
+                addend.data_ptr() if addend is not None else 0,
+                positions.data_ptr(),
+                seq_idx.data_ptr(),
+                slot_mapping.data_ptr(),
+                block_table.data_ptr(),
+                query_start.data_ptr(),
+                nl_buf.data_ptr() if nl_buf is not None else 0,
+                tree_st.tree_sconv_anc.data_ptr() if tree_st is not None else 0,
+                num_tokens,
+                channels,
+                int(x.stride(0)),
+                int(cache.stride(0)),
+                int(cache.stride(2)),
+                int(block_table.stride(0)),
+                int(block_table.shape[1]),
+                int(cache.shape[2]),
+                int(stream_offset),
+                float((width + 1) ** -0.5),
+                1 if addend is not None else 0,
+                1 if residual is not None else 0,
+                1 if aux_out is not None else 0,
+                1 if nl_buf is not None else 0,
+                int(pdl_mode),
+                int(torch.cuda.current_stream(x.device).cuda_stream),
+            )
+            if rc == 0:
+                return out
+    if (
+        _SCONV_V14
+        and 0 < num_tokens <= 64
+        and channels == 4608
+        and width == 4
+        and num_heads == 1
+        and stream_offset % 8 == 0
+        and x.stride(0) % 8 == 0
+        and cache.stride(0) % 8 == 0
+        and cache.stride(2) % 8 == 0
+        and x.dtype == torch.bfloat16
+        and cache.dtype == torch.bfloat16
+        and out.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and (addend is None or addend.dtype == torch.bfloat16)
+        and (residual is None or residual.dtype == torch.bfloat16)
+        and (aux_out is None or aux_out.dtype == torch.bfloat16)
+        and (tree_st is None or getattr(tree_st, "tree_sconv_anc", None) is not None)
+    ):
+        v14lib = _get_sconv_v14_lib()
+        if v14lib is not None:
+            nl_buf = _rowar_nlive_buf(num_tokens) if _SCONV_NLIVE else None
+            pdl_mode = (
+                (2 if (_SCONV_PDL == 2 and addend is None) or _SCONV_PDL >= 3 else _SCONV_PDL)
+                if tree_st is None
+                else (1 if nl_buf is not None else 0)
+            )
+            rc = v14lib.sconv_exact_v14_fwd(
+                x.data_ptr(),
+                cache.data_ptr(),
+                weight.data_ptr(),
+                out.data_ptr(),
+                aux_out.data_ptr() if aux_out is not None else 0,
+                residual.data_ptr() if residual is not None else 0,
+                addend.data_ptr() if addend is not None else 0,
+                positions.data_ptr(),
+                seq_idx.data_ptr(),
+                slot_mapping.data_ptr(),
+                block_table.data_ptr(),
+                query_start.data_ptr(),
+                nl_buf.data_ptr() if nl_buf is not None else 0,
+                tree_st.tree_sconv_anc.data_ptr() if tree_st is not None else 0,
+                num_tokens,
+                channels,
+                int(x.stride(0)),
+                int(cache.stride(0)),
+                int(cache.stride(2)),
+                int(block_table.stride(0)),
+                int(block_table.shape[1]),
+                int(cache.shape[2]),
+                int(stream_offset),
+                float((width + 1) ** -0.5),
+                1 if addend is not None else 0,
+                1 if residual is not None else 0,
+                1 if aux_out is not None else 0,
+                1 if nl_buf is not None else 0,
+                int(pdl_mode),
+                int(torch.cuda.current_stream(x.device).cuda_stream),
+            )
+            if rc == 0:
+                return out
     if (
         tree_st is not None
         and 0 < num_tokens <= 32

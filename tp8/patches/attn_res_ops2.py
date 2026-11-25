@@ -29,6 +29,28 @@ _AUDIT_STATE = {"eager_logs": 0, "g_calls": 0, "g_buf": None, "g_meta": [], "g_d
 _AR_LIB_PATH = os.environ.get("INKLING_ATTN_RES_LIB", "/rdma/libattn_res_exact_v3.so")
 _AR_LIB = None
 _AR_LIB_TRIED = False
+# Wave-V14 standalone multi-query SMEM AttnRes (opt-in, default OFF):
+# 1x DRAM Stack read for NQ=3 (3.0x DRAM cut on 8 Global layers), N_STACK=1..10,
+# normalize_values in {False, True}, hoisted NQ=1 Queries, NLivePtr, & #206-safe PDL.
+_AR_V14 = os.environ.get("INKLING_ATTN_RES_V14", "0").strip().lower() in ("1", "true", "on", "yes")
+_AR_V14_LIB_PATH = os.environ.get(
+    "INKLING_ATTN_RES_V14_LIB", "/rdma/libfused_sconv_attnres_v14.so"
+).strip()
+_AR_V14_LIB = None
+_AR_V14_TRIED = False
+# Wave-V16 dual-regime fused AttnRes + RMSNorm (opt-in, default OFF):
+# Covers BOTH Regime A (T*nq <= 256, 256-thr SMEM Stack) AND Regime B (T*nq > 256, 128-thr
+# BLOCK_D=1024 SMEM-pinned Stack <=90 KiB + L1-hot Last/Addend) across all 48 layers (post-Attn
+# -> Router & post-MoE -> QKVR), N_STACK=1..10, NQ in {1,3}, normalize_values in {False, True},
+# NLivePtr, and #206-safe PDL straight into QKVR/Router!
+_AR_RMSNORM_V16 = os.environ.get("INKLING_ATTN_RES_RMSNORM_V16", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+_AR_RMSNORM_V16_LIB_PATH = os.environ.get(
+    "INKLING_ATTN_RES_RMSNORM_V16_LIB", "/rdma/libfused_sconv_attnres_v16.so"
+).strip()
+_AR_RMSNORM_V16_LIB = None
+_AR_RMSNORM_V16_TRIED = False
 _PREFILL_CUDA = os.environ.get("INKLING_ATTN_RES_PREFILL_CUDA", "1").strip().lower() not in ("0", "", "off", "false", "no")
 _AR_PREFILL_LIB_PATH = os.environ.get("INKLING_PREFILL_AR_LIB", "/rdma/libfused_sconv_ar_prefill.so")
 _AR_PREFILL_LIB = None
@@ -56,6 +78,80 @@ def _get_ar_prefill_lib():
                 print(f"[inkling-attn-res] prefill load failed ({e!r}); using Triton", flush=True)
                 _AR_PREFILL_LIB = None
     return _AR_PREFILL_LIB
+
+
+def _get_ar_rmsnorm_v16_lib():
+    global _AR_RMSNORM_V16_LIB, _AR_RMSNORM_V16_TRIED
+    if not _AR_RMSNORM_V16:
+        return None
+    if not _AR_RMSNORM_V16_TRIED:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        _AR_RMSNORM_V16_TRIED = True
+        if _AR_RMSNORM_V16_LIB_PATH and os.path.exists(_AR_RMSNORM_V16_LIB_PATH):
+            try:
+                lib = ctypes.CDLL(_AR_RMSNORM_V16_LIB_PATH)
+                if (
+                    hasattr(lib, "fused_attnres_rmsnorm_v16_fwd")
+                    and hasattr(lib, "fused_attnres_rmsnorm_v16_init_smem")
+                ):
+                    lib.fused_attnres_rmsnorm_v16_init_smem.argtypes = []
+                    lib.fused_attnres_rmsnorm_v16_init_smem.restype = ctypes.c_int
+                    lib.fused_attnres_rmsnorm_v16_fwd.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_int64, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_float, ctypes.c_float,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_uint64,
+                    ]
+                    lib.fused_attnres_rmsnorm_v16_fwd.restype = ctypes.c_int
+                    rc = int(lib.fused_attnres_rmsnorm_v16_init_smem())
+                    if rc != 0:
+                        raise RuntimeError(f"fused_attnres_rmsnorm_v16_init_smem failed: cudaError={rc}")
+                    _AR_RMSNORM_V16_LIB = lib
+                    print(
+                        f"[inkling-attn-res-rmsnorm-v16] loaded + init_smem OK: {_AR_RMSNORM_V16_LIB_PATH}",
+                        flush=True,
+                    )
+            except Exception as e:
+                print(f"[inkling-attn-res-rmsnorm-v16] load failed ({e!r}); falling back", flush=True)
+                _AR_RMSNORM_V16_LIB = None
+    return _AR_RMSNORM_V16_LIB
+
+
+def _get_ar_v14_lib():
+    global _AR_V14_LIB, _AR_V14_TRIED
+    if not _AR_V14:
+        return None
+    if not _AR_V14_TRIED:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        _AR_V14_TRIED = True
+        if _AR_V14_LIB_PATH and os.path.exists(_AR_V14_LIB_PATH):
+            try:
+                lib = ctypes.CDLL(_AR_V14_LIB_PATH)
+                if hasattr(lib, "attn_res_exact_v14_fwd") and hasattr(lib, "attn_res_exact_v14_init_smem"):
+                    lib.attn_res_exact_v14_init_smem.argtypes = []
+                    lib.attn_res_exact_v14_init_smem.restype = ctypes.c_int
+                    lib.attn_res_exact_v14_fwd.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_int64, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_float, ctypes.c_float,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_uint64,
+                    ]
+                    lib.attn_res_exact_v14_fwd.restype = ctypes.c_int
+                    rc = int(lib.attn_res_exact_v14_init_smem())
+                    if rc != 0:
+                        raise RuntimeError(f"attn_res_exact_v14_init_smem failed: cudaError={rc}")
+                    _AR_V14_LIB = lib
+                    print(f"[inkling-attn-res-v14] loaded + init_smem OK: {_AR_V14_LIB_PATH}", flush=True)
+            except Exception as e:
+                print(f"[inkling-attn-res-v14] load failed ({e!r}); falling back", flush=True)
+                _AR_V14_LIB = None
+    return _AR_V14_LIB
 
 
 def _get_ar_lib():
@@ -332,6 +428,99 @@ def attn_res(
         assert addend.is_contiguous() and addend.shape == last.shape
     assert norm_weight.shape == queries.shape and norm_weight.is_contiguous()
     out = torch.empty((num_q, num_tokens, d), dtype=last.dtype, device=last.device)
+    if (
+        _AR_RMSNORM_V16
+        and not _AUDIT
+        and d == 4608
+        and 1 <= num_stack <= 10
+        and num_q in (1, 3)
+        and int(stack.stride(0)) % 8 == 0
+        and last.dtype == torch.bfloat16
+        and stack.dtype == torch.bfloat16
+        and norm_weight.dtype == torch.bfloat16
+        and (addend is None or addend.dtype == torch.bfloat16)
+    ):
+        v16lib = _get_ar_rmsnorm_v16_lib()
+        if v16lib is not None:
+            nlive_ptr = 0
+            if _CUDA_NLIVE:
+                try:
+                    from vllm.distributed.device_communicators import rdma_all_reduce as _rar
+                    if _rar.ROWAR.get("scope") == num_tokens and _rar.ROWAR.get("buf") is not None:
+                        nlive_ptr = int(_rar.ROWAR["buf"].data_ptr())
+                except Exception:
+                    nlive_ptr = 0
+            use_pdl = 1 if num_tokens <= 64 else 0
+            early_pdl = 1 if (_EARLY and num_tokens <= 64) else 0
+            rc = v16lib.fused_attnres_rmsnorm_v16_fwd(
+                stack.data_ptr(),
+                last.data_ptr(),
+                0 if addend is None else addend.data_ptr(),
+                queries.data_ptr(),
+                norm_weight.data_ptr(),
+                out.data_ptr(),
+                nlive_ptr,
+                int(stack.stride(0)),
+                num_q,
+                num_tokens,
+                num_stack,
+                float(eps),
+                float(norm_eps),
+                1 if addend is not None else 0,
+                1 if normalize_values else 0,
+                early_pdl,
+                1 if nlive_ptr != 0 else 0,
+                use_pdl,
+                int(torch.cuda.current_stream(last.device).cuda_stream),
+            )
+            if rc == 0:
+                return out
+    if (
+        _AR_V14
+        and not _AUDIT
+        and d == 4608
+        and 1 <= num_stack <= 10
+        and num_q in (1, 3)
+        and num_tokens * num_q <= 256
+        and int(stack.stride(0)) % 8 == 0
+        and last.dtype == torch.bfloat16
+        and stack.dtype == torch.bfloat16
+        and norm_weight.dtype == torch.bfloat16
+        and (addend is None or addend.dtype == torch.bfloat16)
+    ):
+        v14lib = _get_ar_v14_lib()
+        if v14lib is not None:
+            nlive_ptr = 0
+            if _CUDA_NLIVE:
+                try:
+                    from vllm.distributed.device_communicators import rdma_all_reduce as _rar
+                    if _rar.ROWAR.get("scope") == num_tokens and _rar.ROWAR.get("buf") is not None:
+                        nlive_ptr = int(_rar.ROWAR["buf"].data_ptr())
+                except Exception:
+                    nlive_ptr = 0
+            rc = v14lib.attn_res_exact_v14_fwd(
+                stack.data_ptr(),
+                last.data_ptr(),
+                0 if addend is None else addend.data_ptr(),
+                queries.data_ptr(),
+                norm_weight.data_ptr(),
+                out.data_ptr(),
+                nlive_ptr,
+                int(stack.stride(0)),
+                num_q,
+                num_tokens,
+                num_stack,
+                float(eps),
+                float(norm_eps),
+                1 if addend is not None else 0,
+                1 if normalize_values else 0,
+                1 if _EARLY else 0,
+                1 if nlive_ptr != 0 else 0,
+                1,
+                int(torch.cuda.current_stream(last.device).cuda_stream),
+            )
+            if rc == 0:
+                return out
     if (
         _CUDA_EXACT
         and d == 4608

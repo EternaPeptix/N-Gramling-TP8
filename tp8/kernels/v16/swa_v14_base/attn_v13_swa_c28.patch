@@ -1,0 +1,162 @@
+diff -ruN a/attn_common_v13.cuh b/attn_common_v13.cuh
+--- a/attn_common_v13.cuh	2026-11-24 16:26:08
++++ b/attn_common_v13.cuh	2026-11-24 18:27:57
+@@ -222,6 +222,16 @@
+     return policy;
+ }
+ 
++static __device__ __forceinline__ uint64_t make_l2_evict_last_policy() {
++    uint64_t policy = 0ULL;
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++    float frac = 1.0f;
++    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, %1;"
++                 : "=l"(policy) : "f"(frac));
++#endif
++    return policy;
++}
++
+ static __device__ __forceinline__ void cp_async_cg_16(uint32_t smem_addr, const void* gmem_ptr) {
+     asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
+                  :: "r"(smem_addr), "l"(gmem_ptr) : "memory");
+@@ -277,7 +287,7 @@
+ 
+ // =========================================================================
+ // Exact IEEE-754 Runtime Split-KV Weight Sum Tree (0-ULP vs V11 `<S>`!)
+-//   Covers ALL S in {2, 3, 4, 6, 8, 12, 16, 24, 32, 48} with ZERO template bloat.
++//   Covers ALL S in {2, 3, 4, 5, 6, 8, 9, 10, 12, 16, 24, 32, 48} with ZERO template bloat.
+ // =========================================================================
+ static __device__ __forceinline__ float reduce_splits_sum_warp_rt(float my_w, int num_splits) {
+     float v = my_w;
+@@ -964,6 +974,10 @@
+     const uint32_t work_sptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_work));
+     uint4* smem_kv0_4 = reinterpret_cast<uint4*>(smem_kv0);
+     uint4* smem_kv1_4 = reinterpret_cast<uint4*>(smem_kv1);
++    // Wave-V14: Pin 3x-reused Local SWA-1024 KV (512 KiB/req <= 4 MiB @ B=8) in GB10 24 MiB L2
++    // across mt=0..2 CTAs and protect it from concurrent wo_ud L2PF streaming (0-ULP pure hint!).
++    constexpr bool kSwaL2EvictLast = (WINDOW >= 0);
++    const uint64_t l2_policy_mgs = kSwaL2EvictLast ? make_l2_evict_last_policy() : 0ULL;
+ 
+     const bool tile0_is_past = (!USE_PDL) && (s_beg < s_end_live) && ((s_beg + BN) <= past);
+     if (tile0_is_past) {
+@@ -974,9 +988,9 @@
+             KV_blk_slot[tid_all] = make_int2(bt_row[lblk], slot);
+         }
+         __syncthreads();
+-        issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, false, 0ULL, tid_all);
++        issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, kSwaL2EvictLast, l2_policy_mgs, tid_all);
+         cp_async_commit();
+-        issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, false, 0ULL, tid_all);
++        issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, kSwaL2EvictLast, l2_policy_mgs, tid_all);
+         cp_async_commit();
+     } else {
+         __syncthreads();
+@@ -1043,9 +1057,9 @@
+         __syncthreads();
+ 
+         if (!tile0_is_past) {
+-            issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, false, 0ULL, tid_all);
++            issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, kSwaL2EvictLast, l2_policy_mgs, tid_all);
+             cp_async_commit();
+-            issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, false, 0ULL, tid_all);
++            issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, kSwaL2EvictLast, l2_policy_mgs, tid_all);
+             cp_async_commit();
+         }
+ 
+@@ -1168,7 +1182,7 @@
+             __syncthreads();
+ 
+             if (n_next < s_end_live) {
+-                issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, false, 0ULL, tid_all);
++                issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, kSwaL2EvictLast, l2_policy_mgs, tid_all);
+                 cp_async_commit();
+             }
+ 
+@@ -1244,7 +1258,7 @@
+             }
+             if (n_next < s_end_live) {
+                 __syncthreads();
+-                issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, false, 0ULL, tid_all);
++                issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, kSwaL2EvictLast, l2_policy_mgs, tid_all);
+                 cp_async_commit();
+             }
+         }
+diff -ruN a/attn_dispatch_v13.cu b/attn_dispatch_v13.cu
+--- a/attn_dispatch_v13.cu	2026-11-24 16:30:05
++++ b/attn_dispatch_v13.cu	2026-11-24 18:27:57
+@@ -12,21 +12,23 @@
+ static bool g_v13_smem_inited = false;
+ 
+ static inline bool is_valid_swa_splits(int s) {
+-    return (s == 1 || s == 2 || s == 4 || s == 6 || s == 8);
++    return (s == 1 || s == 2 || s == 3 || s == 4 || s == 5 || s == 6 ||
++            s == 8 || s == 9 || s == 10 || s == 12);
+ }
+ 
+ static inline bool is_valid_global_splits(int s) {
+-    return (s == 1 || s == 2 || s == 3 || s == 4 || s == 6 || s == 8 ||
+-            s == 12 || s == 16 || s == 24 || s == 32 || s == 48);
++    return (s == 1 || s == 2 || s == 3 || s == 4 || s == 5 || s == 6 || s == 8 ||
++            s == 9 || s == 10 || s == 12 || s == 16 || s == 24 || s == 32 || s == 48);
+ }
+ 
+ static inline bool is_valid_short_splits(int s) {
+-    return (s == 1 || s == 2 || s == 3 || s == 4 || s == 6 || s == 8 || s == 12 || s == 16);
++    return (s == 1 || s == 2 || s == 3 || s == 4 || s == 5 || s == 6 || s == 8 ||
++            s == 9 || s == 10 || s == 12 || s == 16);
+ }
+ 
+ static inline bool is_valid_long_splits(int s) {
+-    return (s == 2 || s == 3 || s == 4 || s == 6 || s == 8 || s == 12 || s == 16 ||
+-            s == 24 || s == 32 || s == 48);
++    return (s == 2 || s == 3 || s == 4 || s == 5 || s == 6 || s == 8 ||
++            s == 9 || s == 10 || s == 12 || s == 16 || s == 24 || s == 32 || s == 48);
+ }
+ 
+ static inline int dispatch_mgs_v13(const AttnLaunchParams& p, bool kv_bf12, int tree_mode) {
+@@ -174,15 +176,16 @@
+ }  // namespace
+ 
+ // =========================================================================
+-// EXPORTED C ABI SYMBOLS (22 symbols: 100% superset of V7..V11 + V13!)
++// EXPORTED C ABI SYMBOLS (24 symbols: 100% superset of V7..V13 + V14!)
+ // =========================================================================
+ 
+-extern "C" int fused_decode_attn_v7_version(void)  { return 13; }
+-extern "C" int fused_decode_attn_v8_version(void)  { return 13; }
+-extern "C" int fused_decode_attn_v9_version(void)  { return 13; }
+-extern "C" int fused_decode_attn_v10_version(void) { return 13; }
+-extern "C" int fused_decode_attn_v11_version(void) { return 13; }
+-extern "C" int fused_decode_attn_v13_version(void) { return 13; }
++extern "C" int fused_decode_attn_v7_version(void)  { return 14; }
++extern "C" int fused_decode_attn_v8_version(void)  { return 14; }
++extern "C" int fused_decode_attn_v9_version(void)  { return 14; }
++extern "C" int fused_decode_attn_v10_version(void) { return 14; }
++extern "C" int fused_decode_attn_v11_version(void) { return 14; }
++extern "C" int fused_decode_attn_v13_version(void) { return 14; }
++extern "C" int fused_decode_attn_v14_version(void) { return 14; }
+ 
+ extern "C" int fused_decode_attn_v13_init_smem(void) {
+     if (g_v13_smem_inited) return 0;
+@@ -194,6 +197,7 @@
+     return 0;
+ }
+ 
++extern "C" int fused_decode_attn_v14_init_smem(void) { return fused_decode_attn_v13_init_smem(); }
+ extern "C" int fused_decode_attn_v11_init_smem(void) { return fused_decode_attn_v13_init_smem(); }
+ extern "C" int fused_decode_attn_v10_init_smem(void) { return fused_decode_attn_v13_init_smem(); }
+ extern "C" int fused_decode_attn_v9_init_smem(void)  { return fused_decode_attn_v13_init_smem(); }
+diff -ruN a/attn_swa_v13.cu b/attn_swa_v13.cu
+--- a/attn_swa_v13.cu	2026-11-24 16:30:00
++++ b/attn_swa_v13.cu	2026-11-24 18:27:57
+@@ -1,7 +1,9 @@
+ // SPDX-License-Identifier: Apache-2.0
+-// Wave-V13 Split TU 2/5: Local SWA-1024 Decode Attention (`attn_swa_v13.cu`)
++// Wave-V14 Split TU 2/5: Local SWA-1024 Decode Attention (`attn_swa_c28_v14.cu` / `attn_swa_v13.cu`)
+ //   ONLY 36 kernels total (BF16 + SWAR KV-BF12, S_MODE in {0, 1}, MT_MAX in {1, 2, 3}, PDL=0/1).
+-//   Exact BL1_2x2 sum(p) + Order-A score+bias + ex2.approx.ftz.f32 (0-ULP 1dcfb306!).
++//   Supports full 0-dead-split B=2..8 SWA ladder S in {1, 2, 3, 4, 5, 6, 8, 9, 10, 12} via runtime
++//   `reduce_splits_sum_warp_rt`, `L2::evict_last` SWA KV pinning, `n_live` early-exit + KV clamping,
++//   and exact BL1_2x2 sum(p) + Order-A score+bias + ex2.approx.ftz.f32 (0-ULP 1dcfb306!).
+ 
+ #define ATTN_V13_DEVICE_TU 1
+ #include "attn_common_v13.cuh"

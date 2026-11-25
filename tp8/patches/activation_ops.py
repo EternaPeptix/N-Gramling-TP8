@@ -14,6 +14,8 @@ from .nvfp4 import FP32_MAX, _quantize_block, _store_block
 # as it starts, which hides its launch; with more, the waiting programs would
 # hold back the kernel's own.
 LAUNCH_DEPENDENTS_MAX_ROWS = 2048
+# Wave-V15 0-ULP invariant marker: _situ_quantize_kernel MUST keep enable_fp_fusion=False (sub_rn).
+_SITU_ENABLE_FP_FUSION_FALSE = True
 
 
 @triton.jit
@@ -252,13 +254,20 @@ def swiglu_quantize(
         values = torch.empty((num_rows, n), dtype=torch.float8_e4m3fn, device=x.device)
         scales = torch.empty((num_rows, -(-(n // 32) // 4) * 4), dtype=torch.uint8, device=x.device)
         row_scales = None
+    if num_rows == 0 or max_rows == 0:
+        return values, scales, row_scales
     if (
         n == 288
         and max_rows >= 256
         and gate_cap == 4.0
         and up_cap == 25.0
+        and x.is_cuda
         and x.dtype == torch.bfloat16
         and x.is_contiguous()
+        and gammas.is_contiguous()
+        and routed.is_contiguous()
+        and num_routed.is_contiguous()
+        and cta_expert.is_contiguous()
     ):
         try:
             from . import prefill_qf as _pqf
@@ -266,12 +275,24 @@ def swiglu_quantize(
         except Exception:
             _pqf, _lib = None, None
         if _lib is not None:
-            _scale_tile = 0 if _pqf.ROWMAJ_SCALES else tile
+            # Wave-V15 fix: row-major scales only valid for tile >= 32, require matching unpadded
+            # stride (n//16=18 for NVFP4, n//32=9 for MXFP8) and _inkling_rowmaj=True tag!
+            _use_rm_288 = bool(_pqf.ROWMAJ_SCALES and tile >= 32)
+            _scale_tile = 0 if _use_rm_288 else tile
+            _scales_in = (
+                torch.empty(
+                    (num_rows, n // 16 if nvfp4 else n // 32),
+                    dtype=scales.dtype,
+                    device=x.device,
+                )
+                if _use_rm_288
+                else scales
+            )
             _rc = _lib.launch_situ_quantize_288(
                 x.data_ptr(),
                 gammas.data_ptr(),
                 values.data_ptr(),
-                scales.data_ptr(),
+                _scales_in.data_ptr(),
                 0 if row_scales is None else row_scales.data_ptr(),
                 routed.data_ptr(),
                 num_routed.data_ptr(),
@@ -286,7 +307,9 @@ def swiglu_quantize(
                 int(torch.cuda.current_stream().cuda_stream),
             )
             if _rc == 0:
-                return values, scales, row_scales
+                if _use_rm_288:
+                    _scales_in._inkling_rowmaj = True  # type: ignore[attr-defined]
+                return values, _scales_in, row_scales
     _situ_quantize_kernel[(min(max_rows, 16384), n // (head + tail))](
         x,
         gammas,

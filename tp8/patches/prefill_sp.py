@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import os
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,6 +91,8 @@ _VALID_SP_RS_MODES = (
     "rhd_fp8_lowsm",
     "a2a_int8_lowsm",
     "a2a_fp8_lowsm",
+    "a2a_int8_pipe_lowsm",
+    "a2a_fp8_pipe_lowsm",
     "fp8_a2a",
     "int8_a2a",
     "int8_col",
@@ -195,8 +198,381 @@ DBO_INTERLEAVE = os.environ.get("INKLING_PREFILL_DBO_INTERLEAVE", "0").strip().l
 DBO_INTERLEAVE_LOCAL_ONLY = os.environ.get(
     "INKLING_PREFILL_DBO_INTERLEAVE_LOCAL_ONLY", "1"
 ).strip().lower() not in ("0", "", "off", "false", "no")
+# Wave-V11 opt-in Fused SConv+AttnRes+FP8-AG-Quant (`fused_sconv_ar_fp8_ag_v11_fwd`, default OFF):
+# Eliminates [S, H] BF16 out_shard round-trip (-234 GB DRAM, -8,256 quant launches), adds missing
+# DiscardBlkPtr ConvCache skip (-117 GB DRAM), and adds DBO-safe max_ctas throttling (0-ULP!).
+SP_FUSED_SCONV_FP8_AG = os.environ.get("INKLING_PREFILL_SP_FUSED_SCONV_FP8_AG", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+# Wave-V11 opt-in NIC-Pure Interleaved Half-1 (`INKLING_PREFILL_DBO_NIC_PURE_INTERLEAVE=1`, default OFF):
+# Moves BOTH `a2a_dequant_sum8[0:S-3]` AND `fused_sconv_ar_fp8_ag_v11` off `comm_stream` onto idle
+# `compute_stream` while keeping `comm_stream` 100% pure NIC wire (RS_B -> RS_A -> AG_B -> AG_A)!
+DBO_NIC_PURE_INTERLEAVE = os.environ.get(
+    "INKLING_PREFILL_DBO_NIC_PURE_INTERLEAVE", "0"
+).strip().lower() in ("1", "on", "true", "yes")
+# Wave-V11 opt-in Fused `wo_ud -> A2A_INT8_g64` (`INKLING_PF_WO_UD_FUSED_A2A=1`, default OFF):
+PF_WO_UD_FUSED_A2A = os.environ.get("INKLING_PF_WO_UD_FUSED_A2A", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+# Wave-V15 mixed prefill+decode SP guard (default ON): disables SP whenever active decode
+# requests share a chunked prefill batch so decode tokens never hit FP8 AG / compressed RS.
+SP_GUARD_MIXED_DECODE = os.environ.get(
+    "INKLING_PREFILL_SP_GUARD_MIXED_DECODE", "1"
+).strip().lower() not in ("0", "", "off", "false", "no")
 
 _LOGGED_ONCE: set[str] = set()
+_SP_EVENT_POOL: dict[Any, list[Any]] = {}
+_SP_EVENT_POOL_MAX = 64
+_ACTIVE_DBO_INSTANCES: weakref.WeakSet[PrefillAROverlap] = weakref.WeakSet()
+# Wave-V16 Non-Tail DSpark Drafter Chunk Tracker (zero-GPU-sync, abort-safe):
+# Tracks single-request chunked prefill progress so `dspark_model.py` can skip 100% dead
+# drafter KV prefill on early chunks (`remaining_prompt_tokens > DRAFT_GLOBAL_WINDOW + 256`)
+# when opted in via `INKLING_PF_SKIP_NONTAIL_DRAFT_V16=1`, while auto-resetting on mid-1M
+# aborts, new requests, decode batches, or multi-request batches.
+_PREFILL_CHUNK_STATE: dict[str, Any] = {
+    "prompt_total": None,
+    "chunk_end": 0,
+    "chunk_tokens": 0,
+    "remaining": None,
+    "num_prefill_reqs": 0,
+    "num_decode_reqs": 0,
+    "is_single_req_prefill": False,
+}
+_PROMPT_LEN_RESOLVER: Any = None
+
+
+def _is_stream_capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _acquire_sp_event(device: Any = None) -> torch.cuda.Event:
+    """Acquire a CUDA event from a bounded per-device pool (only reuses completed events)."""
+    key = str(device) if device is not None else "default"
+    pool = _SP_EVENT_POOL.get(key)
+    if pool:
+        for i, ev in enumerate(pool):
+            try:
+                if ev.query():
+                    return pool.pop(i)
+            except Exception:
+                pass
+    return torch.cuda.Event()
+
+
+def _release_sp_event(device: Any, ev: Any) -> None:
+    """Return a CUDA event to the bounded per-device pool for future reuse."""
+    if ev is None:
+        return
+    key = str(device) if device is not None else "default"
+    pool = _SP_EVENT_POOL.setdefault(key, [])
+    if len(pool) < _SP_EVENT_POOL_MAX:
+        pool.append(ev)
+
+
+def _has_decode_reqs_in_meta(
+    attn_metadata: Any = None,
+    first_attn_prefix: str = "",
+) -> bool:
+    """Zero-GPU-sync check whether `attn_metadata` (or active ForwardContext) contains decode reqs."""
+    am = attn_metadata
+    if am is None:
+        try:
+            from vllm.forward_context import get_forward_context, is_forward_context_available
+
+            if not is_forward_context_available():
+                return False
+            am = getattr(get_forward_context(), "attn_metadata", None)
+        except Exception:
+            return False
+    if am is None:
+        return False
+    if isinstance(am, dict):
+        if first_attn_prefix and first_attn_prefix in am:
+            metas = (am[first_attn_prefix],)
+        else:
+            metas = tuple(am.values())
+    else:
+        metas = (am,)
+    for m in metas:
+        if m is None:
+            continue
+        nd = getattr(m, "num_decode_reqs", None)
+        if nd is None:
+            nd = getattr(m, "num_decodes", None)
+        if nd is not None and int(nd) > 0:
+            return True
+    return False
+
+
+def set_active_prompt_total_tokens(total_tokens: int | None) -> None:
+    """Set or clear the active solo prefill prompt total length (tokens) for V16 non-tail draft skip."""
+    if total_tokens is None or int(total_tokens) <= 0:
+        _PREFILL_CHUNK_STATE["prompt_total"] = None
+        _PREFILL_CHUNK_STATE["remaining"] = None
+    else:
+        _PREFILL_CHUNK_STATE["prompt_total"] = int(total_tokens)
+
+
+def register_prompt_len_resolver(resolver: Any | None) -> None:
+    """Register an optional zero-sync callback `(md, chunk_tokens, chunk_end) -> int | None`
+    returning the total prompt token length (or None if unknown) for the active solo prefill."""
+    global _PROMPT_LEN_RESOLVER
+    _PROMPT_LEN_RESOLVER = resolver
+
+
+def clear_prefill_chunk_state() -> None:
+    """Reset all tracked solo-prefill chunk progress (safe on idle transitions / request aborts)."""
+    _PREFILL_CHUNK_STATE["prompt_total"] = None
+    _PREFILL_CHUNK_STATE["chunk_end"] = 0
+    _PREFILL_CHUNK_STATE["chunk_tokens"] = 0
+    _PREFILL_CHUNK_STATE["remaining"] = None
+    _PREFILL_CHUNK_STATE["num_prefill_reqs"] = 0
+    _PREFILL_CHUNK_STATE["num_decode_reqs"] = 0
+    _PREFILL_CHUNK_STATE["is_single_req_prefill"] = False
+
+
+def _first_cpu_int(val: Any) -> int | None:
+    """Extract a non-negative scalar int from a Python int / list / numpy array / CPU tensor (ZERO GPU sync!)."""
+    if val is None:
+        return None
+    if isinstance(val, (int, np.integer)):
+        iv = int(val)
+        return iv if iv >= 0 else None
+    if isinstance(val, torch.Tensor):
+        if val.is_cuda or val.numel() != 1:
+            return None
+        iv = int(val.item())
+        return iv if iv >= 0 else None
+    try:
+        if len(val) == 1:
+            iv = int(val[0])
+            return iv if iv >= 0 else None
+    except Exception:
+        return None
+    return None
+
+
+def _select_first_attn_md(attn_metadata: Any = None, first_attn_prefix: str = "") -> tuple[Any, Any]:
+    """Return `(md, forward_context_or_None)` without any GPU synchronization."""
+    fc = None
+    am = attn_metadata
+    if am is None:
+        try:
+            from vllm.forward_context import get_forward_context, is_forward_context_available
+
+            if is_forward_context_available():
+                fc = get_forward_context()
+                am = getattr(fc, "attn_metadata", None)
+        except Exception:
+            return None, None
+    if am is None:
+        return None, fc
+    if isinstance(am, dict):
+        if first_attn_prefix and first_attn_prefix in am:
+            return am[first_attn_prefix], fc
+        for v in am.values():
+            if v is not None and (
+                hasattr(v, "num_prefill_reqs") or hasattr(v, "num_decode_reqs") or hasattr(v, "seq_lens_cpu")
+            ):
+                return v, fc
+        return None, fc
+    return am, fc
+
+
+def record_prefill_chunk_state(
+    num_tokens: int,
+    attn_metadata: Any = None,
+    first_attn_prefix: str = "",
+    *,
+    prompt_total_tokens: int | None = None,
+    remaining_prompt_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Record zero-sync solo-prefill chunk progress and detect mid-1M aborts / new requests.
+
+    Strict abort-safety invariant:
+      - If `chunk_end < prev_chunk_end` OR (`prev_chunk_end > 0 and chunk_end <= num_tokens`),
+        a new request has started (or a prior 1M prefill was aborted), so any cached
+        `prompt_total` from the previous request is IMMEDIATELY invalidated unless explicitly
+        supplied for this new chunk.
+      - Whenever `num_decode_reqs > 0`, `num_prefill_reqs != 1`, or stream capture is active,
+        marks `is_single_req_prefill=False` and `remaining=None`.
+    """
+    nt = int(num_tokens)
+    if nt <= 0 or _is_stream_capturing():
+        _PREFILL_CHUNK_STATE["is_single_req_prefill"] = False
+        _PREFILL_CHUNK_STATE["remaining"] = None
+        return dict(_PREFILL_CHUNK_STATE)
+
+    md, fc = _select_first_attn_md(attn_metadata, first_attn_prefix)
+    n_dec = 0
+    n_pf = 0
+    chunk_end = 0
+    if md is not None:
+        nd_raw = getattr(md, "num_decode_reqs", None)
+        if nd_raw is None:
+            nd_raw = getattr(md, "num_decodes", 0)
+        np_raw = getattr(md, "num_prefill_reqs", None)
+        if np_raw is None:
+            np_raw = getattr(md, "num_prefills", 0)
+        n_dec = int(nd_raw or 0)
+        n_pf = int(np_raw or 0)
+        ce = _first_cpu_int(getattr(md, "seq_lens_cpu", None))
+        if ce is None:
+            ce = _first_cpu_int(getattr(md, "seq_lens", None))
+        if ce is not None:
+            chunk_end = ce
+
+    _PREFILL_CHUNK_STATE["num_decode_reqs"] = n_dec
+    _PREFILL_CHUNK_STATE["num_prefill_reqs"] = n_pf
+    _PREFILL_CHUNK_STATE["chunk_tokens"] = nt
+
+    if n_dec > 0 or (md is not None and n_pf != 1):
+        _PREFILL_CHUNK_STATE["is_single_req_prefill"] = False
+        _PREFILL_CHUNK_STATE["remaining"] = None
+        if n_dec > 0:
+            _PREFILL_CHUNK_STATE["prompt_total"] = None
+            _PREFILL_CHUNK_STATE["chunk_end"] = 0
+        return dict(_PREFILL_CHUNK_STATE)
+
+    prev_end = int(_PREFILL_CHUNK_STATE["chunk_end"] or 0)
+    # Detect mid-1M abort or start of a brand-new request!
+    if chunk_end > 0 and ((chunk_end < prev_end) or (prev_end > 0 and chunk_end <= nt)):
+        _PREFILL_CHUNK_STATE["prompt_total"] = None
+        _PREFILL_CHUNK_STATE["remaining"] = None
+
+    rem_val: int | None = None
+    if remaining_prompt_tokens is not None:
+        rem_val = max(0, int(remaining_prompt_tokens))
+    else:
+        for obj in (md, fc):
+            if obj is None:
+                continue
+            r_attr = _first_cpu_int(getattr(obj, "remaining_prompt_tokens", None))
+            if r_attr is not None:
+                rem_val = r_attr
+                break
+
+    pt_val: int | None = None
+    if prompt_total_tokens is not None and int(prompt_total_tokens) > 0:
+        pt_val = int(prompt_total_tokens)
+    else:
+        for obj in (md, fc):
+            if obj is None:
+                continue
+            for attr in ("total_prompt_tokens", "prompt_total_tokens", "num_prompt_tokens", "prompt_lens_cpu"):
+                cand = _first_cpu_int(getattr(obj, attr, None))
+                if cand is not None and cand > 0:
+                    pt_val = cand
+                    break
+            if pt_val is not None:
+                break
+        if pt_val is None and _PROMPT_LEN_RESOLVER is not None:
+            try:
+                cand = _PROMPT_LEN_RESOLVER(md, nt, chunk_end)
+                if cand is not None and int(cand) > 0:
+                    pt_val = int(cand)
+            except Exception:
+                pt_val = None
+
+    if pt_val is not None:
+        _PREFILL_CHUNK_STATE["prompt_total"] = pt_val
+    cached_pt = _PREFILL_CHUNK_STATE["prompt_total"]
+
+    if cached_pt is not None and chunk_end > int(cached_pt):
+        _PREFILL_CHUNK_STATE["prompt_total"] = None
+        cached_pt = None
+
+    if rem_val is None and cached_pt is not None and chunk_end > 0:
+        rem_val = max(0, int(cached_pt) - chunk_end)
+
+    _PREFILL_CHUNK_STATE["chunk_end"] = chunk_end
+    _PREFILL_CHUNK_STATE["remaining"] = rem_val
+    _PREFILL_CHUNK_STATE["is_single_req_prefill"] = (n_dec == 0 and (md is None or n_pf == 1))
+    return dict(_PREFILL_CHUNK_STATE)
+
+
+def get_active_prefill_remaining_tokens(
+    chunk_tokens: int | None = None,
+    attn_metadata: Any = None,
+    first_attn_prefix: str = "",
+) -> int | None:
+    """Return known remaining prompt tokens after the current solo prefill chunk, or None if unknown/unsafe."""
+    if _is_stream_capturing():
+        return None
+    md, fc = _select_first_attn_md(attn_metadata, first_attn_prefix)
+    if md is not None:
+        nd = getattr(md, "num_decode_reqs", None)
+        if nd is None:
+            nd = getattr(md, "num_decodes", 0)
+        np_r = getattr(md, "num_prefill_reqs", None)
+        if np_r is None:
+            np_r = getattr(md, "num_prefills", 0)
+        if int(nd or 0) > 0 or int(np_r or 0) != 1:
+            return None
+        for obj in (md, fc):
+            if obj is None:
+                continue
+            r_attr = _first_cpu_int(getattr(obj, "remaining_prompt_tokens", None))
+            if r_attr is not None:
+                return r_attr
+        ce = _first_cpu_int(getattr(md, "seq_lens_cpu", None))
+        if ce is None:
+            ce = _first_cpu_int(getattr(md, "seq_lens", None))
+        if ce is not None and ce > 0:
+            for obj in (md, fc):
+                if obj is None:
+                    continue
+                for attr in ("total_prompt_tokens", "prompt_total_tokens", "num_prompt_tokens", "prompt_lens_cpu"):
+                    pt = _first_cpu_int(getattr(obj, attr, None))
+                    if pt is not None and pt >= ce:
+                        return pt - ce
+            if _PROMPT_LEN_RESOLVER is not None:
+                try:
+                    pt = _PROMPT_LEN_RESOLVER(md, int(chunk_tokens or 0), ce)
+                    if pt is not None and int(pt) >= ce:
+                        return int(pt) - ce
+                except Exception:
+                    pass
+            prev_end = int(_PREFILL_CHUNK_STATE["chunk_end"] or 0)
+            if (ce < prev_end) or (
+                prev_end > 0 and chunk_tokens is not None and ce <= int(chunk_tokens)
+            ):
+                _PREFILL_CHUNK_STATE["prompt_total"] = None
+                _PREFILL_CHUNK_STATE["remaining"] = None
+                return None
+
+    if not _PREFILL_CHUNK_STATE["is_single_req_prefill"]:
+        return None
+    if int(_PREFILL_CHUNK_STATE["num_decode_reqs"] or 0) > 0:
+        return None
+    if chunk_tokens is not None and int(_PREFILL_CHUNK_STATE["chunk_tokens"] or 0) > 0:
+        if int(chunk_tokens) != int(_PREFILL_CHUNK_STATE["chunk_tokens"]):
+            return None
+    rem = _PREFILL_CHUNK_STATE["remaining"]
+    return int(rem) if rem is not None and int(rem) >= 0 else None
+
+
+def release_prefill_scratch() -> int:
+    """Drain live DBO `comm_stream`s and release SP/DBO scratch caches & pooled CUDA events.
+    Safe on idle transitions and post-abort cleanup after mid-1M cancellation (capture-guarded)."""
+    if _is_stream_capturing():
+        return 0
+    for dbo in list(_ACTIVE_DBO_INSTANCES):
+        try:
+            dbo.drain_comm_stream()
+        except Exception:
+            pass
+    freed = 0
+    for entry in PrefillAROverlap._SOLO_META_CACHE.values():
+        for t in entry:
+            freed += int(t.numel() * t.element_size())
+    PrefillAROverlap._SOLO_META_CACHE.clear()
+    _SP_EVENT_POOL.clear()
+    clear_prefill_chunk_state()
+    return freed
 
 
 def _log_once(key: str, msg: str) -> None:
@@ -355,12 +731,25 @@ class PrefillSPPlan:
         tail_rows: int,
         prefix_sync_mode: str = "eager",
     ) -> PrefillSPPlan:
-        assert num_tokens % world_size == 0
+        if num_tokens <= 0 or world_size <= 0 or num_tokens % world_size != 0:
+            raise ValueError(
+                f"PrefillSPPlan.build requires num_tokens > 0 divisible by world_size "
+                f"(got num_tokens={num_tokens}, world_size={world_size})"
+            )
         shard_size = num_tokens // world_size
+        if shard_size < HALO_ROWS:
+            raise ValueError(
+                f"PrefillSPPlan.build requires shard_size >= {HALO_ROWS} (got {shard_size})"
+            )
         begin = rank * shard_size
         end = begin + shard_size
         halo = 0 if rank == 0 else HALO_ROWS
-        positions_s = positions[begin:end].contiguous()
+        if positions.ndim > 1:
+            positions_s = positions[..., begin:end].contiguous()
+            pos_1d = positions[0]
+        else:
+            positions_s = positions[begin:end].contiguous()
+            pos_1d = positions
 
         if conv_md is None:
             return cls(
@@ -390,6 +779,10 @@ class PrefillSPPlan:
             )
 
         device = positions.device
+        if int(conv_md.slot_mapping.shape[0]) < num_tokens:
+            raise ValueError(
+                f"conv_md.slot_mapping too short: {int(conv_md.slot_mapping.shape[0])} < {num_tokens}"
+            )
         slot_mapping = conv_md.slot_mapping[:num_tokens]
         seq_idx = conv_md.seq_idx[:num_tokens]
         query_start = conv_md.query_start[:num_tokens]
@@ -450,7 +843,7 @@ class PrefillSPPlan:
                 discard_blk_dev=discard_blk_dev,
                 rank0_last3_slots=rank0_last3_slots,
                 lazy_def_meta=(
-                    positions[:num_tokens],
+                    pos_1d[:num_tokens],
                     slot_mapping,
                     seq_idx,
                     query_start,
@@ -461,7 +854,7 @@ class PrefillSPPlan:
 
         real_slots = _real_slot_mask(slot_mapping, n_cache)
         full_sync_mask = compute_sp_sync_mask(
-            positions[:num_tokens],
+            pos_1d[:num_tokens],
             slot_mapping,
             seq_idx,
             query_start,
@@ -507,7 +900,7 @@ class PrefillSPPlan:
             # Deferred rows: strictly real (non-discard) prefix-boundary & request-tail slots
             # in chronological order, with ZERO spurious shard-end halo rows when S % align != 0.
             def_mask = compute_sp_sync_mask(
-                positions[:num_tokens],
+                pos_1d[:num_tokens],
                 slot_mapping,
                 seq_idx,
                 query_start,
@@ -966,9 +1359,10 @@ def sync_deferred_conv_caches(
 
     if comm_stream is not None:
         cur = torch.cuda.current_stream(c0.device)
-        ev_in = torch.cuda.Event()
+        ev_in = _acquire_sp_event(c0.device)
         ev_in.record(cur)
         comm_stream.wait_event(ev_in)
+        _release_sp_event(c0.device, ev_in)
         for _t in (
             def_plan.my_src_blk,
             def_plan.my_src_off,
@@ -980,9 +1374,10 @@ def sync_deferred_conv_caches(
                 _t.record_stream(comm_stream)
         with torch.cuda.stream(comm_stream):
             _run()
-            ev_out = torch.cuda.Event()
+            ev_out = _acquire_sp_event(c0.device)
             ev_out.record(comm_stream)
         cur.wait_event(ev_out)
+        _release_sp_event(c0.device, ev_out)
     else:
         _run()
 
@@ -1030,6 +1425,16 @@ def _tp_reduce_scatter_into(
         if rs_mode in ("rdma_int8_col", "rdma_bf12"):
             rs_mode = rs_mode[5:]
 
+    # 0. Wave-V11 pre-quantized fused `wo_ud -> A2A_INT8_g64` partial (ZERO a2a_quant kernel!)
+    from . import prefill_sp_rs as _sp_rs_chk
+
+    if isinstance(partial, _sp_rs_chk.PreQuantA2APartial):
+        if _sp_rs_chk.compressed_reduce_scatter_prequant_into(
+            partial, out_shard, lowsm_ctas=lowsm_ctas_override
+        ):
+            return
+        raise RuntimeError("PreQuantA2APartial reduce_scatter_prequant_into failed")
+
     # 2. Optional compressed ReduceScatter (`rhd_*` | `a2a_*_lowsm` | `fp8_a2a` | `int8_a2a` | `int8_col` | `bf12`, T >= SP_RS_MIN_T)
     if (
         rs_mode in (
@@ -1039,6 +1444,8 @@ def _tp_reduce_scatter_into(
             "rhd_fp8_lowsm",
             "a2a_int8_lowsm",
             "a2a_fp8_lowsm",
+            "a2a_int8_pipe_lowsm",
+            "a2a_fp8_pipe_lowsm",
             "fp8_a2a",
             "int8_a2a",
             "int8_col",
@@ -1226,6 +1633,8 @@ def _sharded_short_conv_halo_torch(
       3. Optional residual update: `((conv_res + conv_addend) + y)` in fp32, rounded to bf16.
     """
     S, D = conv_out.shape
+    if S <= 0:
+        return conv_out
     W = int(conv_weight.shape[1])
     assert W == 4 and stream_width == D
     n_cache = int(cache.shape[2])
@@ -1324,6 +1733,212 @@ def scatter_remote_conv_cache(
         plan.remote_dst_off,
         stream_offset : stream_offset + stream_width,
     ] = rows
+
+
+@dataclass
+class PreQuantFP8Shard:
+    """Pre-quantized `[S, D]` FP8-E4M3FN + `[S, 1]` FP32 scale for `q=0` emitted directly
+    by `fused_sconv_ar_fp8_ag_v11_fwd` (+ optional `[2, S, D]` BF16 `aux_bf16` for `q=1,2`)."""
+
+    x_fp8_s: torch.Tensor
+    x_scale_s: torch.Tensor
+    aux_bf16: torch.Tensor | None = None
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        self.x_fp8_s.record_stream(stream)
+        self.x_scale_s.record_stream(stream)
+        if self.aux_bf16 is not None:
+            self.aux_bf16.record_stream(stream)
+
+
+def run_sharded_sconv_attn_res_v11(
+    sconv_mod: Any,  # Inkling2ShortConv
+    x_with_halo: torch.Tensor,  # [halo + S, D] bf16
+    plan: PrefillSPPlan,
+    conv_out: torch.Tensor,  # [S, D] bf16
+    stack: torch.Tensor,  # [n_stack, S, D] bf16
+    mix_last: torch.Tensor | None,  # [S, D] bf16 or None
+    queries: torch.Tensor,  # [nq, D] fp32
+    norm: Any,  # Inkling2RMSNorm
+    normalize_values: bool,
+    conv_addend: torch.Tensor | None = None,
+    conv_res: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    *,
+    want_fp8_q0: bool = False,
+    max_ctas: int = 0,
+) -> torch.Tensor | PreQuantFP8Shard:
+    """Wave-V11 fused 0-ULP `ShortConv + AttnRes + RMSNorm + DiscardBlkPtr Skip + Direct
+    FP8-E4M3FN Rowwise AG Quant` (`fused_sconv_ar_fp8_ag_v11_fwd` in `libpf_rhd_comm_v11.so`).
+    Falls back transparently to `run_sharded_sconv_attn_res` whenever disabled or unsupported."""
+    if (
+        SP_FUSED_SCONV_FP8_AG
+        and plan.has_cache
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        from . import prefill_sp_rs as _sp_rs
+        from .sconv import conv_metadata
+
+        rhd_lib = _sp_rs._get_rhd_comm_lib()
+        v11_fn = (
+            getattr(rhd_lib, "fused_sconv_ar_fp8_ag_v11_fwd", None)
+            if rhd_lib is not None
+            else None
+        )
+        m = conv_metadata(sconv_mod.owner)
+        S, D = conv_out.shape
+        nq = int(queries.shape[0])
+        n_stack = int(stack.shape[0])
+        if v11_fn is not None and m is not None and D == 4608 and nq in (1, 3) and 1 <= n_stack <= 8 and normalize_values:
+            offset, width = sconv_mod.owner.stream_ranges[sconv_mod.stream]
+            c = sconv_mod.owner.kv_cache
+            cw = sconv_mod.conv_weight
+            x_cur = x_with_halo[plan.halo :]
+            if (
+                c.shape[1] == 1
+                and width == D
+                and cw.shape == (D, 4)
+                and cw.is_contiguous()
+                and x_with_halo.dtype == torch.bfloat16
+                and x_with_halo.is_contiguous()
+                and c.dtype == torch.bfloat16
+                and cw.dtype == torch.bfloat16
+                and norm.weight.dtype == torch.bfloat16
+                and stack.dtype == torch.bfloat16
+                and queries.dtype == torch.float32
+                and plan.positions_s.dtype == torch.int64
+                and plan.slot_mapping_s is not None
+                and plan.slot_mapping_s.dtype == torch.int64
+                and plan.seq_idx_s is not None
+                and plan.seq_idx_s.dtype == torch.int32
+                and m.block_table.dtype == torch.int32
+                and plan.qstart_local is not None
+                and plan.qstart_local.dtype == torch.int32
+                and c.stride(3) == 1
+                and conv_out.is_contiguous()
+                and queries.is_contiguous()
+                and norm.weight.is_contiguous()
+                and stack.stride(1) == D
+                and stack.stride(2) == 1
+                and (conv_res is None or (conv_res.is_contiguous() and conv_res.dtype == torch.bfloat16))
+                and (conv_addend is None or (conv_addend.is_contiguous() and conv_addend.dtype == torch.bfloat16))
+                and (mix_last is None or (mix_last.is_contiguous() and mix_last.dtype == torch.bfloat16))
+                and not (conv_res is not None and conv_addend is None)
+            ):
+                discard_ptr = (
+                    0 if plan.discard_blk_dev is None else int(plan.discard_blk_dev.data_ptr())
+                )
+                stream_u64 = int(torch.cuda.current_stream(x_with_halo.device).cuda_stream)
+                if want_fp8_q0:
+                    out_fp8 = torch.empty((S, D), dtype=torch.float8_e4m3fn, device=x_with_halo.device)
+                    out_sc = torch.empty((S, 1), dtype=torch.float32, device=x_with_halo.device)
+                    out_aux = (
+                        torch.empty((2, S, D), dtype=torch.bfloat16, device=x_with_halo.device)
+                        if nq == 3
+                        else None
+                    )
+                    rc = v11_fn(
+                        x_cur.data_ptr(),
+                        cw.data_ptr(),
+                        c.data_ptr(),
+                        conv_out.data_ptr(),
+                        0 if conv_res is None else conv_res.data_ptr(),
+                        0 if conv_addend is None else conv_addend.data_ptr(),
+                        plan.positions_s.data_ptr(),
+                        plan.seq_idx_s.data_ptr(),
+                        plan.slot_mapping_s.data_ptr(),
+                        m.block_table.data_ptr(),
+                        plan.qstart_local.data_ptr(),
+                        stack.data_ptr(),
+                        0 if mix_last is None else mix_last.data_ptr(),
+                        queries.data_ptr(),
+                        norm.weight.data_ptr(),
+                        out_fp8.data_ptr(),
+                        out_sc.data_ptr(),
+                        0 if out_aux is None else out_aux.data_ptr(),
+                        discard_ptr,
+                        int(x_cur.stride(0)),
+                        int(c.stride(0)),
+                        int(c.stride(2)),
+                        int(m.block_table.stride(0)),
+                        int(m.block_table.shape[1]),
+                        int(c.shape[2]),
+                        int(offset),
+                        int(stack.stride(0)),
+                        nq,
+                        S,
+                        n_stack,
+                        float(5**-0.5),
+                        float(eps),
+                        float(norm.eps),
+                        1 if conv_res is not None else 0,
+                        1 if conv_addend is not None else 0,
+                        1 if mix_last is not None else 0,
+                        1,
+                        int(max_ctas),
+                        stream_u64,
+                    )
+                    if rc == 0:
+                        return PreQuantFP8Shard(x_fp8_s=out_fp8, x_scale_s=out_sc, aux_bf16=out_aux)
+                else:
+                    out_bf16 = torch.empty((nq, S, D), dtype=torch.bfloat16, device=x_with_halo.device)
+                    rc = v11_fn(
+                        x_cur.data_ptr(),
+                        cw.data_ptr(),
+                        c.data_ptr(),
+                        conv_out.data_ptr(),
+                        0 if conv_res is None else conv_res.data_ptr(),
+                        0 if conv_addend is None else conv_addend.data_ptr(),
+                        plan.positions_s.data_ptr(),
+                        plan.seq_idx_s.data_ptr(),
+                        plan.slot_mapping_s.data_ptr(),
+                        m.block_table.data_ptr(),
+                        plan.qstart_local.data_ptr(),
+                        stack.data_ptr(),
+                        0 if mix_last is None else mix_last.data_ptr(),
+                        queries.data_ptr(),
+                        norm.weight.data_ptr(),
+                        0,
+                        0,
+                        out_bf16.data_ptr(),
+                        discard_ptr,
+                        int(x_cur.stride(0)),
+                        int(c.stride(0)),
+                        int(c.stride(2)),
+                        int(m.block_table.stride(0)),
+                        int(m.block_table.shape[1]),
+                        int(c.shape[2]),
+                        int(offset),
+                        int(stack.stride(0)),
+                        nq,
+                        S,
+                        n_stack,
+                        float(5**-0.5),
+                        float(eps),
+                        float(norm.eps),
+                        1 if conv_res is not None else 0,
+                        1 if conv_addend is not None else 0,
+                        1 if mix_last is not None else 0,
+                        0,
+                        int(max_ctas),
+                        stream_u64,
+                    )
+                    if rc == 0:
+                        return out_bf16
+    return run_sharded_sconv_attn_res(
+        sconv_mod=sconv_mod,
+        x_with_halo=x_with_halo,
+        plan=plan,
+        conv_out=conv_out,
+        stack=stack,
+        mix_last=mix_last,
+        queries=queries,
+        norm=norm,
+        normalize_values=normalize_values,
+        conv_addend=conv_addend,
+        conv_res=conv_res,
+        eps=eps,
+    )
 
 
 def run_sharded_sconv_attn_res(
@@ -1571,16 +2186,27 @@ class PrefillSeqParallel:
         self.min_tokens = SP_MIN_TOKENS
         self.q3_mode = SP_Q3_MODE
 
-    def eligible(self, num_tokens: int) -> bool:
+    def eligible(
+        self,
+        num_tokens: int,
+        attn_metadata: Any = None,
+        first_attn_prefix: str = "",
+    ) -> bool:
         if not SP_ENABLED or self.world_size <= 1:
             return False
-        if torch.cuda.is_current_stream_capturing():
+        if _is_stream_capturing():
             return False
         if num_tokens < self.min_tokens:
             return False
         if num_tokens % self.world_size != 0:
             return False
-        return (num_tokens // self.world_size) >= HALO_ROWS
+        if (num_tokens // self.world_size) < HALO_ROWS:
+            return False
+        # Wave-V15 mixed prefill+decode guard: never enable SP when decode reqs are mixed in!
+        if SP_GUARD_MIXED_DECODE and _has_decode_reqs_in_meta(attn_metadata, first_attn_prefix):
+            return False
+        record_prefill_chunk_state(num_tokens, attn_metadata, first_attn_prefix)
+        return True
 
     def pad_target(
         self,
@@ -1592,7 +2218,7 @@ class PrefillSeqParallel:
         (`INKLING_PREFILL_SP_PAD_TAIL=1`, `T >= SP_PAD_MIN_T`, `T % world_size != 0`), or 0."""
         if not (SP_ENABLED and SP_PAD_TAIL) or self.world_size <= 1:
             return 0
-        if torch.cuda.is_current_stream_capturing():
+        if _is_stream_capturing():
             return 0
         if num_tokens < max(self.min_tokens, SP_PAD_MIN_T):
             return 0
@@ -1610,6 +2236,7 @@ class PrefillSeqParallel:
         t_pad = ((num_tokens + align - 1) // align) * align
         if (t_pad // self.world_size) < HALO_ROWS:
             return 0
+        record_prefill_chunk_state(num_tokens, attn_metadata, first_attn_prefix)
         return t_pad
 
     def build_plan(
@@ -1659,8 +2286,11 @@ class PrefillSeqParallel:
            - In `eager` mode: unified `k_sync`-row RDMA AG.
         Returns `(x_with_halo, gathered_sync)`.
         """
+        from . import prefill_sp_rs as _sp_rs_p
+
         halo = plan.halo
-        x_with_halo = partial.new_empty((halo + plan.shard_size, self.hidden_size))
+        _tpl = partial.local_shard if isinstance(partial, _sp_rs_p.PreQuantA2APartial) else partial
+        x_with_halo = _tpl.new_empty((halo + plan.shard_size, self.hidden_size))
         x_shard = x_with_halo[halo:]
         _tp_reduce_scatter_into(
             partial, x_shard, self.mode, plan.begin, plan.end,
@@ -1677,7 +2307,7 @@ class PrefillSeqParallel:
             if plan.halo_only:
                 # Last 3 rows are already contiguous at x_shard[-HALO_ROWS:] -> zero index_select!
                 my_last3 = x_shard[-HALO_ROWS:]
-                recv_prev = x_with_halo[:HALO_ROWS] if halo > 0 else partial.new_empty((HALO_ROWS, self.hidden_size))
+                recv_prev = x_with_halo[:HALO_ROWS] if halo > 0 else _tpl.new_empty((HALO_ROWS, self.hidden_size))
                 if _tp_ring_shift_into(recv_prev, my_last3):
                     gathered_sync = recv_prev if halo == 0 else None
                     if sconv_mod is not None and has_remote and gathered_sync is not None:
@@ -1719,7 +2349,15 @@ class PrefillSeqParallel:
         Returns list of `Q` full `[T, H]` tensors (`Q=1` for 88 sublayers, `Q=3` for 8 global-next),
         or `[x_q_full, PreprojectedGlobalKV, PreprojectedGlobalKV]` when `repl_kv` is active."""
         x_with_halo, _ = self.reduce_scatter_and_halo(partial, plan, sconv_mod=sconv_mod)
-        out_shard = run_sharded_sconv_attn_res(
+        _want_fp8_q0 = bool(
+            SP_FUSED_SCONV_FP8_AG
+            and SP_FP8_AG
+            and fp8_ag_modes is not None
+            and len(fp8_ag_modes) >= 1
+            and fp8_ag_modes[0] == "direct"
+            and SP_AG_MODE == "nccl_fp8_zcopy_lowsm"
+        )
+        out_shard = run_sharded_sconv_attn_res_v11(
             sconv_mod=sconv_mod,
             x_with_halo=x_with_halo,
             plan=plan,
@@ -1731,6 +2369,8 @@ class PrefillSeqParallel:
             normalize_values=normalize_values,
             conv_addend=conv_addend,
             conv_res=conv_res,
+            want_fp8_q0=_want_fp8_q0,
+            max_ctas=0,
         )
         return self.gather_queries(
             out_shard, next_global_repl=next_global_repl, fp8_ag_modes=fp8_ag_modes
@@ -1738,16 +2378,53 @@ class PrefillSeqParallel:
 
     def gather_queries(
         self,
-        out_shard: torch.Tensor,
+        out_shard: torch.Tensor | PreQuantFP8Shard,
         next_global_repl: GlobalKVReplWeights | None = None,
         fp8_ag_modes: tuple[str, ...] | None = None,
         ag_transport_override: str | None = None,
         lowsm_ctas_override: int | None = None,
     ) -> list[Any]:
         """All-gather `[Q, S, H]` along dim=0 per query -> list of `Q` contiguous `[T, H]` tensors.
+        Supports Wave-V11 `PreQuantFP8Shard` (100% pure NIC wire, ZERO quant/unpack!).
         When `next_global_repl` is provided and `Q == 3` (`INKLING_PREFILL_SP_Q3=repl_kv`),
         AllGathers ONLY `x_q` and projects sharded `x_k, x_v` + 1 tiny `all_to_all` (20x less wire,
         100% BF16 exact!)."""
+        if isinstance(out_shard, PreQuantFP8Shard):
+            from . import prefill_sp_rs as _sp_rs
+
+            x_q_full = _sp_rs.compressed_all_gather_prequant_fp8_dim0(
+                out_shard.x_fp8_s,
+                out_shard.x_scale_s,
+                world_size=self.world_size,
+                all_gather_1d_fn=_tp_all_gather_dim0,
+            )
+            if out_shard.aux_bf16 is None:
+                return [x_q_full]
+            if next_global_repl is not None:
+                kv_preproj = global_kv_proj_fused_a2a(
+                    out_shard.aux_bf16[0],
+                    out_shard.aux_bf16[1],
+                    next_global_repl,
+                    _tp_all_to_all_dim0,
+                )
+                return [x_q_full, kv_preproj, kv_preproj]
+            eff_ag_tr = ag_transport_override if ag_transport_override else SP_AG_MODE
+            _def_m = "rhd" if eff_ag_tr != "nccl" else "bf16"
+            m1 = fp8_ag_modes[1] if (SP_FP8_AG and fp8_ag_modes is not None and len(fp8_ag_modes) == 3) else _def_m
+            m2 = fp8_ag_modes[2] if (SP_FP8_AG and fp8_ag_modes is not None and len(fp8_ag_modes) == 3) else _def_m
+            return [
+                x_q_full,
+                _tp_all_gather_mode(
+                    out_shard.aux_bf16[0], m1,
+                    ag_transport_override=ag_transport_override,
+                    lowsm_ctas_override=lowsm_ctas_override,
+                ),
+                _tp_all_gather_mode(
+                    out_shard.aux_bf16[1], m2,
+                    ag_transport_override=ag_transport_override,
+                    lowsm_ctas_override=lowsm_ctas_override,
+                ),
+            ]
         nq = int(out_shard.shape[0])
         eff_ag_tr = ag_transport_override if ag_transport_override else SP_AG_MODE
         _default_ag_mode = "rhd" if eff_ag_tr != "nccl" else "bf16"
@@ -2062,18 +2739,27 @@ def global_kv_proj_sharded_a2a(
 @dataclass
 class _AsyncHandle:
     out: Any
-    done_event: torch.cuda.Event
+    done_event: torch.cuda.Event | None
     comm_stream: torch.cuda.Stream
     gathered_sync: torch.Tensor | None = None
 
     def wait(self, compute_stream: torch.cuda.Stream) -> Any:
-        compute_stream.wait_event(self.done_event)
+        ev = self.done_event
+        if ev is not None:
+            compute_stream.wait_event(ev)
+            self.done_event = None
+            _release_sp_event(getattr(self.comm_stream, "device", None), ev)
         self.out.record_stream(compute_stream)
         sc = getattr(self.out, "_inkling_fp8_scale", None)
         if sc is not None:
             sc.record_stream(compute_stream)
         if self.gathered_sync is not None:
             self.gathered_sync.record_stream(compute_stream)
+        deq = getattr(self, "_v11_deq_desc", None)
+        if isinstance(deq, dict):
+            for _v in deq.values():
+                if isinstance(_v, torch.Tensor):
+                    _v.record_stream(compute_stream)
         return self.out
 
 
@@ -2084,14 +2770,18 @@ class _AsyncSPSublayerHandle:
     """
 
     outs: list[Any]
-    done_event: torch.cuda.Event
+    done_event: torch.cuda.Event | None
     comm_stream: torch.cuda.Stream
     aux: torch.Tensor | None = None
 
     def wait(
         self, compute_stream: torch.cuda.Stream
     ) -> tuple[list[Any], torch.Tensor | None]:
-        compute_stream.wait_event(self.done_event)
+        ev = self.done_event
+        if ev is not None:
+            compute_stream.wait_event(ev)
+            self.done_event = None
+            _release_sp_event(getattr(self.comm_stream, "device", None), ev)
         seen: set[int] = set()
         for t in self.outs:
             tid = id(t)
@@ -2130,13 +2820,19 @@ class PrefillAROverlap:
     def __init__(self, device: torch.device) -> None:
         self.device = device
         self._comm_stream: torch.cuda.Stream | None = None
+        _ACTIVE_DBO_INSTANCES.add(self)
+
+    def drain_comm_stream(self) -> None:
+        """Synchronize `comm_stream` if initialized (safe post-abort / idle barrier)."""
+        if self._comm_stream is not None:
+            self._comm_stream.synchronize()
 
     @property
     def comm_stream(self) -> torch.cuda.Stream:
         if self._comm_stream is None:
             st = torch.cuda.Stream(device=self.device, priority=-1)
             # Warm up per-stream cuBLAS handle eagerly outside capture (used by repl_kv GEMMs!)
-            if self.device.type == "cuda" and not torch.cuda.is_current_stream_capturing():
+            if self.device.type == "cuda" and not _is_stream_capturing():
                 with torch.cuda.stream(st):
                     _z = torch.empty((1, 16), dtype=torch.bfloat16, device=self.device)
                     _ = torch.mm(_z, _z.t())
@@ -2153,7 +2849,7 @@ class PrefillAROverlap:
     ) -> bool:
         if not AR_OVERLAP_ENABLED or world_size <= 1:
             return False
-        if torch.cuda.is_current_stream_capturing():
+        if _is_stream_capturing():
             return False
         if num_tokens < AR_OVERLAP_MIN_TOKENS:
             return False
@@ -2175,6 +2871,7 @@ class PrefillAROverlap:
             return False
         if getattr(md, "num_actual_tokens", -1) != num_tokens:
             return False
+        record_prefill_chunk_state(num_tokens, attn_metadata, first_attn_prefix)
         return True
 
     @staticmethod
@@ -2189,7 +2886,7 @@ class PrefillAROverlap:
         10.1 ms BF16 AllReduce + 563 ms Triton JIT stall (`INKLING_PREFILL_SP_PAD_TAIL=1`)."""
         if not (AR_OVERLAP_ENABLED and SP_PAD_TAIL) or world_size <= 1:
             return 0
-        if torch.cuda.is_current_stream_capturing():
+        if _is_stream_capturing():
             return 0
         if num_tokens < max(AR_OVERLAP_MIN_TOKENS, SP_PAD_MIN_T):
             return 0
@@ -2215,6 +2912,7 @@ class PrefillAROverlap:
         # Micro-batch A [0:t_pad//2) must contain strictly real tokens!
         if (t_pad // 2) >= num_tokens:
             return 0
+        record_prefill_chunk_state(num_tokens, attn_metadata, first_attn_prefix)
         return t_pad
 
     _SOLO_META_CACHE: dict[tuple[str, int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -2334,14 +3032,15 @@ class PrefillAROverlap:
         """Issue `all_reduce(partial)` asynchronously on `comm_stream`."""
         from vllm.distributed import tensor_model_parallel_all_reduce
 
-        ev_ready = torch.cuda.Event()
+        ev_ready = _acquire_sp_event(self.device)
         ev_ready.record(compute_stream)
         cs = self.comm_stream
         cs.wait_event(ev_ready)
+        _release_sp_event(self.device, ev_ready)
         partial.record_stream(cs)
         with torch.cuda.stream(cs):
             out = tensor_model_parallel_all_reduce(partial)
-            ev_done = torch.cuda.Event()
+            ev_done = _acquire_sp_event(self.device)
             ev_done.record(cs)
         return _AsyncHandle(out=out, done_event=ev_done, comm_stream=cs)
 
@@ -2355,16 +3054,18 @@ class PrefillAROverlap:
         """Issue SP `reduce_scatter + halo/sync RDMA AG` asynchronously on `comm_stream`.
         Note: remote `conv_state.kv_cache` scatter runs on `compute_stream` right after
         `wait()` so `kv_cache` writes stay ordered cleanly on `compute_stream`."""
-        ev_ready = torch.cuda.Event()
+        ev_ready = _acquire_sp_event(self.device)
         ev_ready.record(compute_stream)
         cs = self.comm_stream
         cs.wait_event(ev_ready)
+        _release_sp_event(self.device, ev_ready)
         partial.record_stream(cs)
+        plan.record_stream(cs)
         with torch.cuda.stream(cs):
             x_with_halo, gathered_sync = sp.reduce_scatter_and_halo(
                 partial, plan, sconv_mod=None
             )
-            ev_done = torch.cuda.Event()
+            ev_done = _acquire_sp_event(self.device)
             ev_done.record(cs)
         return _AsyncHandle(
             out=x_with_halo,
@@ -2382,10 +3083,11 @@ class PrefillAROverlap:
     ) -> list[_AsyncHandle]:
         """Issue SP `all_gather` (or `repl_kv` fused K/V proj + A2A for Q=3 global layers)
         asynchronously on `comm_stream`."""
-        ev_ready = torch.cuda.Event()
+        ev_ready = _acquire_sp_event(self.device)
         ev_ready.record(compute_stream)
         cs = self.comm_stream
         cs.wait_event(ev_ready)
+        _release_sp_event(self.device, ev_ready)
         out_shard.record_stream(cs)
         nq = int(out_shard.shape[0])
         handles: list[_AsyncHandle] = []
@@ -2394,13 +3096,13 @@ class PrefillAROverlap:
             if next_global_repl is not None and nq == 3:
                 q_mode = fp8_ag_modes[0] if (SP_FP8_AG and fp8_ag_modes is not None) else _default_ag_mode
                 g_q = _tp_all_gather_mode(out_shard[0], q_mode)
-                ev_q = torch.cuda.Event()
+                ev_q = _acquire_sp_event(self.device)
                 ev_q.record(cs)
                 handles.append(_AsyncHandle(out=g_q, done_event=ev_q, comm_stream=cs))
                 kv_pre = global_kv_proj_fused_a2a(
                     out_shard[1], out_shard[2], next_global_repl, _tp_all_to_all_dim0
                 )
-                ev_kv = torch.cuda.Event()
+                ev_kv = _acquire_sp_event(self.device)
                 ev_kv.record(cs)
                 h_kv = _AsyncHandle(out=kv_pre, done_event=ev_kv, comm_stream=cs)
                 handles.append(h_kv)
@@ -2413,7 +3115,7 @@ class PrefillAROverlap:
                     g = _tp_all_gather_mode(out_shard[q], "rhd")
                 else:
                     g = _tp_all_gather_dim0(out_shard[q])
-                ev_done = torch.cuda.Event()
+                ev_done = _acquire_sp_event(self.device)
                 ev_done.record(cs)
                 handles.append(_AsyncHandle(out=g, done_event=ev_done, comm_stream=cs))
         return handles
@@ -2425,16 +3127,18 @@ class PrefillAROverlap:
     ) -> torch.Tensor:
         """Run a single `all_gather(dim=0)` on `comm_stream` and synchronize `compute_stream`
         on its completion event (keeps ALL NCCL collectives strictly on `comm_stream`!)."""
-        ev_ready = torch.cuda.Event()
+        ev_ready = _acquire_sp_event(self.device)
         ev_ready.record(compute_stream)
         cs = self.comm_stream
         cs.wait_event(ev_ready)
+        _release_sp_event(self.device, ev_ready)
         tensor.record_stream(cs)
         with torch.cuda.stream(cs):
             out = _tp_all_gather_dim0(tensor)
-            ev_done = torch.cuda.Event()
+            ev_done = _acquire_sp_event(self.device)
             ev_done.record(cs)
         compute_stream.wait_event(ev_done)
+        _release_sp_event(self.device, ev_done)
         out.record_stream(compute_stream)
         return out
 
@@ -2472,18 +3176,39 @@ class PrefillAROverlap:
           - `ev_done` ensures all outputs (and `conv_state.kv_cache` on final drain) are
             complete before `compute_stream` consumes them.
         """
-        ev_ready = torch.cuda.Event()
+        ev_ready = _acquire_sp_event(self.device)
         ev_ready.record(compute_stream)
         cs = self.comm_stream
         cs.wait_event(ev_ready)
+        _release_sp_event(self.device, ev_ready)
         partial.record_stream(cs)
+        plan.record_stream(cs)
+        for _t in (conv_out, stack, mix_last, conv_addend, conv_res, need_aux_shard):
+            if _t is not None:
+                _t.record_stream(cs)
+        eff_ag_tr = ag_transport_override if ag_transport_override else SP_AG_MODE
+        _want_fp8_q0 = bool(
+            SP_FUSED_SCONV_FP8_AG
+            and SP_FP8_AG
+            and fp8_ag_modes is not None
+            and len(fp8_ag_modes) >= 1
+            and fp8_ag_modes[0] == "direct"
+            and eff_ag_tr == "nccl_fp8_zcopy_lowsm"
+        )
+        from . import prefill_sp_rs as _sp_rs_s
+
+        _sconv_ctas = (
+            int(lowsm_ctas_override)
+            if (lowsm_ctas_override is not None and int(lowsm_ctas_override) > 0)
+            else int(_sp_rs_s.SP_LOWSM_CTAS)
+        )
         with torch.cuda.stream(cs):
             x_with_halo, _ = sp.reduce_scatter_and_halo(
                 partial, plan, sconv_mod=sconv_mod,
                 rs_mode_override=rs_mode_override,
                 lowsm_ctas_override=lowsm_ctas_override,
             )
-            out_shard = run_sharded_sconv_attn_res(
+            out_shard = run_sharded_sconv_attn_res_v11(
                 sconv_mod=sconv_mod,
                 x_with_halo=x_with_halo,
                 plan=plan,
@@ -2495,6 +3220,8 @@ class PrefillAROverlap:
                 normalize_values=normalize_values,
                 conv_addend=conv_addend,
                 conv_res=conv_res,
+                want_fp8_q0=_want_fp8_q0,
+                max_ctas=_sconv_ctas,
             )
             outs = sp.gather_queries(
                 out_shard,
@@ -2508,7 +3235,7 @@ class PrefillAROverlap:
                 if need_aux_shard is not None
                 else None
             )
-            ev_done = torch.cuda.Event()
+            ev_done = _acquire_sp_event(self.device)
             ev_done.record(cs)
         return _AsyncSPSublayerHandle(
             outs=outs, done_event=ev_done, comm_stream=cs, aux=aux_g
@@ -2528,18 +3255,134 @@ class PrefillAROverlap:
         runs ONLY `reduce_scatter + halo/cache_sync` on `comm_stream` and returns an
         `_AsyncHandle` whose `.wait(compute_stream)` delivers `x_with_halo` to `compute_stream`
         so `run_sharded_sconv_attn_res` overlaps behind the next collective on `comm_stream`!"""
-        ev_ready = torch.cuda.Event()
+        ev_ready = _acquire_sp_event(self.device)
         ev_ready.record(compute_stream)
         cs = self.comm_stream
         cs.wait_event(ev_ready)
+        _release_sp_event(self.device, ev_ready)
         partial.record_stream(cs)
+        plan.record_stream(cs)
         with torch.cuda.stream(cs):
             x_with_halo, gathered_sync = sp.reduce_scatter_and_halo(
                 partial, plan, sconv_mod=sconv_mod,
                 rs_mode_override=rs_mode_override,
                 lowsm_ctas_override=lowsm_ctas_override,
             )
-            ev_done = torch.cuda.Event()
+            ev_done = _acquire_sp_event(self.device)
+            ev_done.record(cs)
+        return _AsyncHandle(
+            out=x_with_halo,
+            done_event=ev_done,
+            comm_stream=cs,
+            gathered_sync=gathered_sync,
+        )
+
+    def launch_sp_rs_wire_halo_only(
+        self,
+        sp: PrefillSeqParallel,
+        partial: Any,
+        sconv_mod: Any,
+        plan: PrefillSPPlan,
+        compute_stream: torch.cuda.Stream,
+        rs_mode_override: str | None = None,
+        lowsm_ctas_override: int | None = None,
+    ) -> _AsyncHandle:
+        """Wave-V11 NIC-Pure Interleaved Stage 1 (`INKLING_PREFILL_DBO_NIC_PURE_INTERLEAVE=1`):
+        Runs ONLY A2A wire + 3-row tail dequant (~1.5 us) + ring_shift halo (~15 us) on
+        `comm_stream`, returning `(x_with_halo, dequant_desc)` so `compute_stream` runs the
+        remaining `S - 3` dequant rows AND `fused_sconv_ar_fp8_ag_v11` at 48 SMs overlapped
+        behind the next NIC collective! Cleanly falls back to full `reduce_scatter_and_halo`
+        when preconditions (`halo_only`, V11 `.so`, A2A mode) are not met."""
+        from . import prefill_sp_rs as _sp_rs
+
+        ev_ready = _acquire_sp_event(self.device)
+        ev_ready.record(compute_stream)
+        cs = self.comm_stream
+        cs.wait_event(ev_ready)
+        _release_sp_event(self.device, ev_ready)
+        partial.record_stream(cs)
+        plan.record_stream(cs)
+        eff_rs = rs_mode_override if rs_mode_override else SP_RS_MODE
+        can_wire_only = (
+            plan.has_cache
+            and plan.halo_only
+            and plan.my_pack_idx is not None
+            and (
+                isinstance(partial, _sp_rs.PreQuantA2APartial)
+                or eff_rs in (
+                    "a2a_int8_lowsm",
+                    "a2a_fp8_lowsm",
+                    "a2a_int8_pipe_lowsm",
+                    "a2a_fp8_pipe_lowsm",
+                )
+            )
+        )
+        with torch.cuda.stream(cs):
+            deq_desc: dict[str, Any] | None = None
+            if can_wire_only:
+                halo = plan.halo
+                _tpl = (
+                    partial.local_shard
+                    if isinstance(partial, _sp_rs.PreQuantA2APartial)
+                    else partial
+                )
+                x_with_halo = _tpl.new_empty((halo + plan.shard_size, sp.hidden_size))
+                x_shard = x_with_halo[halo:]
+                deq_desc = _sp_rs.compressed_a2a_wire_and_last3_into(
+                    partial,
+                    x_shard,
+                    mode=eff_rs,
+                    world_size=sp.world_size,
+                    rank=sp.rank,
+                    halo_rows=HALO_ROWS,
+                    lowsm_ctas=lowsm_ctas_override,
+                )
+                if deq_desc is not None:
+                    my_last3 = x_shard[-HALO_ROWS:]
+                    recv_prev = (
+                        x_with_halo[:HALO_ROWS]
+                        if halo > 0
+                        else _tpl.new_empty((HALO_ROWS, sp.hidden_size))
+                    )
+                    has_remote = (
+                        plan.remote_gather_idx is not None
+                        or plan.rank0_last3_slots is not None
+                    )
+                    if _tp_ring_shift_into(recv_prev, my_last3):
+                        gathered_sync = recv_prev if halo == 0 else None
+                        if sconv_mod is not None and has_remote and gathered_sync is not None:
+                            offset, width = sconv_mod.owner.stream_ranges[sconv_mod.stream]
+                            scatter_remote_conv_cache(
+                                gathered_sync, plan, sconv_mod.owner.kv_cache, offset, width
+                            )
+                    else:
+                        gathered_sync = _tp_all_gather_dim0(my_last3.contiguous())
+                        if halo > 0 and plan.halo_gather_idx is not None:
+                            x_with_halo[:halo].copy_(
+                                gathered_sync.index_select(0, plan.halo_gather_idx)
+                            )
+                        if sconv_mod is not None and has_remote:
+                            offset, width = sconv_mod.owner.stream_ranges[sconv_mod.stream]
+                            scatter_remote_conv_cache(
+                                gathered_sync, plan, sconv_mod.owner.kv_cache, offset, width
+                            )
+                    ev_done = _acquire_sp_event(self.device)
+                    ev_done.record(cs)
+                    h = _AsyncHandle(
+                        out=x_with_halo,
+                        done_event=ev_done,
+                        comm_stream=cs,
+                        gathered_sync=None,
+                    )
+                    h._v11_deq_desc = deq_desc  # type: ignore[attr-defined]
+                    return h
+
+            x_with_halo, gathered_sync = sp.reduce_scatter_and_halo(
+                partial, plan, sconv_mod=sconv_mod,
+                rs_mode_override=rs_mode_override,
+                lowsm_ctas_override=lowsm_ctas_override,
+            )
+            ev_done = _acquire_sp_event(self.device)
             ev_done.record(cs)
         return _AsyncHandle(
             out=x_with_halo,
@@ -2551,7 +3394,7 @@ class PrefillAROverlap:
     def launch_sp_gather_only(
         self,
         sp: PrefillSeqParallel,
-        out_shard: torch.Tensor,
+        out_shard: torch.Tensor | PreQuantFP8Shard,
         compute_stream: torch.cuda.Stream,
         *,
         need_aux_shard: torch.Tensor | None = None,
@@ -2563,10 +3406,11 @@ class PrefillAROverlap:
         """Stage 2 of Hybrid NIC-First Interleaved DBO+SP (`INKLING_PREFILL_DBO_INTERLEAVE=1`):
         runs ONLY `gather_queries (+ optional aux AG)` on `comm_stream` after `compute_stream`
         produces `out_shard` (and optional `need_aux_shard`)."""
-        ev_ready = torch.cuda.Event()
+        ev_ready = _acquire_sp_event(self.device)
         ev_ready.record(compute_stream)
         cs = self.comm_stream
         cs.wait_event(ev_ready)
+        _release_sp_event(self.device, ev_ready)
         out_shard.record_stream(cs)
         if need_aux_shard is not None:
             need_aux_shard.record_stream(cs)
@@ -2583,7 +3427,7 @@ class PrefillAROverlap:
                 if need_aux_shard is not None
                 else None
             )
-            ev_done = torch.cuda.Event()
+            ev_done = _acquire_sp_event(self.device)
             ev_done.record(cs)
         return _AsyncSPSublayerHandle(
             outs=outs, done_event=ev_done, comm_stream=cs, aux=aux_g
@@ -2634,10 +3478,18 @@ def pad_prefill_sp_inputs(
     assert pad_n > 0
     device = inputs_embeds.device
 
-    pos_pad = torch.cat(
-        [positions[:orig_tokens], torch.zeros((pad_n,), dtype=positions.dtype, device=device)],
-        dim=0,
-    )
+    if positions.ndim == 1:
+        pos_pad = torch.cat(
+            [positions[:orig_tokens], torch.zeros((pad_n,), dtype=positions.dtype, device=device)],
+            dim=0,
+        )
+    else:
+        pos_slice = positions[..., :orig_tokens]
+        pad_shape = (*pos_slice.shape[:-1], pad_n)
+        pos_pad = torch.cat(
+            [pos_slice, torch.zeros(pad_shape, dtype=positions.dtype, device=device)],
+            dim=-1,
+        )
     emb_pad = torch.cat(
         [inputs_embeds, inputs_embeds.new_zeros((pad_n, inputs_embeds.shape[1]))],
         dim=0,

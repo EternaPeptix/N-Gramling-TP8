@@ -1,0 +1,45 @@
+# Wave-V16 8-Node Prometheus Telemetry Exporter Service (Install on Head Node: spark-one)
+# Parameterized template: substitute @V16_USER@ and @V16_INSTALL_DIR@ before enabling,
+# and configure cluster hosts/paths in /etc/inkling-v16/supervisor.env (ZERO hardcoded secrets!).
+[Unit]
+Description=Inkling-2-Small TP8 Wave-V16 8-Node Prometheus Telemetry Exporter (:9108)
+Documentation=file://@V16_INSTALL_DIR@/REPORT.md
+After=network-online.target docker.service
+Wants=network-online.target inkling-tp8-v15-supervisor.service
+
+[Service]
+Type=simple
+User=@V16_USER@
+Group=@V16_USER@
+WorkingDirectory=@V16_INSTALL_DIR@
+EnvironmentFile=-/etc/inkling-v15/supervisor.env
+EnvironmentFile=-/etc/inkling-v16/supervisor.env
+
+ExecStart=/usr/bin/env python3 @V16_INSTALL_DIR@/v16_metrics_exporter.py \
+  --bind ${V16_EXPORTER_BIND:-0.0.0.0} \
+  --port ${V16_EXPORTER_PORT:-9108} \
+  --vllm-host ${V15_HEAD_HOST:-127.0.0.1} \
+  --vllm-port ${PORT:-8010} \
+  --scrape-interval ${V16_EXPORTER_SCRAPE_INTERVAL_S:-5} \
+  --watchdog-state ${V15_STATE_DIR:-/var/lib/inkling-v15}/watchdog_state.json
+
+# Resilience & resource limits (lightweight exporter, never OOM-killed before workers)
+Restart=always
+RestartSec=5s
+TimeoutStopSec=15s
+OOMScoreAdjust=-300
+LimitNOFILE=65536
+
+# Security hardening (PrivateTmp=false so /dev/shm rank snapshots remain readable)
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/dev/shm
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=inkling-v16-exporter
+
+[Install]
+WantedBy=multi-user.target

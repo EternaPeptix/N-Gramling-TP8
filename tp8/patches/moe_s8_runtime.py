@@ -26,7 +26,9 @@ Rollout Controls (all default OFF unless `INKLING_MOE_S8=1` or set individually)
   - `INKLING_MOE_S8_FUSE_COMBINE=1`     : fuse exact slot-0..7 combine into W2 -> SendBuf (-48 launches/step)
   - `INKLING_MOE_S8_BN_MODE=adaptive`   : `adaptive` (2, default), `bn16` (1), or `bn32` (0)
   - `INKLING_MOE_S8_U_THRESH=37`        : Adaptive BN=16 / BN=32 cutoff (`1 <= U <= u_thresh` -> BN=16)
-  - `INKLING_MOE_S8_QUANT_FMA=1`        : Router K2 NVFP4 quant error FMA mode (1=fmaf, 0=unfused)
+  - `INKLING_MOE_S8_ROUTER_QUANT_FMA=1` : Router X->NVFP4 quant error FMA (1=fmaf, matches exact_s7)
+  - `INKLING_MOE_S8_W2_QUANT_FMA=0`     : W13/QDeqA/W2 SiTU->NVFP4 error FMA (0=sub_rn, matches Triton)
+  - `INKLING_MOE_S8_NVFP4_ONLY=0`       : 1-boot A/B knob restricting S8 strictly to NVFP4 L0..39
 """
 
 from __future__ import annotations
@@ -70,11 +72,21 @@ _RAW_B2_BN_MODE = os.environ.get("INKLING_MOE_S8_B2_BN_MODE", "").strip()
 S8_B2_BN_MODE: int | None = _parse_bn_mode(_RAW_B2_BN_MODE) if _RAW_B2_BN_MODE else None
 _RAW_B2_U_THRESH = os.environ.get("INKLING_MOE_S8_B2_U_THRESH", "").strip()
 S8_B2_U_THRESH: int | None = int(_RAW_B2_U_THRESH) if _RAW_B2_U_THRESH else None
-# Wave-V12 Forensic Fix: decouple S8_QUANT_FMA from INKLING_MOE_V9_QUANT_FMA!
-# S8 C=1..2 Router + W13->QDeqA + W2 matches live 1dcfb306 with fmaf (1), whereas
-# C=2..32 NVFP4 W2 uses sub_rn (INKLING_MOE_V9_QUANT_FMA=0). Setting V9_QUANT_FMA=0
-# must NOT silently break S8_QUANT_FMA!
-S8_QUANT_FMA = 1 if _env_flag("INKLING_MOE_S8_QUANT_FMA", True) else 0
+# Wave-V13 Forensic 0-ULP Fix: decouple S8 Router FFMA (=1) from S8 W13/QDeqA/W2 sub_rn (=0)!
+# SM121a cubin SASS proof of live 10/10 S7 baseline (1dcfb30680d0252c):
+#   - Router X -> NVFP4 (librouter_bf12_exact.so):          FFMA   (S8_ROUTER_QUANT_FMA = 1)
+#   - SiTU -> W2 NVFP4 (Triton activation_ops.py:311):      sub_rn (S8_W2_QUANT_FMA = 0)
+# V12-B4 (coupled=1) gave 0/10 (9859daa8); V12-B10 (coupled=0) gave 2/10 (a5dc798c).
+# S8_W2_QUANT_FMA strictly does NOT inherit INKLING_MOE_S8_QUANT_FMA so a stale
+# INKLING_MOE_S8_QUANT_FMA=1 in live_champion_v12.env can never taint W13/QDeqA/W2!
+S8_ROUTER_QUANT_FMA = (
+    1
+    if _env_flag("INKLING_MOE_S8_ROUTER_QUANT_FMA", _env_flag("INKLING_MOE_S8_QUANT_FMA", True))
+    else 0
+)
+S8_W2_QUANT_FMA = 1 if _env_flag("INKLING_MOE_S8_W2_QUANT_FMA", False) else 0
+S8_QUANT_FMA = S8_ROUTER_QUANT_FMA  # backward-compatible alias
+S8_NVFP4_ONLY = _env_flag("INKLING_MOE_S8_NVFP4_ONLY", False)
 
 
 def _parse_mx7_v5_mode() -> str:
@@ -90,11 +102,23 @@ def _parse_mx7_v5_mode() -> str:
 
 MX7_V5_MODE: str = _parse_mx7_v5_mode()
 MX7_V5_THRESH: int = max(0, min(63, int(os.environ.get("INKLING_MX7_V5_THRESH", "32") or "32")))
+# Wave-V16 C=1..2 L2::evict_first + LPT Dynamic Queue + W2 Pre-Wait Hoist (ALL default OFF -> 100% V15 invariant!)
+NVFP4_C1_V16: bool = _env_flag("INKLING_NVFP4_C1_V16", False)
+NVFP4_C1_V16_EVICT: int = max(0, min(2, int(os.environ.get("INKLING_NVFP4_C1_V16_EVICT", "1" if NVFP4_C1_V16 else "0") or "0")))
+NVFP4_C1_V16_LPT: int = max(0, min(2, int(os.environ.get("INKLING_NVFP4_C1_V16_LPT", "2" if NVFP4_C1_V16 else "0") or "0")))
+MX7_C1_V16: bool = _env_flag("INKLING_MX7_C1_V16", False)
+MX7_C1_V16_LPT: int = max(0, min(2, int(os.environ.get("INKLING_MX7_C1_V16_LPT", "2" if MX7_C1_V16 else "0") or "0")))
+# Wave-V14 C=1..2 0-ULP Max-Occupancy MX7 MoE knobs (ALL default OFF -> 100% V13 invariant!)
+MX7_C1_V14: bool = _env_flag("INKLING_MX7_C1_V14", MX7_C1_V16)
+MX7_C1_V14_FUSE_QDEQ: bool = _env_flag("INKLING_MX7_C1_V14_FUSE_QDEQ", MX7_C1_V14)
+MX7_C1_V14_EVICT: int = 1 if _env_flag("INKLING_MX7_C1_V14_EVICT", MX7_C1_V14) else 0
 NVFP4_V6: bool = _env_flag("INKLING_NVFP4_V6", False)
 NVFP4_C1_V9: bool = _env_flag("INKLING_NVFP4_C1_V9", False)
 NVFP4_C1_V9_QDEQ: bool = _env_flag("INKLING_NVFP4_C1_V9_QDEQ", NVFP4_C1_V9)
+# Wave-V13 C=1..2 0-ULP Max-Occupancy NVFP4 MoE knob (default OFF -> 100% V12 invariant!)
+NVFP4_C1_V13: bool = _env_flag("INKLING_NVFP4_C1_V13", NVFP4_C1_V16)
 # Wave-V12 C=1..2 0-ULP NVFP4 MoE knob (default OFF -> 100% V10 invariant!)
-NVFP4_C1_V12: bool = _env_flag("INKLING_NVFP4_C1_V12", False)
+NVFP4_C1_V12: bool = _env_flag("INKLING_NVFP4_C1_V12", NVFP4_C1_V13)
 # Wave-V10 C=1..2 MoE + Single-Launch Fused Router knobs (ALL default OFF -> 100% V9 invariant!)
 ROUTER_V10_FUSED: bool = _env_flag("INKLING_ROUTER_V10_FUSED", False)
 ROUTER_BF11: bool = _env_flag("INKLING_ROUTER_BF11", False)
@@ -120,6 +144,22 @@ _ROUTER_PATHS = (
 )
 _NVFP4_PATHS = (
     os.environ.get("INKLING_NVFP4_WS5_S8_LIB", "").strip(),
+    *(
+        (
+            "/rdma/libnvfp4_ws5_c1_v16.so",
+            os.path.join(_DIR, "libnvfp4_ws5_c1_v16.so"),
+        )
+        if NVFP4_C1_V16
+        else ()
+    ),
+    *(
+        (
+            "/rdma/libnvfp4_ws5_c1_v13.so",
+            os.path.join(_DIR, "libnvfp4_ws5_c1_v13.so"),
+        )
+        if NVFP4_C1_V13
+        else ()
+    ),
     *(
         (
             "/rdma/libnvfp4_ws5_c1_v12.so",
@@ -159,7 +199,23 @@ _NVFP4_PATHS = (
     os.path.join(_DIR, "libnvfp4_ws5_s8.so"),
 )
 _MX7_PATHS = (
-    os.environ.get("INKLING_MX7_S8_LIB", ""),
+    os.environ.get("INKLING_MX7_S8_LIB", "").strip(),
+    *(
+        (
+            "/rdma/libmxfp8_mx7_c1_v16.so",
+            os.path.join(_DIR, "libmxfp8_mx7_c1_v16.so"),
+        )
+        if MX7_C1_V16
+        else ()
+    ),
+    *(
+        (
+            "/rdma/libmxfp8_mx7_c1_v14.so",
+            os.path.join(_DIR, "libmxfp8_mx7_c1_v14.so"),
+        )
+        if (MX7_C1_V14 or MX7_C1_V14_FUSE_QDEQ)
+        else ()
+    ),
     *(
         (
             "/rdma/libmxfp8_mx7_c1_v5.so",
@@ -384,6 +440,22 @@ def get_nvfp4_lib(path: str | None = None) -> ctypes.CDLL | None:
                 ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
             ]
             lib.nvfp4_w2_ws5_c1_v6_fma_fwd.restype = ctypes.c_int
+        if hasattr(lib, "nvfp4_w13_ws5_c1_v16_fwd"):
+            lib.nvfp4_w13_ws5_c1_v16_fwd.argtypes = [
+                *[ctypes.c_void_p] * 15,
+                *[ctypes.c_int] * 15,
+                ctypes.c_void_p,
+                ctypes.c_uint64,
+            ]
+            lib.nvfp4_w13_ws5_c1_v16_fwd.restype = ctypes.c_int
+        if hasattr(lib, "nvfp4_w2_ws5_c1_v16_fwd"):
+            lib.nvfp4_w2_ws5_c1_v16_fwd.argtypes = [
+                *[ctypes.c_void_p] * 19,
+                *[ctypes.c_int] * 13,
+                ctypes.c_void_p,
+                ctypes.c_uint64,
+            ]
+            lib.nvfp4_w2_ws5_c1_v16_fwd.restype = ctypes.c_int
         if hasattr(lib, "nvfp4_w13_ws5_c1_v10_fwd"):
             lib.nvfp4_w13_ws5_c1_v10_fwd.argtypes = [
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -618,6 +690,143 @@ def get_mx7_lib(path: str | None = None) -> ctypes.CDLL | None:
                 ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
             ]
             lib.mx7_w2_c1_v5_panel_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_c1_min_cta"):
+            lib.mx7_c1_min_cta.argtypes = []
+            lib.mx7_c1_min_cta.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w13_c1_v16_fwd"):
+            lib.mx7_w13_c1_v16_fwd.argtypes = [
+                *[ctypes.c_void_p] * 13,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                *[ctypes.c_int] * 9,
+                ctypes.c_void_p, ctypes.c_uint64,
+            ]
+            lib.mx7_w13_c1_v16_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w2_c1_v16_fwd"):
+            lib.mx7_w2_c1_v16_fwd.argtypes = [
+                *[ctypes.c_void_p] * 14,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                *[ctypes.c_int] * 9,
+                ctypes.c_void_p, ctypes.c_uint64,
+            ]
+            lib.mx7_w2_c1_v16_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w13_c1_v16_compat_fwd"):
+            lib.mx7_w13_c1_v16_compat_fwd.argtypes = [
+                *[ctypes.c_void_p] * 16,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                *[ctypes.c_int] * 9,
+                ctypes.c_void_p, ctypes.c_uint64,
+            ]
+            lib.mx7_w13_c1_v16_compat_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w2_c1_v16_compat_fwd"):
+            lib.mx7_w2_c1_v16_compat_fwd.argtypes = [
+                *[ctypes.c_void_p] * 17,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                *[ctypes.c_int] * 9,
+                ctypes.c_void_p, ctypes.c_uint64,
+            ]
+            lib.mx7_w2_c1_v16_compat_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w13_c1_v16_panel_fwd"):
+            lib.mx7_w13_c1_v16_panel_fwd.argtypes = [
+                *[ctypes.c_void_p] * 14,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                *[ctypes.c_int] * 9,
+                ctypes.c_void_p, ctypes.c_uint64,
+            ]
+            lib.mx7_w13_c1_v16_panel_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w2_c1_v16_panel_fwd"):
+            lib.mx7_w2_c1_v16_panel_fwd.argtypes = [
+                *[ctypes.c_void_p] * 15,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                *[ctypes.c_int] * 9,
+                ctypes.c_void_p, ctypes.c_uint64,
+            ]
+            lib.mx7_w2_c1_v16_panel_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w13_c1_v14_fwd"):
+            lib.mx7_w13_c1_v14_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+            ]
+            lib.mx7_w13_c1_v14_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w2_c1_v14_fwd"):
+            lib.mx7_w2_c1_v14_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+            ]
+            lib.mx7_w2_c1_v14_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w13_c1_v14_compat_fwd"):
+            lib.mx7_w13_c1_v14_compat_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+            ]
+            lib.mx7_w13_c1_v14_compat_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w2_c1_v14_compat_fwd"):
+            lib.mx7_w2_c1_v14_compat_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+            ]
+            lib.mx7_w2_c1_v14_compat_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w13_c1_v14_panel_fwd"):
+            lib.mx7_w13_c1_v14_panel_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+            ]
+            lib.mx7_w13_c1_v14_panel_fwd.restype = ctypes.c_int
+        if hasattr(lib, "mx7_w2_c1_v14_panel_fwd"):
+            lib.mx7_w2_c1_v14_panel_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+            ]
+            lib.mx7_w2_c1_v14_panel_fwd.restype = ctypes.c_int
     else:
         lib.mx7_w13_s8_fwd.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -675,6 +884,7 @@ def get_workspace(device: torch.device) -> dict[str, torch.Tensor]:
             "row_amax_in": torch.empty((16,), dtype=torch.float32, device=device),
             "router_arrive": torch.zeros((1,), dtype=torch.int32, device=device),
             "tile_qdeq_done": torch.zeros((_WS_MAX_CTAS,), dtype=torch.int32, device=device),
+            "work_queue": torch.zeros((64,), dtype=torch.int32, device=device),
         }
         _WS[idx] = ws
     return ws
@@ -920,6 +1130,10 @@ def route_bf12_s8(
         `_inkling_src2compact` (`[T*8]`), and optional `_inkling_row_amax_w2` (`[T*8]`, pre-zeroed!)
         onto `tiles` so downstream W13/W2 consume them directly with zero extra launches.
     """
+    if not S8_ROUTER:
+        return None
+    if S8_NVFP4_ONLY and weight_amax is None:
+        return None
     lib = get_router_lib()
     if lib is None:
         return None
@@ -1002,7 +1216,7 @@ def route_bf12_s8(
                 0 if weight_denominator is None else weight_denominator.data_ptr(),
                 tokens, float(route_scale), int(be11), int(num_local),
                 int(plan.tile), int(plan.max_ctas), 1 if nvfp4 else 0,
-                int(S8_QUANT_FMA), int(pdl), st,
+                int(S8_ROUTER_QUANT_FMA), int(pdl), st,
             )
             if rc != 0:
                 raise RuntimeError(f"router_bf11_c1_fused_v10_fwd failed with cudaError={rc}")
@@ -1023,7 +1237,7 @@ def route_bf12_s8(
                 0 if weight_denominator is None else weight_denominator.data_ptr(),
                 tokens, float(route_scale), int(base_exp), int(num_local),
                 int(plan.tile), int(plan.max_ctas), 1 if nvfp4 else 0,
-                int(S8_QUANT_FMA), int(pdl), st,
+                int(S8_ROUTER_QUANT_FMA), int(pdl), st,
             )
             if rc != 0:
                 raise RuntimeError(f"router_bf12_c1_fused_v10_fwd failed with cudaError={rc}")
@@ -1054,7 +1268,7 @@ def route_bf12_s8(
             0 if weight_denominator is None else weight_denominator.data_ptr(),
             tokens, float(route_scale), int(base_exp), int(num_local),
             int(plan.tile), int(plan.max_ctas), 1 if nvfp4 else 0,
-            int(S8_QUANT_FMA), int(pdl), st,
+            int(S8_ROUTER_QUANT_FMA), int(pdl), st,
         )
         if rc != 0:
             raise RuntimeError(f"router_bf12_c1_v4_fwd failed with cudaError={rc}")
@@ -1167,6 +1381,8 @@ def forward_experts_s8(
     act, act_scale, row_scale = quantized
     n_compact = tokens * experts.topk  # <= 128
 
+    if S8_NVFP4_ONLY and not experts.nvfp4:
+        return None
     if experts.nvfp4:
         lib = get_nvfp4_lib()
         if lib is None or not getattr(lib, "_inkling_v4", False):
@@ -1212,9 +1428,45 @@ def forward_experts_s8(
                 and hasattr(lib, "nvfp4_situ_quant_dequant_c1_v9_fwd")
             )
         )
-        w13_pw = 1 if (use_pdl and use_zs) else 0
-        w13_td = 1 if (use_pdl and use_fs) else 0
-        if use_c1_v10_fuse_qdeq:
+        use_c1_v16 = (
+            NVFP4_C1_V16
+            and get_nvfp4_version() >= 16
+            and hasattr(lib, "nvfp4_w13_ws5_c1_v16_fwd")
+            and hasattr(lib, "nvfp4_w2_ws5_c1_v16_fwd")
+        )
+        w13_pw = 1 if use_pdl else 0
+        w13_td = 1 if use_pdl else 0
+        if use_c1_v16:
+            rc = lib.nvfp4_w13_ws5_c1_v16_fwd(
+                act.data_ptr(), act_scale.data_ptr(), row_scale.data_ptr(),
+                m13["slabs"].data_ptr(), ws_base_13.data_ptr(),
+                m13["p_off"].data_ptr(), m13["patches"].data_ptr(),
+                experts.ones.data_ptr(), tiles.data_ptr(),
+                0 if not use_zs else tile_mask.data_ptr(),
+                0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                gammas.data_ptr() if use_fs else 0,
+                row_amax_w2.data_ptr() if use_fs else 0,
+                w13_out.data_ptr(),
+                ws["tile_qdeq_done"].data_ptr() if use_c1_v10_fuse_qdeq else 0,
+                576, 4608, plan.max_ctas, plan.tile,
+                1 if use_zs else 0, 1 if use_fs else 0,
+                1 if use_c1_qdeq else 0,
+                eff_bn_mode, 3 if eff_bn_mode == 3 else eff_u_thresh,
+                w13_pw, w13_td, 1 if use_c1_v10_fuse_qdeq else 0, S8_W2_QUANT_FMA,
+                NVFP4_C1_V16_EVICT, NVFP4_C1_V16_LPT, ws["work_queue"].data_ptr(), st,
+            )
+            if rc != 0:
+                raise RuntimeError(f"nvfp4_w13_ws5_c1_v16_fwd failed with cudaError={rc}")
+            if use_c1_qdeq and not use_c1_v10_fuse_qdeq:
+                rc = lib.nvfp4_situ_quant_dequant_c1_v9_fwd(
+                    w13_out.data_ptr(), w13_out.data_ptr(), row_amax_w2.data_ptr(),
+                    tiles.data_ptr(), tile_compact_start.data_ptr(),
+                    plan.max_ctas, plan.tile, n_compact,
+                    1 if use_pdl else 0, 1 if use_pdl else 0, S8_W2_QUANT_FMA, st,
+                )
+                if rc != 0:
+                    raise RuntimeError(f"nvfp4_situ_quant_dequant_c1_v9_fwd failed with cudaError={rc}")
+        elif use_c1_v10_fuse_qdeq:
             rc = lib.nvfp4_w13_ws5_c1_v10_fwd(
                 act.data_ptr(), act_scale.data_ptr(), row_scale.data_ptr(),
                 m13["slabs"].data_ptr(), ws_base_13.data_ptr(),
@@ -1229,7 +1481,7 @@ def forward_experts_s8(
                 576, 4608, plan.max_ctas, plan.tile,
                 1 if use_zs else 0, 1 if use_fs else 0, 1,
                 eff_bn_mode, 3 if eff_bn_mode == 3 else eff_u_thresh,
-                w13_pw, w13_td, 1, S8_QUANT_FMA, st,
+                w13_pw, w13_td, 1, S8_W2_QUANT_FMA, st,
             )
             if rc != 0:
                 raise RuntimeError(f"nvfp4_w13_ws5_c1_v10_fwd failed with cudaError={rc}")
@@ -1257,7 +1509,7 @@ def forward_experts_s8(
                     w13_out.data_ptr(), w13_out.data_ptr(), row_amax_w2.data_ptr(),
                     tiles.data_ptr(), tile_compact_start.data_ptr(),
                     plan.max_ctas, plan.tile, n_compact,
-                    1 if use_pdl else 0, 1 if use_pdl else 0, S8_QUANT_FMA, st,
+                    1 if use_pdl else 0, 1 if use_pdl else 0, S8_W2_QUANT_FMA, st,
                 )
                 if rc != 0:
                     raise RuntimeError(f"nvfp4_situ_quant_dequant_c1_v9_fwd failed with cudaError={rc}")
@@ -1297,9 +1549,36 @@ def forward_experts_s8(
         if use_fc and out_buf is None:
             out_buf = torch.empty((tokens, 4608), dtype=x.dtype, device=device)
 
-        w2_pw = 2 if (use_pdl and use_fs) else 0
-        w2_td = 1 if (use_pdl and use_fc) else 0
-        if use_c1_v9:
+        # V13 PDL Safety Fix: when use_pdl=True, ALWAYS pass w2_pw=2 so isolating
+        # INKLING_MOE_S8_FUSE_SITU=0 with FUSE_COMBINE=1 waits for Triton swiglu_quantize's
+        # gdc_launch_dependents() before reading act2 (fixes #206 PDL race)!
+        w2_pw = 2 if use_pdl else 0
+        w2_td = 1 if use_pdl else 0
+        if use_c1_v16:
+            rc = lib.nvfp4_w2_ws5_c1_v16_fwd(
+                act2.data_ptr(),
+                0 if act2_s is None else act2_s.data_ptr(),
+                0 if act2_rs is None else act2_rs.data_ptr(),
+                row_amax_w2.data_ptr() if use_fs else 0,
+                w2_amax.data_ptr() if use_fs else 0,
+                w2_denom.data_ptr() if use_fs else 0,
+                m2["w_pack"].data_ptr(), m2["ws5_pack"].data_ptr(), ws_base_2.data_ptr(),
+                m2["p_off"].data_ptr(), m2["patches"].data_ptr(),
+                experts.ones.data_ptr(), tiles.data_ptr(),
+                0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                down.data_ptr(),
+                src2compact.data_ptr() if use_fc else 0,
+                0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                ws["panel_done"].data_ptr() if use_fc else 0,
+                out_buf.data_ptr() if use_fc else 0,
+                4608, 288, plan.max_ctas, plan.tile, tokens, n_compact,
+                2 if use_c1_qdeq else (1 if use_fs else 0), 1 if use_fc else 0,
+                w2_pw, w2_td, S8_W2_QUANT_FMA,
+                NVFP4_C1_V16_EVICT, NVFP4_C1_V16_LPT, ws["work_queue"].data_ptr(), st,
+            )
+            if rc != 0:
+                raise RuntimeError(f"nvfp4_w2_ws5_c1_v16_fwd failed with cudaError={rc}")
+        elif use_c1_v9:
             rc = lib.nvfp4_w2_ws5_c1_v9_fwd(
                 act2.data_ptr(),
                 0 if act2_s is None else act2_s.data_ptr(),
@@ -1318,7 +1597,7 @@ def forward_experts_s8(
                 out_buf.data_ptr() if use_fc else 0,
                 4608, 288, plan.max_ctas, plan.tile, tokens, n_compact,
                 2 if use_c1_qdeq else (1 if use_fs else 0), 1 if use_fc else 0,
-                w2_pw, w2_td, S8_QUANT_FMA, st,
+                w2_pw, w2_td, S8_W2_QUANT_FMA, st,
             )
             if rc != 0:
                 raise RuntimeError(f"nvfp4_w2_ws5_c1_v9_fwd failed with cudaError={rc}")
@@ -1340,18 +1619,18 @@ def forward_experts_s8(
                 ws["panel_done"].data_ptr() if use_fc else 0,
                 out_buf.data_ptr() if use_fc else 0,
                 4608, 288, plan.max_ctas, plan.tile, tokens, n_compact,
-                1 if use_fs else 0, 1 if use_fc else 0, int(S8_QUANT_FMA),
+                1 if use_fs else 0, 1 if use_fc else 0, int(S8_W2_QUANT_FMA),
                 w2_pw, w2_td, st,
             )
             if rc != 0:
                 raise RuntimeError(f"nvfp4_w2_ws5_c1_v6_fma_fwd failed with cudaError={rc}")
         else:
             global _WARNED_W2_QUANT_FMA
-            if use_fs and S8_QUANT_FMA and not _WARNED_W2_QUANT_FMA:
+            if use_fs and S8_W2_QUANT_FMA and not _WARNED_W2_QUANT_FMA:
                 _WARNED_W2_QUANT_FMA = True
                 warnings.warn(
                     "Loaded NVFP4 C=1 library lacks nvfp4_w2_ws5_c1_v9_fwd / nvfp4_w2_ws5_c1_v6_fma_fwd; "
-                    "W2 OTF NVFP4 quant will use unfused sub_rn despite INKLING_MOE_S8_QUANT_FMA=1.",
+                    "W2 OTF NVFP4 quant will use unfused sub_rn despite INKLING_MOE_S8_W2_QUANT_FMA=1.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -1393,8 +1672,8 @@ def forward_experts_s8(
                 w13_out = ws["situ_out"][:n_compact] if use_fs else torch.empty(
                     (plan.rows, 576), dtype=torch.bfloat16, device=device
                 )
-                w13_pw = 1 if (use_pdl and use_zs) else 0
-                w13_td = 1 if (use_pdl and use_fs) else 0
+                w13_pw = 1 if use_pdl else 0
+                w13_td = 1 if use_pdl else 0
                 rc = mx6_lib.mx6_w13_c1_v10_fwd(
                     act.data_ptr(), act_scale.data_ptr(),
                     sm4_13.data_ptr(), ws3_13.data_ptr(),
@@ -1426,8 +1705,8 @@ def forward_experts_s8(
                 )
                 if use_fc and out_buf is None:
                     out_buf = torch.empty((tokens, 4608), dtype=x.dtype, device=device)
-                w2_pw = 2 if (use_pdl and use_fs) else 0
-                w2_td = 1 if (use_pdl and use_fc) else 0
+                w2_pw = 2 if use_pdl else 0
+                w2_td = 1 if use_pdl else 0
                 rc = mx6_lib.mx6_w2_c1_v10_fwd(
                     act2.data_ptr(),
                     0 if act2_s is None else act2_s.data_ptr(),
@@ -1487,55 +1766,168 @@ def forward_experts_s8(
         w13_out = ws["situ_out"][:n_compact] if use_fs else torch.empty(
             (plan.rows, 576), dtype=torch.bfloat16, device=device
         )
-        w13_pw = 1 if (use_pdl and use_zs) else 0
-        w13_td = 1 if (use_pdl and use_fs) else 0
+        use_mx7_v16 = (
+            MX7_C1_V16
+            and mx_ver >= 16
+            and hasattr(lib, "mx7_w13_c1_v16_fwd")
+            and hasattr(lib, "mx7_w2_c1_v16_fwd")
+        )
+        use_mx7_v14 = (
+            (MX7_C1_V14 or MX7_C1_V14_FUSE_QDEQ)
+            and mx_ver >= 14
+            and hasattr(lib, "mx7_w13_c1_v14_fwd")
+            and hasattr(lib, "mx7_w2_c1_v14_fwd")
+        )
+        use_mx7_qdeq = (
+            use_mx7_v14
+            and MX7_C1_V14_FUSE_QDEQ
+            and use_fs
+            and int(plan.max_ctas) <= _WS_MAX_CTAS
+        )
+        mx7_u_arg = 3 if eff_bn_mode == 3 else eff_u_thresh
+        mx7_qdeq_ptr = ws["tile_qdeq_done"].data_ptr() if use_mx7_qdeq else 0
+        w13_pw = 1 if use_pdl else 0
+        w13_td = 1 if use_pdl else 0
         if v5_mode == "panel":
             pp13, po13, sm13, so13, sf13, bws13, _ = v5_13
-            rc = lib.mx7_w13_c1_v5_panel_fwd(
-                act.data_ptr(), act_scale.data_ptr(),
-                pp13.data_ptr(), po13.data_ptr(),
-                sm13.data_ptr(), so13.data_ptr(), sf13.data_ptr(),
-                experts.ones.data_ptr(), tiles.data_ptr(),
-                0 if not use_zs else tile_mask.data_ptr(),
-                0 if tile_compact_start is None else tile_compact_start.data_ptr(),
-                gammas.data_ptr() if use_fs else 0,
-                w13_out.data_ptr(),
-                576, 4608, plan.max_ctas, plan.tile, int(bws13),
-                1 if use_zs else 0, 1 if use_fs else 0,
-                eff_bn_mode, eff_u_thresh,
-                w13_pw, w13_td, st,
-            )
+            if use_mx7_v16 and hasattr(lib, "mx7_w13_c1_v16_panel_fwd"):
+                rc = lib.mx7_w13_c1_v16_panel_fwd(
+                    act.data_ptr(), act_scale.data_ptr(),
+                    pp13.data_ptr(), po13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), sf13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if not use_zs else tile_mask.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    gammas.data_ptr() if use_fs else 0,
+                    w13_out.data_ptr(), mx7_qdeq_ptr,
+                    576, 4608, plan.max_ctas, plan.tile, int(bws13),
+                    1 if use_zs else 0, 1 if use_fs else 0, 1 if use_mx7_qdeq else 0,
+                    eff_bn_mode, mx7_u_arg,
+                    w13_pw, w13_td, MX7_C1_V14_EVICT, MX7_C1_V16_LPT, ws["work_queue"].data_ptr(), st,
+                )
+            elif use_mx7_v14 and hasattr(lib, "mx7_w13_c1_v14_panel_fwd"):
+                rc = lib.mx7_w13_c1_v14_panel_fwd(
+                    act.data_ptr(), act_scale.data_ptr(),
+                    pp13.data_ptr(), po13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), sf13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if not use_zs else tile_mask.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    gammas.data_ptr() if use_fs else 0,
+                    w13_out.data_ptr(), mx7_qdeq_ptr,
+                    576, 4608, plan.max_ctas, plan.tile, int(bws13),
+                    1 if use_zs else 0, 1 if use_fs else 0, 1 if use_mx7_qdeq else 0,
+                    eff_bn_mode, mx7_u_arg,
+                    w13_pw, w13_td, MX7_C1_V14_EVICT, st,
+                )
+            else:
+                rc = lib.mx7_w13_c1_v5_panel_fwd(
+                    act.data_ptr(), act_scale.data_ptr(),
+                    pp13.data_ptr(), po13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), sf13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if not use_zs else tile_mask.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    gammas.data_ptr() if use_fs else 0,
+                    w13_out.data_ptr(),
+                    576, 4608, plan.max_ctas, plan.tile, int(bws13),
+                    1 if use_zs else 0, 1 if use_fs else 0,
+                    eff_bn_mode, eff_u_thresh,
+                    w13_pw, w13_td, st,
+                )
         elif v5_mode == "compat":
             sl13, w3_13, sm13, so13, do13, sf13, bm13, bws13, _ = v5_13
-            rc = lib.mx7_w13_c1_v5_fwd(
-                act.data_ptr(), act_scale.data_ptr(),
-                sl13.data_ptr(), w3_13.data_ptr(),
-                sm13.data_ptr(), so13.data_ptr(), do13.data_ptr(),
-                sf13.data_ptr(), bm13.data_ptr(),
-                experts.ones.data_ptr(), tiles.data_ptr(),
-                0 if not use_zs else tile_mask.data_ptr(),
-                0 if tile_compact_start is None else tile_compact_start.data_ptr(),
-                gammas.data_ptr() if use_fs else 0,
-                w13_out.data_ptr(),
-                576, 4608, plan.max_ctas, plan.tile, int(bws13),
-                1 if use_zs else 0, 1 if use_fs else 0,
-                eff_bn_mode, eff_u_thresh,
-                w13_pw, w13_td, st,
-            )
+            if use_mx7_v16 and hasattr(lib, "mx7_w13_c1_v16_compat_fwd"):
+                rc = lib.mx7_w13_c1_v16_compat_fwd(
+                    act.data_ptr(), act_scale.data_ptr(),
+                    sl13.data_ptr(), w3_13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), do13.data_ptr(),
+                    sf13.data_ptr(), bm13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if not use_zs else tile_mask.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    gammas.data_ptr() if use_fs else 0,
+                    w13_out.data_ptr(), mx7_qdeq_ptr,
+                    576, 4608, plan.max_ctas, plan.tile, int(bws13),
+                    1 if use_zs else 0, 1 if use_fs else 0, 1 if use_mx7_qdeq else 0,
+                    eff_bn_mode, mx7_u_arg,
+                    w13_pw, w13_td, MX7_C1_V14_EVICT, MX7_C1_V16_LPT, ws["work_queue"].data_ptr(), st,
+                )
+            elif use_mx7_v14 and hasattr(lib, "mx7_w13_c1_v14_compat_fwd"):
+                rc = lib.mx7_w13_c1_v14_compat_fwd(
+                    act.data_ptr(), act_scale.data_ptr(),
+                    sl13.data_ptr(), w3_13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), do13.data_ptr(),
+                    sf13.data_ptr(), bm13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if not use_zs else tile_mask.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    gammas.data_ptr() if use_fs else 0,
+                    w13_out.data_ptr(), mx7_qdeq_ptr,
+                    576, 4608, plan.max_ctas, plan.tile, int(bws13),
+                    1 if use_zs else 0, 1 if use_fs else 0, 1 if use_mx7_qdeq else 0,
+                    eff_bn_mode, mx7_u_arg,
+                    w13_pw, w13_td, MX7_C1_V14_EVICT, st,
+                )
+            else:
+                rc = lib.mx7_w13_c1_v5_fwd(
+                    act.data_ptr(), act_scale.data_ptr(),
+                    sl13.data_ptr(), w3_13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), do13.data_ptr(),
+                    sf13.data_ptr(), bm13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if not use_zs else tile_mask.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    gammas.data_ptr() if use_fs else 0,
+                    w13_out.data_ptr(),
+                    576, 4608, plan.max_ctas, plan.tile, int(bws13),
+                    1 if use_zs else 0, 1 if use_fs else 0,
+                    eff_bn_mode, eff_u_thresh,
+                    w13_pw, w13_td, st,
+                )
         else:
-            rc = lib.mx7_w13_c1_v4_fwd(
-                act.data_ptr(), act_scale.data_ptr(),
-                slabs13.data_ptr(), ws3_13.data_ptr(), flips13.data_ptr(), foff13.data_ptr(),
-                experts.ones.data_ptr(), tiles.data_ptr(),
-                0 if not use_zs else tile_mask.data_ptr(),
-                0 if tile_compact_start is None else tile_compact_start.data_ptr(),
-                gammas.data_ptr() if use_fs else 0,
-                w13_out.data_ptr(),
-                576, 4608, plan.max_ctas, plan.tile, int(bws13),
-                1 if use_zs else 0, 1 if use_fs else 0,
-                eff_bn_mode, eff_u_thresh,
-                w13_pw, w13_td, st,
-            )
+            if use_mx7_v16:
+                rc = lib.mx7_w13_c1_v16_fwd(
+                    act.data_ptr(), act_scale.data_ptr(),
+                    slabs13.data_ptr(), ws3_13.data_ptr(), flips13.data_ptr(), foff13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if not use_zs else tile_mask.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    gammas.data_ptr() if use_fs else 0,
+                    w13_out.data_ptr(), mx7_qdeq_ptr,
+                    576, 4608, plan.max_ctas, plan.tile, int(bws13),
+                    1 if use_zs else 0, 1 if use_fs else 0, 1 if use_mx7_qdeq else 0,
+                    eff_bn_mode, mx7_u_arg,
+                    w13_pw, w13_td, MX7_C1_V14_EVICT, MX7_C1_V16_LPT, ws["work_queue"].data_ptr(), st,
+                )
+            elif use_mx7_v14:
+                rc = lib.mx7_w13_c1_v14_fwd(
+                    act.data_ptr(), act_scale.data_ptr(),
+                    slabs13.data_ptr(), ws3_13.data_ptr(), flips13.data_ptr(), foff13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if not use_zs else tile_mask.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    gammas.data_ptr() if use_fs else 0,
+                    w13_out.data_ptr(), mx7_qdeq_ptr,
+                    576, 4608, plan.max_ctas, plan.tile, int(bws13),
+                    1 if use_zs else 0, 1 if use_fs else 0, 1 if use_mx7_qdeq else 0,
+                    eff_bn_mode, mx7_u_arg,
+                    w13_pw, w13_td, MX7_C1_V14_EVICT, st,
+                )
+            else:
+                rc = lib.mx7_w13_c1_v4_fwd(
+                    act.data_ptr(), act_scale.data_ptr(),
+                    slabs13.data_ptr(), ws3_13.data_ptr(), flips13.data_ptr(), foff13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if not use_zs else tile_mask.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    gammas.data_ptr() if use_fs else 0,
+                    w13_out.data_ptr(),
+                    576, 4608, plan.max_ctas, plan.tile, int(bws13),
+                    1 if use_zs else 0, 1 if use_fs else 0,
+                    eff_bn_mode, eff_u_thresh,
+                    w13_pw, w13_td, st,
+                )
         if rc != 0:
             raise RuntimeError(f"mx7_w13_c1[{v5_mode}] failed with cudaError={rc}")
 
@@ -1555,64 +1947,176 @@ def forward_experts_s8(
         if use_fc and out_buf is None:
             out_buf = torch.empty((tokens, 4608), dtype=x.dtype, device=device)
 
-        w2_pw = 2 if (use_pdl and use_fs) else 0
-        w2_td = 1 if (use_pdl and use_fc) else 0
+        w2_pw = 2 if use_pdl else 0
+        w2_td = 1 if use_pdl else 0
+        mx7_fq_w2 = (2 if use_mx7_qdeq else 1) if use_fs else 0
         if v5_mode == "panel":
             pp2, po2, sm2, so2, sf2, bws2, _ = v5_2
-            rc = lib.mx7_w2_c1_v5_panel_fwd(
-                act2.data_ptr(),
-                0 if act2_s is None else act2_s.data_ptr(),
-                pp2.data_ptr(), po2.data_ptr(),
-                sm2.data_ptr(), so2.data_ptr(), sf2.data_ptr(),
-                experts.ones.data_ptr(), tiles.data_ptr(),
-                0 if tile_compact_start is None else tile_compact_start.data_ptr(),
-                down.data_ptr(),
-                src2compact.data_ptr() if use_fc else 0,
-                0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
-                ws["panel_done"].data_ptr() if use_fc else 0,
-                out_buf.data_ptr() if use_fc else 0,
-                4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
-                0, 9, n_compact,
-                1 if use_fs else 0, 1 if use_fc else 0,
-                w2_pw, w2_td, st,
-            )
+            if use_mx7_v16 and hasattr(lib, "mx7_w2_c1_v16_panel_fwd"):
+                rc = lib.mx7_w2_c1_v16_panel_fwd(
+                    act2.data_ptr(),
+                    0 if act2_s is None else act2_s.data_ptr(),
+                    pp2.data_ptr(), po2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), sf2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    down.data_ptr(),
+                    src2compact.data_ptr() if use_fc else 0,
+                    0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                    ws["panel_done"].data_ptr() if use_fc else 0,
+                    out_buf.data_ptr() if use_fc else 0,
+                    4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
+                    0, 9, n_compact,
+                    mx7_fq_w2, 1 if use_fc else 0,
+                    w2_pw, w2_td, MX7_C1_V14_EVICT, MX7_C1_V16_LPT, ws["work_queue"].data_ptr(), st,
+                )
+            elif use_mx7_v14 and hasattr(lib, "mx7_w2_c1_v14_panel_fwd"):
+                rc = lib.mx7_w2_c1_v14_panel_fwd(
+                    act2.data_ptr(),
+                    0 if act2_s is None else act2_s.data_ptr(),
+                    pp2.data_ptr(), po2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), sf2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    down.data_ptr(),
+                    src2compact.data_ptr() if use_fc else 0,
+                    0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                    ws["panel_done"].data_ptr() if use_fc else 0,
+                    out_buf.data_ptr() if use_fc else 0,
+                    4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
+                    0, 9, n_compact,
+                    mx7_fq_w2, 1 if use_fc else 0,
+                    w2_pw, w2_td, MX7_C1_V14_EVICT, st,
+                )
+            else:
+                rc = lib.mx7_w2_c1_v5_panel_fwd(
+                    act2.data_ptr(),
+                    0 if act2_s is None else act2_s.data_ptr(),
+                    pp2.data_ptr(), po2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), sf2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    down.data_ptr(),
+                    src2compact.data_ptr() if use_fc else 0,
+                    0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                    ws["panel_done"].data_ptr() if use_fc else 0,
+                    out_buf.data_ptr() if use_fc else 0,
+                    4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
+                    0, 9, n_compact,
+                    1 if use_fs else 0, 1 if use_fc else 0,
+                    w2_pw, w2_td, st,
+                )
         elif v5_mode == "compat":
             sl2, w3_2, sm2, so2, do2, sf2, bm2, bws2, _ = v5_2
-            rc = lib.mx7_w2_c1_v5_fwd(
-                act2.data_ptr(),
-                0 if act2_s is None else act2_s.data_ptr(),
-                sl2.data_ptr(), w3_2.data_ptr(),
-                sm2.data_ptr(), so2.data_ptr(), do2.data_ptr(),
-                sf2.data_ptr(), bm2.data_ptr(),
-                experts.ones.data_ptr(), tiles.data_ptr(),
-                0 if tile_compact_start is None else tile_compact_start.data_ptr(),
-                down.data_ptr(),
-                src2compact.data_ptr() if use_fc else 0,
-                0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
-                ws["panel_done"].data_ptr() if use_fc else 0,
-                out_buf.data_ptr() if use_fc else 0,
-                4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
-                0, 9, n_compact,
-                1 if use_fs else 0, 1 if use_fc else 0,
-                w2_pw, w2_td, st,
-            )
+            if use_mx7_v16 and hasattr(lib, "mx7_w2_c1_v16_compat_fwd"):
+                rc = lib.mx7_w2_c1_v16_compat_fwd(
+                    act2.data_ptr(),
+                    0 if act2_s is None else act2_s.data_ptr(),
+                    sl2.data_ptr(), w3_2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), do2.data_ptr(),
+                    sf2.data_ptr(), bm2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    down.data_ptr(),
+                    src2compact.data_ptr() if use_fc else 0,
+                    0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                    ws["panel_done"].data_ptr() if use_fc else 0,
+                    out_buf.data_ptr() if use_fc else 0,
+                    4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
+                    0, 9, n_compact,
+                    mx7_fq_w2, 1 if use_fc else 0,
+                    w2_pw, w2_td, MX7_C1_V14_EVICT, MX7_C1_V16_LPT, ws["work_queue"].data_ptr(), st,
+                )
+            elif use_mx7_v14 and hasattr(lib, "mx7_w2_c1_v14_compat_fwd"):
+                rc = lib.mx7_w2_c1_v14_compat_fwd(
+                    act2.data_ptr(),
+                    0 if act2_s is None else act2_s.data_ptr(),
+                    sl2.data_ptr(), w3_2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), do2.data_ptr(),
+                    sf2.data_ptr(), bm2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    down.data_ptr(),
+                    src2compact.data_ptr() if use_fc else 0,
+                    0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                    ws["panel_done"].data_ptr() if use_fc else 0,
+                    out_buf.data_ptr() if use_fc else 0,
+                    4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
+                    0, 9, n_compact,
+                    mx7_fq_w2, 1 if use_fc else 0,
+                    w2_pw, w2_td, MX7_C1_V14_EVICT, st,
+                )
+            else:
+                rc = lib.mx7_w2_c1_v5_fwd(
+                    act2.data_ptr(),
+                    0 if act2_s is None else act2_s.data_ptr(),
+                    sl2.data_ptr(), w3_2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), do2.data_ptr(),
+                    sf2.data_ptr(), bm2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    down.data_ptr(),
+                    src2compact.data_ptr() if use_fc else 0,
+                    0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                    ws["panel_done"].data_ptr() if use_fc else 0,
+                    out_buf.data_ptr() if use_fc else 0,
+                    4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
+                    0, 9, n_compact,
+                    1 if use_fs else 0, 1 if use_fc else 0,
+                    w2_pw, w2_td, st,
+                )
         else:
-            rc = lib.mx7_w2_c1_v4_fwd(
-                act2.data_ptr(),
-                0 if act2_s is None else act2_s.data_ptr(),
-                slabs2.data_ptr(), ws3_2.data_ptr(), flips2.data_ptr(), foff2.data_ptr(),
-                experts.ones.data_ptr(), tiles.data_ptr(),
-                0 if tile_compact_start is None else tile_compact_start.data_ptr(),
-                down.data_ptr(),
-                src2compact.data_ptr() if use_fc else 0,
-                0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
-                ws["panel_done"].data_ptr() if use_fc else 0,
-                out_buf.data_ptr() if use_fc else 0,
-                4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
-                0, 9, n_compact,
-                1 if use_fs else 0, 1 if use_fc else 0,
-                w2_pw, w2_td, st,
-            )
+            if use_mx7_v16:
+                rc = lib.mx7_w2_c1_v16_fwd(
+                    act2.data_ptr(),
+                    0 if act2_s is None else act2_s.data_ptr(),
+                    slabs2.data_ptr(), ws3_2.data_ptr(), flips2.data_ptr(), foff2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    down.data_ptr(),
+                    src2compact.data_ptr() if use_fc else 0,
+                    0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                    ws["panel_done"].data_ptr() if use_fc else 0,
+                    out_buf.data_ptr() if use_fc else 0,
+                    4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
+                    0, 9, n_compact,
+                    mx7_fq_w2, 1 if use_fc else 0,
+                    w2_pw, w2_td, MX7_C1_V14_EVICT, MX7_C1_V16_LPT, ws["work_queue"].data_ptr(), st,
+                )
+            elif use_mx7_v14:
+                rc = lib.mx7_w2_c1_v14_fwd(
+                    act2.data_ptr(),
+                    0 if act2_s is None else act2_s.data_ptr(),
+                    slabs2.data_ptr(), ws3_2.data_ptr(), flips2.data_ptr(), foff2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    down.data_ptr(),
+                    src2compact.data_ptr() if use_fc else 0,
+                    0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                    ws["panel_done"].data_ptr() if use_fc else 0,
+                    out_buf.data_ptr() if use_fc else 0,
+                    4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
+                    0, 9, n_compact,
+                    mx7_fq_w2, 1 if use_fc else 0,
+                    w2_pw, w2_td, MX7_C1_V14_EVICT, st,
+                )
+            else:
+                rc = lib.mx7_w2_c1_v4_fwd(
+                    act2.data_ptr(),
+                    0 if act2_s is None else act2_s.data_ptr(),
+                    slabs2.data_ptr(), ws3_2.data_ptr(), flips2.data_ptr(), foff2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    0 if tile_compact_start is None else tile_compact_start.data_ptr(),
+                    down.data_ptr(),
+                    src2compact.data_ptr() if use_fc else 0,
+                    0 if (not use_fc or nlive_buf is None) else nlive_buf.data_ptr(),
+                    ws["panel_done"].data_ptr() if use_fc else 0,
+                    out_buf.data_ptr() if use_fc else 0,
+                    4608, 288, plan.max_ctas, plan.tile, tokens, int(bws2),
+                    0, 9, n_compact,
+                    1 if use_fs else 0, 1 if use_fc else 0,
+                    w2_pw, w2_td, st,
+                )
         if rc != 0:
             raise RuntimeError(f"mx7_w2_c1[{v5_mode}] failed with cudaError={rc}")
 

@@ -37,11 +37,17 @@ Environment (read at import, all optional):
                               it stops the page cache from competing with the unified
                               memory the weights land in. Falls back to buffered reads
                               if O_DIRECT is unavailable or a read fails the alignment.
+  INKLING_LOAD_IO_RETRIES=3   bounded retries on transient NVMe pread I/O errors (V15)
+  INKLING_LOAD_IO_RETRY_BACKOFF_S=0.25 base exponential backoff seconds on I/O retry (V15)
+  INKLING_LOAD_MIN_CHUNK_MB=4 minimum chunk size when shrinking under staging OOM (V15)
 """
 
+import atexit
 import ctypes
+import errno
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 
@@ -51,6 +57,7 @@ logger = logging.getLogger(__name__)
 
 _MODE = os.environ.get("INKLING_LOAD_STAGED", "1")
 _CHUNK_BYTES = max(1, int(os.environ.get("INKLING_LOAD_CHUNK_MB", "128"))) << 20
+_MIN_CHUNK_BYTES = max(1, int(os.environ.get("INKLING_LOAD_MIN_CHUNK_MB", "4"))) << 20
 _DROP_CACHE = os.environ.get("INKLING_LOAD_DROP_CACHE", "1") != "0"
 # O_DIRECT reads skip the page cache: measured 2.5-3x the buffered rate on this NVMe.
 _O_DIRECT = os.environ.get("INKLING_LOAD_O_DIRECT", "0") != "0"
@@ -58,7 +65,12 @@ _ALIGN = 4096  # O_DIRECT alignment for offset, size and buffer
 # Concurrent preads per chunk. One blocking pread leaves the NVMe queue starved
 # (1.84 GB/s); 8 threads reach 6.66 GB/s on the same bytes.
 _READ_THREADS = max(1, int(os.environ.get("INKLING_LOAD_READ_THREADS", "16")))
+_IO_RETRIES = max(0, int(os.environ.get("INKLING_LOAD_IO_RETRIES", "3")))
+_IO_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("INKLING_LOAD_IO_RETRY_BACKOFF_S", "0.25")))
 _POOL = None
+_POOL_LOCK = threading.Lock()
+_ALIGNED_SCRATCH = None
+_ATEXIT_REGISTERED = False
 # Below this a tensor is copied to anonymous memory in one piece instead.
 _SMALL_BYTES = 1 << 20
 # Bytes compared at each end of a tensor to prove the file range is the view.
@@ -70,16 +82,174 @@ _SLOW_H2D_BYTES_PER_S = 200 << 20
 
 _fd_key: tuple[str, int] | None = None
 _DIRECT_FDS: set = set()
+_SEEN_SHARDS: set[str] = set()
 _fd = -1
 _fd_size = 0
+
+_TRANSIENT_ERRNOS = frozenset(
+    e
+    for e in (
+        getattr(errno, "EINTR", None),
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EWOULDBLOCK", None),
+        getattr(errno, "EBUSY", None),
+        getattr(errno, "EIO", None),
+        getattr(errno, "ETIMEDOUT", None),
+    )
+    if e is not None
+)
+
+
+def _atexit_release_staging() -> None:
+    try:
+        release_staging()
+    except Exception:
+        pass
+
+
+def _ensure_atexit_registered() -> None:
+    global _ATEXIT_REGISTERED
+    if not _ATEXIT_REGISTERED:
+        _ATEXIT_REGISTERED = True
+        atexit.register(_atexit_release_staging)
+
+
+def _host_empty_cache_safe() -> None:
+    try:
+        if hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()
+    except Exception:
+        pass
+
+
+def _is_transient_io_err(exc: OSError) -> bool:
+    return exc.errno is None or exc.errno in _TRANSIENT_ERRNOS
+
+
+def _fadvise_drop_range(fd: int, offset: int, length: int) -> None:
+    if not _DROP_CACHE or fd < 0:
+        return
+    fadv = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadv is not None and dontneed is not None:
+        try:
+            fadv(fd, offset, length, dontneed)
+        except OSError:
+            pass
+
+
+def _fadvise_drop_fd(fd: int) -> None:
+    _fadvise_drop_range(fd, 0, 0)
+
+
+def _fadvise_drop_path(path: str) -> None:
+    if not _DROP_CACHE or not path:
+        return
+    if getattr(os, "posix_fadvise", None) is None:
+        return
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        _fadvise_drop_fd(fd)
+    except OSError:
+        pass
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 _warned: set[str] = set()
-_stats = {"bytes": 0, "tensors": 0, "read_s": 0.0, "h2d_s": 0.0, "logged": 0}
+_stats = {
+    "bytes": 0,
+    "tensors": 0,
+    "read_s": 0.0,
+    "h2d_s": 0.0,
+    "logged": 0,
+    "o_direct_fallbacks": 0,
+    "io_retries": 0,
+    "oom_retries": 0,
+    "mmap_fallbacks": 0,
+}
+
+
+def get_load_diagnostics() -> dict:
+    """Return a snapshot of checkpoint loader throughput & resilience counters."""
+    return {
+        **_stats,
+        "fd_open": _fd >= 0,
+        "fd_direct": _fd in _DIRECT_FDS,
+        "pool_active": _POOL is not None,
+        "seen_shards": len(_SEEN_SHARDS),
+        "aligned_scratch_bytes": (
+            _ALIGNED_SCRATCH.numel() * _ALIGNED_SCRATCH.element_size()
+            if _ALIGNED_SCRATCH is not None
+            else 0
+        ),
+    }
 
 
 def _warn_once(key: str, msg: str, *args) -> None:
     if key not in _warned:
         _warned.add(key)
         logger.warning(msg, *args)
+
+
+def _close_cached_fd() -> None:
+    global _fd, _fd_key, _fd_size
+    if _fd >= 0:
+        _fadvise_drop_fd(_fd)
+        _DIRECT_FDS.discard(_fd)
+        try:
+            os.close(_fd)
+        except OSError:
+            pass
+    _fd = -1
+    _fd_key = None
+    _fd_size = 0
+
+
+def _resolve_fd_path(fd: int, path: str | None = None) -> str | None:
+    if path:
+        return path
+    if _fd_key is not None and fd == _fd:
+        return _fd_key[0]
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return None
+
+
+def _reopen_buffered(fd: int, path: str | None = None) -> int:
+    """Replace an O_DIRECT fd in-place with a buffered fd so reads + fadvise(DONTNEED) continue safely."""
+    global _fd, _fd_key, _fd_size
+    resolved = _resolve_fd_path(fd, path)
+    if not resolved:
+        if fd == _fd:
+            _close_cached_fd()
+        return -1
+    try:
+        bfd = os.open(resolved, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    except OSError as e:
+        _warn_once("reopen_buf", "staged load: buffered reopen failed for %s (%s)", resolved, e)
+        if fd == _fd:
+            _close_cached_fd()
+        return -1
+    _DIRECT_FDS.discard(fd)
+    _stats["o_direct_fallbacks"] += 1
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    if fd == _fd:
+        _fd = bfd
+        try:
+            _fd_size = os.fstat(bfd).st_size
+        except OSError:
+            pass
+    return bfd
 
 
 def _file_range(addr: int, nbytes: int) -> tuple[str, int, int] | None:
@@ -124,29 +294,119 @@ def _open_backing(path: str, inode: int, end: int) -> int:
     or -1 when it is not the mapped inode or is shorter than ``end``."""
     global _fd_key, _fd, _fd_size
     if _fd_key != (path, inode):
-        if _fd >= 0:
-            os.close(_fd)
-        _fd_key, _fd = None, -1
-        flags = os.O_RDONLY | os.O_CLOEXEC
-        if _O_DIRECT:
-            flags |= getattr(os, "O_DIRECT", 0)
-        fd = os.open(path, flags)
+        _close_cached_fd()
+        base_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        direct_flag = getattr(os, "O_DIRECT", 0) if _O_DIRECT else 0
+        opened_direct = False
+        if direct_flag:
+            try:
+                fd = os.open(path, base_flags | direct_flag)
+                opened_direct = True
+            except OSError as e:
+                _warn_once(
+                    "odirect_open",
+                    "staged load: O_DIRECT unsupported on %s (%s); falling back to buffered+fadvise",
+                    path,
+                    e,
+                )
+                _stats["o_direct_fallbacks"] += 1
+                fd = os.open(path, base_flags)
+        else:
+            fd = os.open(path, base_flags)
         stat = os.fstat(fd)
         if stat.st_ino != inode:
             os.close(fd)
             return -1
         _fd_key, _fd, _fd_size = (path, inode), fd, stat.st_size
-        if _O_DIRECT:
+        _SEEN_SHARDS.add(path)
+        if opened_direct:
             _DIRECT_FDS.add(fd)
+        _ensure_atexit_registered()
     return _fd if _fd_size >= end else -1
 
 
+def _pread_bytes_with_retry(fd: int, nbytes: int, offset: int) -> bytes:
+    """Buffered os.pread with bounded transient-I/O retry."""
+    if nbytes <= 0:
+        return b""
+    last_err: OSError | None = None
+    for attempt in range(_IO_RETRIES + 1):
+        try:
+            chunks: list[bytes] = []
+            done = 0
+            while done < nbytes:
+                got = os.pread(fd, nbytes - done, offset + done)
+                if not got:
+                    raise OSError(f"short probe read at {offset + done} ({done}/{nbytes} bytes)")
+                chunks.append(got)
+                done += len(got)
+            return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+        except OSError as e:
+            last_err = e
+            if attempt >= _IO_RETRIES or not _is_transient_io_err(e):
+                raise
+            _stats["io_retries"] += 1
+            delay = _IO_RETRY_BACKOFF_S * (2**attempt)
+            logger.warning(
+                "staged load: transient probe pread error (%s) at offset=%d len=%d "
+                "(retry %d/%d in %.2fs)",
+                e,
+                offset,
+                nbytes,
+                attempt + 1,
+                _IO_RETRIES,
+                delay,
+            )
+            if delay > 0:
+                time.sleep(delay)
+    raise last_err if last_err is not None else OSError("probe pread failed")
 
-def _probe_read(fd: int, nbytes: int, offset: int) -> bytes:
+
+def _alloc_aligned_scratch(total: int, *, reuse: bool = False) -> torch.Tensor | None:
+    """Allocate a ``total + _ALIGN`` uint8 scratch buffer with pinned->pageable OOM fallback."""
+    global _ALIGNED_SCRATCH
+    needed = total + _ALIGN
+    if reuse and _ALIGNED_SCRATCH is not None and _ALIGNED_SCRATCH.numel() >= needed:
+        return _ALIGNED_SCRATCH
+    buf: torch.Tensor | None = None
+    for attempt in range(2):
+        try:
+            buf = torch.empty(needed, dtype=torch.uint8, pin_memory=True)
+            break
+        except (RuntimeError, MemoryError) as e:
+            _stats["oom_retries"] += 1
+            if attempt == 0:
+                _host_empty_cache_safe()
+                continue
+            _warn_once("aligned_pin_oom", "staged load: pinned O_DIRECT scratch OOM (%s); using pageable", e)
+            try:
+                buf = torch.empty(needed, dtype=torch.uint8, pin_memory=False)
+            except (RuntimeError, MemoryError) as e2:
+                _warn_once("aligned_oom", "staged load: pageable O_DIRECT scratch OOM (%s); using buffered path", e2)
+                return None
+    if reuse and buf is not None:
+        _ALIGNED_SCRATCH = buf
+    return buf
+
+
+def _probe_read(fd: int, nbytes: int, offset: int, path: str | None = None) -> bytes:
     """Read ``nbytes`` at ``offset`` and return them, tolerating O_DIRECT alignment
     (the probe offset/length are arbitrary, the fd may be O_DIRECT)."""
-    if not _O_DIRECT:
-        return os.pread(fd, nbytes, offset)
+    if fd not in _DIRECT_FDS:
+        return _pread_bytes_with_retry(fd, nbytes, offset)
+
+    def _buffered_probe() -> bytes:
+        resolved = _resolve_fd_path(fd, path)
+        if not resolved:
+            raise OSError("cannot resolve shard path for buffered probe fallback")
+        bfd = os.open(resolved, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        try:
+            data = _pread_bytes_with_retry(bfd, nbytes, offset)
+            _fadvise_drop_range(bfd, offset, nbytes)
+            return data
+        finally:
+            os.close(bfd)
+
     head = offset % _ALIGN
     start = offset - head
     total = (head + nbytes + _ALIGN - 1) // _ALIGN * _ALIGN
@@ -154,23 +414,32 @@ def _probe_read(fd: int, nbytes: int, offset: int) -> bytes:
         # The padded window would run past EOF and O_DIRECT requires whole aligned
         # blocks, so redo the probe through a BUFFERED fd (pread on an O_DIRECT fd
         # still enforces alignment, so we must not reuse it here).
-        bfd = os.open(os.readlink(f"/proc/self/fd/{fd}"), os.O_RDONLY | os.O_CLOEXEC)
-        try:
-            return os.pread(bfd, nbytes, offset)
-        finally:
-            os.close(bfd)
-    # torch pinned memory is only 512-B aligned; take an _ALIGN-aligned slice.
-    scratch = torch.empty(total + _ALIGN, dtype=torch.uint8, pin_memory=True)
+        return _buffered_probe()
+
+    scratch = _alloc_aligned_scratch(total, reuse=False)
+    if scratch is None:
+        return _buffered_probe()
     base = scratch.data_ptr()
     base += (-base) % _ALIGN
     view = memoryview((ctypes.c_char * total).from_address(base))
-    done = 0
-    while done < total:
-        got = os.preadv(fd, [view[done:]], start + done)
-        if got <= 0:
-            raise OSError(f"short probe read at {start + done}")
-        done += got
-    return ctypes.string_at(base + head, nbytes)
+    try:
+        done = 0
+        while done < total:
+            got = os.preadv(fd, [view[done:]], start + done)
+            if got <= 0:
+                raise OSError(f"short probe read at {start + done}")
+            done += got
+        return ctypes.string_at(base + head, nbytes)
+    except OSError as e:
+        _warn_once(
+            "probe_odirect",
+            "staged load: O_DIRECT probe failed (%s) at offset=%d len=%d; using buffered probe",
+            e,
+            offset,
+            nbytes,
+        )
+        _stats["o_direct_fallbacks"] += 1
+        return _buffered_probe()
 
 
 def _pread_aligned(fd: int, ptr: int, nbytes: int, offset: int) -> int:
@@ -180,8 +449,10 @@ def _pread_aligned(fd: int, ptr: int, nbytes: int, offset: int) -> int:
     all to be _ALIGN-aligned. Tensor offsets inside a safetensors shard are only
     8-byte aligned and a tensor's last chunk can be a short step, so read a padded
     _ALIGN-aligned window into a scratch buffer and copy the requested slice out.
-    Returns ``nbytes`` on success, ``-1`` if the window would run past EOF.
+    Returns ``nbytes`` on success, ``-1`` if the window would run past EOF or scratch OOMs.
     """
+    if nbytes <= 0:
+        return 0
     size = os.fstat(fd).st_size
     head = offset % _ALIGN              # bytes to skip in the first block
     start = offset - head               # _ALIGN-aligned file offset to read from
@@ -191,20 +462,44 @@ def _pread_aligned(fd: int, ptr: int, nbytes: int, offset: int) -> int:
         return -1
     # torch's pinned allocator only guarantees 512-byte alignment, NOT _ALIGN, so
     # over-allocate and take an _ALIGN-aligned slice inside the block.
-    scratch = torch.empty(total + _ALIGN, dtype=torch.uint8, pin_memory=True)
+    scratch = _alloc_aligned_scratch(total, reuse=True)
+    if scratch is None:
+        return -1
     raw = scratch.data_ptr()
     base = raw + ((-raw) % _ALIGN)
     total = (total // _ALIGN) * _ALIGN
     view = memoryview((ctypes.c_char * total).from_address(base))
-    done = 0
-    while done < total:
-        got = os.preadv(fd, [view[done:]], start + done)
-        if got <= 0:
-            raise OSError(f"short read at {start + done} ({done}/{total} bytes)")
-        done += got
-    ctypes.memmove(ptr, base + head, nbytes)
-    return nbytes
-
+    last_err: OSError | None = None
+    for attempt in range(_IO_RETRIES + 1):
+        try:
+            done = 0
+            while done < total:
+                got = os.preadv(fd, [view[done:]], start + done)
+                if got <= 0:
+                    raise OSError(f"short read at {start + done} ({done}/{total} bytes)")
+                done += got
+            ctypes.memmove(ptr, base + head, nbytes)
+            return nbytes
+        except OSError as e:
+            last_err = e
+            # Alignment/FS errors (EINVAL/EOPNOTSUPP) must immediately trigger buffered fallback.
+            if attempt >= _IO_RETRIES or not _is_transient_io_err(e):
+                raise
+            _stats["io_retries"] += 1
+            delay = _IO_RETRY_BACKOFF_S * (2**attempt)
+            logger.warning(
+                "staged load: transient O_DIRECT pread error (%s) at offset=%d len=%d "
+                "(retry %d/%d in %.2fs)",
+                e,
+                start,
+                total,
+                attempt + 1,
+                _IO_RETRIES,
+                delay,
+            )
+            if delay > 0:
+                time.sleep(delay)
+    raise last_err if last_err is not None else OSError("O_DIRECT pread failed")
 
 
 def _pread_parallel(fd: int, ptr: int, nbytes: int, offset: int) -> None:
@@ -214,12 +509,20 @@ def _pread_parallel(fd: int, ptr: int, nbytes: int, offset: int) -> None:
     buffer, so the result is byte-identical to the serial read; only the issue order
     changes. Falls back to the serial path for small reads or when threads are off.
     """
+    if nbytes <= 0:
+        return
     if _READ_THREADS <= 1 or nbytes < (4 << 20):
         _pread_into(fd, ptr, nbytes, offset)
         return
     global _POOL
-    if _POOL is None:
-        _POOL = _ThreadPoolExecutor(max_workers=_READ_THREADS)
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = _ThreadPoolExecutor(
+                max_workers=_READ_THREADS,
+                thread_name_prefix="gb10-pread",
+            )
+            _ensure_atexit_registered()
+        pool = _POOL
     parts = min(_READ_THREADS, max(1, nbytes // (1 << 20)))
     per = nbytes // parts
     ranges = []
@@ -228,13 +531,15 @@ def _pread_parallel(fd: int, ptr: int, nbytes: int, offset: int) -> None:
         ln = per if i < parts - 1 else nbytes - at
         ranges.append((at, ln))
         at += ln
-    errs = []
+    errs: list[OSError] = []
+
     def worker(start: int, ln: int) -> None:
         try:
             _pread_into(fd, ptr + start, ln, offset + start)
         except OSError as e:      # noqa: BLE001 - re-raised on the caller's thread
             errs.append(e)
-    futs = [_POOL.submit(worker, st, ln) for st, ln in ranges]
+
+    futs = [pool.submit(worker, st, ln) for st, ln in ranges]
     for f in futs:
         f.result()
     if errs:
@@ -242,13 +547,37 @@ def _pread_parallel(fd: int, ptr: int, nbytes: int, offset: int) -> None:
 
 
 def _pread_into(fd: int, ptr: int, nbytes: int, offset: int) -> None:
+    if nbytes <= 0:
+        return
     view = memoryview((ctypes.c_char * nbytes).from_address(ptr))
-    done = 0
-    while done < nbytes:
-        got = os.preadv(fd, [view[done:]], offset + done)
-        if got <= 0:
-            raise OSError(f"short read at {offset + done} ({done}/{nbytes} bytes)")
-        done += got
+    last_err: OSError | None = None
+    for attempt in range(_IO_RETRIES + 1):
+        try:
+            done = 0
+            while done < nbytes:
+                got = os.preadv(fd, [view[done:]], offset + done)
+                if got <= 0:
+                    raise OSError(f"short read at {offset + done} ({done}/{nbytes} bytes)")
+                done += got
+            return
+        except OSError as e:
+            last_err = e
+            if attempt >= _IO_RETRIES or not _is_transient_io_err(e):
+                raise
+            _stats["io_retries"] += 1
+            delay = _IO_RETRY_BACKOFF_S * (2**attempt)
+            logger.warning(
+                "staged load: transient pread error (%s) at offset=%d len=%d (retry %d/%d in %.2fs)",
+                e,
+                offset,
+                nbytes,
+                attempt + 1,
+                _IO_RETRIES,
+                delay,
+            )
+            if delay > 0:
+                time.sleep(delay)
+    raise last_err if last_err is not None else OSError("pread failed")
 
 
 def _backing_file(src: torch.Tensor, nbytes: int) -> tuple[int, int]:
@@ -268,8 +597,8 @@ def _backing_file(src: torch.Tensor, nbytes: int) -> tuple[int, int]:
             return -1, 0
         probe = min(nbytes, _PROBE_BYTES)
         tail = nbytes - probe
-        if _probe_read(fd, probe, offset) != ctypes.string_at(ptr, probe) or _probe_read(
-            fd, probe, offset + tail
+        if _probe_read(fd, probe, offset, path=path) != ctypes.string_at(ptr, probe) or _probe_read(
+            fd, probe, offset + tail, path=path
         ) != ctypes.string_at(ptr + tail, probe):
             _warn_once("probe", "staged load: %s does not match its mapping", path)
             return -1, 0
@@ -281,11 +610,39 @@ def _backing_file(src: torch.Tensor, nbytes: int) -> tuple[int, int]:
 
 def _staging(numel: int, dtype: torch.dtype, pin: bool) -> torch.Tensor:
     if pin:
-        try:
-            return torch.empty(numel, dtype=dtype, pin_memory=True)
-        except RuntimeError as e:
-            _warn_once("pin", "staged load: pageable staging buffer (%s)", e)
+        for attempt in range(2):
+            try:
+                return torch.empty(numel, dtype=dtype, pin_memory=True)
+            except (RuntimeError, MemoryError) as e:
+                _stats["oom_retries"] += 1
+                if attempt == 0:
+                    _host_empty_cache_safe()
+                    continue
+                _warn_once("pin", "staged load: pageable staging buffer (%s)", e)
     return torch.empty(numel, dtype=dtype)
+
+
+def _alloc_staging_adaptive(step: int, dtype: torch.dtype, itemsize: int, pin: bool) -> tuple[torch.Tensor, int]:
+    """Allocate staging buffer, shrinking chunk size down to _MIN_CHUNK_BYTES on host OOM."""
+    min_step = max(1, _MIN_CHUNK_BYTES // max(1, itemsize))
+    cur = max(1, step)
+    while True:
+        try:
+            return _staging(cur, dtype, pin=pin), cur
+        except (RuntimeError, MemoryError) as e:
+            _stats["oom_retries"] += 1
+            _host_empty_cache_safe()
+            if cur <= min_step:
+                raise
+            next_step = max(min_step, cur // 2)
+            logger.warning(
+                "staged load: staging OOM at %.1f MiB (%s); shrinking chunk to %.1f MiB",
+                (cur * itemsize) / (1024.0 * 1024.0),
+                e,
+                (next_step * itemsize) / (1024.0 * 1024.0),
+            )
+            cur = next_step
+            pin = False
 
 
 def _staged_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -297,45 +654,67 @@ def _staged_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
     # Always one full chunk, so torch's pinned-memory cache reuses one block.
     step = max(1, _CHUNK_BYTES // itemsize)
     dst_flat, src_flat = dst.view(-1), src.view(-1)
-    stage = _staging(step, src.dtype, pin=dst.device.type == "cuda")
+    stage, step = _alloc_staging_adaptive(step, src.dtype, itemsize, pin=dst.device.type == "cuda")
     fd, offset = _backing_file(src_flat, nbytes)
+    shard_path = _fd_key[0] if _fd_key is not None else None
 
     read_s = h2d_s = 0.0
     for start in range(0, total, step):
         n = min(step, total - start)
+        chunk_bytes = n * itemsize
         t0 = time.perf_counter()
+        chunk_loaded = False
         if fd >= 0:
             at = offset + start * itemsize
-            try:
-                if _O_DIRECT and fd in _DIRECT_FDS:
-                    if _pread_aligned(fd, stage.data_ptr(), n * itemsize, at) < 0:
-                        _pread_into(fd, stage.data_ptr(), n * itemsize, at)
-                else:
-                    _pread_parallel(fd, stage.data_ptr(), n * itemsize, at)
-                if _DROP_CACHE:
-                    os.posix_fadvise(fd, at, n * itemsize, os.POSIX_FADV_DONTNEED)
-            except OSError as e:
-                # do not abandon the whole file: drop to buffered pread (same fd works
-                # for buffered IO once we stop forcing alignment, but O_DIRECT still
-                # enforces it, so switch to a buffered duplicate for the remainder).
-                _warn_once("read", "staged load: direct read failed (%s)", e)
-                # Keep _open_backing's cached fd consistent: replace it in place with a
-                # buffered duplicate (closing it without clearing the module cache would
-                # leave a stale fd for the next probe -> EBADF -> silent mmap fallback).
-                global _fd, _fd_key
+            if _O_DIRECT and fd in _DIRECT_FDS:
                 try:
-                    bfd = os.open(os.readlink(f"/proc/self/fd/{fd}"), os.O_RDONLY | os.O_CLOEXEC)
-                    _DIRECT_FDS.discard(fd)
-                    os.close(fd)
-                    fd = bfd
-                    _fd = bfd
-                    if _fd_key is not None:
-                        _fd_key = (_fd_key[0], _fd_key[1])
-                except OSError:
+                    got = _pread_aligned(fd, stage.data_ptr(), chunk_bytes, at)
+                    if got == chunk_bytes:
+                        chunk_loaded = True
+                    else:
+                        # Padded O_DIRECT window ran past EOF (or scratch OOM):
+                        # reopen buffered and immediately read THIS chunk cleanly.
+                        _warn_once(
+                            "odirect_eof",
+                            "staged load: O_DIRECT EOF/alignment boundary at offset=%d len=%d (%s); "
+                            "switching to buffered+fadvise",
+                            at,
+                            chunk_bytes,
+                            shard_path or "unknown",
+                        )
+                        fd = _reopen_buffered(fd, shard_path)
+                except OSError as e:
+                    _warn_once(
+                        "read",
+                        "staged load: O_DIRECT read failed (%s) at offset=%d len=%d (%s); "
+                        "falling back to buffered+fadvise",
+                        e,
+                        at,
+                        chunk_bytes,
+                        shard_path or "unknown",
+                    )
+                    fd = _reopen_buffered(fd, shard_path)
+            if not chunk_loaded and fd >= 0:
+                try:
+                    _pread_parallel(fd, stage.data_ptr(), chunk_bytes, at)
+                    chunk_loaded = True
+                    _fadvise_drop_range(fd, at, chunk_bytes)
+                except OSError as e:
+                    _warn_once(
+                        "read_buf",
+                        "staged load: buffered pread failed (%s) at offset=%d len=%d (%s); "
+                        "falling back to mmap view",
+                        e,
+                        at,
+                        chunk_bytes,
+                        shard_path or "unknown",
+                    )
+                    _close_cached_fd()
                     fd = -1
-                    _fd = -1
-                    _fd_key = None
-        if fd < 0:
+            elif chunk_loaded and _DROP_CACHE:
+                _fadvise_drop_range(fd, at, chunk_bytes)
+        if not chunk_loaded:
+            _stats["mmap_fallbacks"] += 1
             stage[:n].copy_(src_flat[start : start + n])
         t1 = time.perf_counter()
         dst_flat[start : start + n].copy_(stage[:n])
@@ -359,12 +738,14 @@ def _staged_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
         gib = _stats["bytes"] / 2**30
         logger.info(
             "staged load: %.1f GiB in %d tensors (read %.2f GiB/s, "
-            "host-to-GPU %.2f GiB/s, %s)",
+            "host-to-GPU %.2f GiB/s, %s, odirect_fb=%d, retries=%d)",
             gib,
             _stats["tensors"],
             gib / max(_stats["read_s"], 1e-9),
             gib / max(_stats["h2d_s"], 1e-9),
             "pread" if fd >= 0 else "mmap view",
+            _stats["o_direct_fallbacks"],
+            _stats["io_retries"],
         )
 
 
@@ -385,7 +766,16 @@ def copy_from_checkpoint_(dst: torch.Tensor, src: torch.Tensor) -> None:
     ):
         # The clone faults the pages in on the CPU; the driver then copies
         # from resident anonymous memory.
-        dst.copy_(src.clone())
+        try:
+            dst.copy_(src.clone())
+        except (RuntimeError, MemoryError) as e:
+            _stats["oom_retries"] += 1
+            _warn_once("clone_oom", "staged load: small/non-contig clone OOM (%s); reclaiming and retrying", e)
+            _host_empty_cache_safe()
+            try:
+                dst.copy_(src.clone())
+            except (RuntimeError, MemoryError):
+                dst.copy_(src)
     else:
         _staged_copy(dst, src)
 
@@ -393,29 +783,28 @@ def copy_from_checkpoint_(dst: torch.Tensor, src: torch.Tensor) -> None:
 def release_staging() -> None:
     """Release cached shard fd, pread thread pool, and PyTorch pinned host staging buffer
     after checkpoint loading finishes (reclaims 128-256 MiB of pinned GB10 UMA RAM)."""
-    global _fd, _fd_key, _fd_size, _POOL
-    if _fd >= 0:
-        try:
-            if _DROP_CACHE:
-                os.posix_fadvise(_fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        except OSError:
-            pass
-        try:
-            os.close(_fd)
-        except OSError:
-            pass
-        _DIRECT_FDS.discard(_fd)
-        _fd = -1
-        _fd_key = None
-        _fd_size = 0
-    if _POOL is not None:
-        try:
-            _POOL.shutdown(wait=False)
-        except Exception:
-            pass
+    global _POOL, _ALIGNED_SCRATCH
+    _close_cached_fd()
+    if _SEEN_SHARDS:
+        shards = sorted(_SEEN_SHARDS)
+        _SEEN_SHARDS.clear()
+        for sp in shards:
+            _fadvise_drop_path(sp)
+    with _POOL_LOCK:
+        pool = _POOL
         _POOL = None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=True)
+        except Exception:
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
+    _ALIGNED_SCRATCH = None
+    _host_empty_cache_safe()
     try:
-        if hasattr(torch._C, "_host_emptyCache"):
-            torch._C._host_emptyCache()
+        from . import host_pin as _hp_uma
+        _hp_uma.reclaim_host_uma(empty_cuda=False, tag="gb10_load_release_staging")
     except Exception:
         pass

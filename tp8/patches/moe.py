@@ -40,6 +40,29 @@ _S8_MOD_LOADED = False
 _C32_MOD_CACHE = None
 _C32_MOD_LOADED = False
 _PF_MOE_MOD_CACHE = None
+# Wave-V15 opt-in (default OFF — V13 S8 is proven 0-ULP bit-exact for M=1..16 prefill too):
+# When enabled, restricts M<=16 S8 fused MoE strictly to FULL decode CUDA graph capture.
+_MOE_S8_DECODE_ONLY = os.environ.get("INKLING_MOE_S8_DECODE_ONLY", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+
+
+def _is_s8_decode_allowed() -> bool:
+    if not _MOE_S8_DECODE_ONLY:
+        return True
+    try:
+        from .ops import skinny_bf11 as _sbf11
+
+        return bool(_sbf11._is_strict_decode_capturing())
+    except Exception:
+        return False
+
+
+def audit_moe_dense_invariants_v15(strict: bool | None = None) -> dict:
+    """Delegate startup 0-ULP MoE/BF11 invariant self-check to skinny_bf11."""
+    from .ops import skinny_bf11 as _sbf11
+
+    return _sbf11.audit_moe_dense_invariants_v15(strict=strict)
 
 
 def _get_rar_mod():
@@ -307,14 +330,29 @@ class Inkling2Experts(nn.Module):
         out_dtype = torch.bfloat16 if x.dtype == torch.float8_e4m3fn else x.dtype
         src2dst, gammas, rows, tiles = routing
         _fallback_sbuf = None
+        if x.shape[0] == 0:
+            if push is not None:
+                return None
+            if not reduce and not combine_only:
+                return torch.empty((0, self.hidden_size), dtype=out_dtype, device=x.device), src2dst
+            return torch.empty((0, self.hidden_size), dtype=out_dtype, device=x.device)
         # Dec160 S8 fused decode MoE fast path (Zero-Scatter + Fused W13 SiTU + W2 OTF Quant + Fused Combine)
-        if (reduce or combine_only) and push is None and plan.tile <= 16:
+        # Wave-V15 fix: guard 0 < x.shape[0] <= 16 (plan.tile <= 16 also holds for M=17..128, which previously
+        # called get_send_buffer() & forward_experts_s8() 48x/step before falling through to C32!).
+        _has_s8_tile_mask = getattr(tiles, "_inkling_tile_mask", None) is not None
+        if (
+            (reduce or combine_only)
+            and push is None
+            and plan.tile <= 16
+            and 0 < x.shape[0] <= 16
+            and (_has_s8_tile_mask or _is_s8_decode_allowed())
+        ):
             _s8 = _get_s8_mod()
             _s8_active = _s8 is not None and (
                 _s8.S8_ZERO_SCATTER
                 or _s8.S8_FUSE_SITU
                 or _s8.S8_FUSE_COMBINE
-                or getattr(tiles, "_inkling_tile_mask", None) is not None
+                or _has_s8_tile_mask
             )
             if _s8 is not None and _s8_active:
                 _sbuf = None
@@ -325,8 +363,12 @@ class Inkling2Experts(nn.Module):
                     _sbuf = _rar.get_send_buffer((x.shape[0], self.hidden_size), out_dtype)
                     if _rar.ROWAR.get("scope") == x.shape[0]:
                         _nlive = _rar.ROWAR.get("buf")
+                # Wave-V15 fix: ensure S8 never allocates an fp8 (1B/elem) output buffer for a BF16 kernel.
+                _s8_out_buf = _sbuf
+                if _s8_out_buf is None and x.dtype == torch.float8_e4m3fn:
+                    _s8_out_buf = torch.empty((x.shape[0], self.hidden_size), dtype=out_dtype, device=x.device)
                 _out = _s8.forward_experts_s8(
-                    self, x, routing, quantized, plan, out_buf=_sbuf, nlive_buf=_nlive,
+                    self, x, routing, quantized, plan, out_buf=_s8_out_buf, nlive_buf=_nlive,
                 )
                 if _out is not None:
                     if combine_only or self.ep_size == 1:
@@ -349,6 +391,11 @@ class Inkling2Experts(nn.Module):
                     return _out
                 if _sbuf is not None and _rar is not None and getattr(_rar, "_SBUF_RING_V10", False):
                     _fallback_sbuf = _sbuf
+        if _has_s8_tile_mask and quantized[0].shape[0] < plan.rows:
+            raise RuntimeError(
+                f"S8 Zero-Scatter quantized activations ({quantized[0].shape[0]} rows < plan.rows={plan.rows}) "
+                f"cannot fall back to non-S8 BMM (reduce={reduce}, combine_only={combine_only}, push={push is not None})"
+            )
         # C=32 (B=32, M=17..256) opt-in 0-ULP fused MoE fast path (Zero-Scatter + Fused SiTU + 6-Wave L2 Combine)
         if (
             (reduce or combine_only)
@@ -426,7 +473,12 @@ class Inkling2Experts(nn.Module):
                 *self.scales("w2"),
             )
             del gate_up
-        if (reduce or combine_only) and push is None and plan.tile >= 64:
+        if (
+            (reduce or combine_only)
+            and push is None
+            and plan.tile >= 64
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             pf_moe_native = _get_pf_moe_mod()
             if pf_moe_native.is_active(plan, tokens=x.shape[0]) and pf_moe_native.COMBINE_MODE != 0:
                 ensure_packed_for_pf_native(self.w2_weight, self.w2_weight_scale, 1)
@@ -564,6 +616,23 @@ class Inkling2MoE(nn.Module):
             if _fp8_sc is not None:
                 x._inkling_fp8_scale = _fp8_sc  # type: ignore[attr-defined]
         gate, experts = self.gate, self.experts
+        if x.shape[0] == 0:
+            out_dtype = torch.bfloat16 if x.dtype == torch.float8_e4m3fn else x.dtype
+            if push is not None:
+                return None
+            if not reduce and not combine_only:
+                return (
+                    torch.empty((0, experts.hidden_size), dtype=out_dtype, device=x.device),
+                    torch.empty((0,), dtype=torch.int32, device=x.device),
+                )
+            return torch.empty((0, experts.hidden_size), dtype=out_dtype, device=x.device)
+        if x.dtype == torch.float8_e4m3fn and x.shape[0] <= 16:
+            _fp8_sc = getattr(x, "_inkling_fp8_scale", None)
+            if _fp8_sc is None:
+                raise ValueError("FP8 input passed to Inkling2MoE.forward without _inkling_fp8_scale")
+            from .ops.linear import dequantize_fp8_rowwise
+
+            x = dequantize_fp8_rowwise(x, _fp8_sc)
         plan = experts.plan(x.shape[0])
         prezeroed_out = None
         zero_done_event = None
@@ -587,7 +656,15 @@ class Inkling2MoE(nn.Module):
                 )
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-            is_padding = get_forward_context().is_padding
+            _fc_pad = get_forward_context().is_padding
+            if (
+                _fc_pad is not None
+                and _fc_pad.shape == (x.shape[0],)
+                and _fc_pad.dtype == torch.bool
+            ):
+                is_padding = _fc_pad
+        _allow_fused_zs = (reduce or combine_only) and (push is None)
+        _allow_s8_zs = _allow_fused_zs and _is_s8_decode_allowed()
         routing, quantized = route(
             x,
             gate.weight,
@@ -600,6 +677,8 @@ class Inkling2MoE(nn.Module):
             plan,
             *experts.scales("w13"),
             is_padding,
+            allow_s8_zs=_allow_s8_zs,
+            allow_c32_zs=_allow_fused_zs,
         )
         return experts(
             x,

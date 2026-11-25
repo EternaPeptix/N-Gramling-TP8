@@ -61,6 +61,66 @@ _PF_ROUTER_FP8 = _SM12 and os.environ.get("INKLING_PF_ROUTER_FP8", "0").strip().
     "1", "true", "on", "yes",
 )
 _PF_ROUTER_FP8_MIN_M = int(os.environ.get("INKLING_PF_ROUTER_FP8_MIN_M", "1024"))
+# Wave-V15 opt-in (default OFF): protect decode tokens from FP8 quantization on both
+# pure eager decode (M >= MIN_M graph miss -> 100% BF16) and mixed prefill+decode chunks
+# (decode prefix x[:num_decode_tokens] runs exact BF16, prefill suffix runs fast FP8 TC).
+_PF_MIXED_DECODE_BF16 = os.environ.get("INKLING_PF_MIXED_DECODE_BF16", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+
+
+def _classify_pf_decode_batch(m: int) -> tuple[bool, int]:
+    """Inspect ForwardContext.attn_metadata for prefill vs decode token split.
+
+    Returns ``(allow_fp8, n_decode_prefix)``:
+      - ``(False, m)``: pure decode batch -> NEVER quantize to FP8!
+      - ``(True, n_dec)`` with ``0 < n_dec < m``: mixed chunk -> BF16 on ``[:n_dec]``, FP8 on ``[n_dec:]``.
+      - ``(True, 0)``: pure prefill (or no ForwardContext) -> fast FP8 path on all ``m`` rows.
+    """
+    if not _PF_MIXED_DECODE_BF16 or m <= 0:
+        return True, 0
+    try:
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+
+        if not is_forward_context_available():
+            return True, 0
+        amd = getattr(get_forward_context(), "attn_metadata", None)
+        if not isinstance(amd, dict) or not amd:
+            return True, 0
+        saw_attn_md = False
+        max_pf_toks = 0
+        max_pf_reqs = 0
+        max_dec_reqs = 0
+        max_dec_toks = 0
+        for md in amd.values():
+            if md is None:
+                continue
+            has_pf_tok = hasattr(md, "num_prefill_tokens")
+            has_dec_req = hasattr(md, "num_decode_reqs")
+            if not (has_pf_tok or has_dec_req):
+                continue
+            saw_attn_md = True
+            if has_pf_tok:
+                max_pf_toks = max(max_pf_toks, int(getattr(md, "num_prefill_tokens") or 0))
+            if hasattr(md, "num_prefill_reqs"):
+                max_pf_reqs = max(max_pf_reqs, int(getattr(md, "num_prefill_reqs") or 0))
+            if has_dec_req:
+                max_dec_reqs = max(max_dec_reqs, int(getattr(md, "num_decode_reqs") or 0))
+            if hasattr(md, "num_decode_tokens"):
+                max_dec_toks = max(max_dec_toks, int(getattr(md, "num_decode_tokens") or 0))
+        if not saw_attn_md:
+            return True, 0
+        if max_pf_toks == 0 and max_pf_reqs == 0 and max_dec_reqs > 0:
+            # Pure decode batch running eagerly (e.g. graph miss at M>=256): keep 100% BF16!
+            return False, m
+        if max_dec_reqs > 0 and max_dec_toks > 0:
+            if max_dec_toks >= m:
+                return False, m
+            return True, max_dec_toks
+        return True, 0
+    except Exception:
+        # Fail-closed against corrupting decode tokens if metadata inspection unexpectedly throws.
+        return False, m
 _FP8_MAX = 448.0
 _FP8_EPS = 1e-12
 _PF_ROWQUANT_V4 = _SM12 and os.environ.get("INKLING_PF_ROWQUANT_V4", "0").strip().lower() in (
@@ -71,6 +131,30 @@ _PF_NONMOE_V4_LIB_PATH = os.environ.get(
 ).strip()
 _PF_NONMOE_V4_LIB = None
 _PF_NONMOE_V4_TRIED = False
+# Wave-V11 314 TFLOPS SM121a FP8 `m16n8k32.f16`-inner / FP32-outer Dense GEMM + Fused wo_ud->A2A
+# Strictly opt-in (default OFF) and gated to eager prefill (M >= 1024, !capturing -> 0 decode touch!)
+_PF_DENSE_FP8_F16ACC = _SM12 and os.environ.get("INKLING_PF_DENSE_FP8_F16ACC", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+_PF_WO_UD_FUSED_A2A = _SM12 and os.environ.get("INKLING_PF_WO_UD_FUSED_A2A", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+_PF_DENSE_FP8_RESERVE_SMS = max(
+    min(int(os.environ.get("INKLING_PF_DENSE_FP8_RESERVE_SMS", "8") or 8), 24), 0
+)
+_PF_DENSE_FP8_RESERVE_EXPLICIT = "INKLING_PF_DENSE_FP8_RESERVE_SMS" in os.environ
+_PF_DENSE_FP8_TC_V13_LIB_PATH = os.environ.get(
+    "INKLING_PF_DENSE_FP8_TC_V13_LIB", "/rdma/libpf_dense_fp8_tc_v13.so"
+).strip()
+_PF_DENSE_FP8_TC_V11_LIB_PATH = os.environ.get(
+    "INKLING_PF_DENSE_FP8_TC_V11_LIB", "/rdma/libpf_dense_fp8_tc_v11.so"
+).strip()
+_PF_DENSE_FP8_TC_V11_LIB = None
+_PF_DENSE_FP8_TC_V11_TRIED = False
+_FP8_W_V11_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_V11_W_MAX_PREQUANT = 2.2
+_V11_W_MAX_WO_UD = 22.0
+_V11_A_MAX_WO_UD = 22.0
 _PF_ROWQUANT_SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _SHARED_PF_SCRATCH = os.environ.get(
     "INKLING_SHARED_PF_SCRATCH",
@@ -98,6 +182,20 @@ def get_shared_pf_scratch(
         buf = torch.empty((need,), dtype=torch.uint8, device=device)
         _SHARED_PF_SCRATCH_BUF[skey] = buf
     return buf[:need]
+
+
+def release_prefill_scratch() -> int:
+    """Release non-graphed prefill row-quant scratch pools (preserves _FP8_W_CACHE)."""
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return 0
+    freed = 0
+    for a, b in _PF_ROWQUANT_SCRATCH.values():
+        freed += int(a.numel() * a.element_size()) + int(b.numel() * b.element_size())
+    _PF_ROWQUANT_SCRATCH.clear()
+    for buf in _SHARED_PF_SCRATCH_BUF.values():
+        freed += int(buf.numel() * buf.element_size())
+    _SHARED_PF_SCRATCH_BUF.clear()
+    return freed
 
 
 def _resolve_bf16_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -241,6 +339,11 @@ def quantize_fp8_rowwise(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamic per-row BF16 [M, K] -> (x_fp8 [M_pad, K] e4m3fn, x_scale [M_pad, 1] fp32)."""
     m, k = x.shape
+    if m == 0:
+        return (
+            torch.empty((0, k), dtype=torch.float8_e4m3fn, device=x.device),
+            torch.empty((0, 1), dtype=torch.float32, device=x.device),
+        )
     m_pad = ((m + 15) & ~15) if pad_m16 else m
     can_v4 = (
         _PF_ROWQUANT_V4
@@ -334,11 +437,16 @@ def _dequant_fp8_rowwise_ht_kernel(
 def dequantize_fp8_rowwise(x_fp8: torch.Tensor, x_scale: torch.Tensor) -> torch.Tensor:
     """Dequantize FP8 E4M3FN [M, K] + per-row FP32 scale [M, 1] -> contiguous BF16 [M, K]."""
     m, k = int(x_fp8.shape[0]), int(x_fp8.shape[1])
+    if m == 0:
+        return torch.empty((0, k), dtype=torch.bfloat16, device=x_fp8.device)
     head = 1 << (k.bit_length() - 1)
     tail = k - head
     if (
         x_fp8.is_cuda
         and x_fp8.stride(1) == 1
+        and x_scale.is_cuda
+        and x_scale.dtype == torch.float32
+        and x_scale.is_contiguous()
         and head <= 8192
         and (tail == 0 or (tail & (tail - 1)) == 0)
     ):
@@ -350,6 +458,208 @@ def dequantize_fp8_rowwise(x_fp8: torch.Tensor, x_scale: torch.Tensor) -> torch.
         )
         return y
     return (x_fp8.to(torch.float32) * x_scale).to(torch.bfloat16)
+
+
+def _get_pf_dense_fp8_tc_v11_lib():
+    """Lazily load SM121a `libpf_dense_fp8_tc_v13.so` (or V11 fallback) outside CUDA graph capture."""
+    global _PF_DENSE_FP8_TC_V11_LIB, _PF_DENSE_FP8_TC_V11_TRIED, _PF_DENSE_FP8_RESERVE_SMS
+    if _PF_DENSE_FP8_TC_V11_TRIED:
+        return _PF_DENSE_FP8_TC_V11_LIB
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return None
+    _PF_DENSE_FP8_TC_V11_TRIED = True
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _cands = (
+        _PF_DENSE_FP8_TC_V13_LIB_PATH,
+        "/rdma/libpf_dense_fp8_tc_v13.so",
+        os.path.join(_here, "libpf_dense_fp8_tc_v13.so"),
+        _PF_DENSE_FP8_TC_V11_LIB_PATH,
+        "/rdma/libpf_dense_fp8_tc_v11.so",
+        os.path.join(_here, "libpf_dense_fp8_tc_v11.so"),
+    )
+    _chosen = next((p for p in _cands if p and os.path.exists(p)), "")
+    if _chosen:
+        try:
+            lib = ctypes.CDLL(_chosen)
+            lib.pf_dense_fp8_tc_v11_version.argtypes = []
+            lib.pf_dense_fp8_tc_v11_version.restype = ctypes.c_int
+            lib.pf_quant_weight_f16safe_v11_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_uint64,
+            ]
+            lib.pf_quant_weight_f16safe_v11_fwd.restype = ctypes.c_int
+            lib.pf_dense_fp8_f16acc_v11_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_uint64,
+            ]
+            lib.pf_dense_fp8_f16acc_v11_fwd.restype = ctypes.c_int
+            lib.pf_wo_ud_bf16_to_bf16_v11_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_float, ctypes.c_int, ctypes.c_uint64,
+            ]
+            lib.pf_wo_ud_bf16_to_bf16_v11_fwd.restype = ctypes.c_int
+            lib.pf_wo_ud_fused_a2a_int8_v11_fwd.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+            ]
+            lib.pf_wo_ud_fused_a2a_int8_v11_fwd.restype = ctypes.c_int
+            if (not _PF_DENSE_FP8_RESERVE_EXPLICIT) and int(lib.pf_dense_fp8_tc_v11_version()) >= 1300:
+                _PF_DENSE_FP8_RESERVE_SMS = 0
+            _PF_DENSE_FP8_TC_V11_LIB = lib
+            print(
+                f"[inkling-pf-dense-v11] loaded SM121a 314-TF FP8-f16acc dense TC kernels: "
+                f"{_chosen} (ver={lib.pf_dense_fp8_tc_v11_version()}, reserve_sms={_PF_DENSE_FP8_RESERVE_SMS})",
+                flush=True,
+            )
+        except Exception as _e:
+            print(f"[inkling-pf-dense-v11] lib load failed ({_e!r}); falling back to cuBLASLt", flush=True)
+            _PF_DENSE_FP8_TC_V11_LIB = None
+    return _PF_DENSE_FP8_TC_V11_LIB
+
+
+def _get_cached_w_fp8_v11_f16safe(
+    weight: torch.Tensor, w_max: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lazily quantize & cache BF16 `[N, K]` -> `(w_fp8 [N, K] uint8 row-major, w_scale [N] fp32)`
+    bounded to `[-w_max, w_max]` so `m16n8k32.f16` inner `K_CHUNK=64` has provably 0 FP16 overflow!"""
+    w_key = int(round(w_max * 100.0))
+    direct_entries = getattr(weight, "_inkling_fp8_v11_entries", None)
+    if isinstance(direct_entries, dict):
+        hit = direct_entries.get(w_key)
+        if hit is not None:
+            return hit
+    n, k = int(weight.shape[0]), int(weight.shape[1])
+    ptr = int(weight.data_ptr())
+    ckey = (ptr, n, k, w_key)
+    if ptr != 0:
+        cached = _FP8_W_V11_CACHE.get(ckey)
+        if cached is not None:
+            return cached
+    w_src = _resolve_bf16_weight(weight).contiguous()
+    lib = _get_pf_dense_fp8_tc_v11_lib()
+    if lib is not None and (k % 64) == 0 and w_src.is_cuda:
+        w_fp8 = torch.empty((n, k), dtype=torch.uint8, device=w_src.device)
+        w_sc = torch.empty((n,), dtype=torch.float32, device=w_src.device)
+        rc = lib.pf_quant_weight_f16safe_v11_fwd(
+            w_src.data_ptr(),
+            w_fp8.data_ptr(),
+            w_sc.data_ptr(),
+            n,
+            k,
+            float(w_max),
+            int(torch.cuda.current_stream(w_src.device).cuda_stream),
+        )
+        if rc == 0:
+            entry = (w_fp8, w_sc)
+            if ptr != 0:
+                _FP8_W_V11_CACHE[ckey] = entry
+            try:
+                if not isinstance(direct_entries, dict):
+                    direct_entries = {}
+                    weight._inkling_fp8_v11_entries = direct_entries  # type: ignore[attr-defined]
+                direct_entries[w_key] = entry
+            except Exception:
+                pass
+            return entry
+    w_f32 = w_src.float()
+    amax = w_f32.abs().amax(dim=1)
+    w_sc = torch.clamp(amax * (1.0 / float(w_max)), min=_FP8_EPS).contiguous()
+    w_fp8 = (
+        torch.clamp(w_f32 / w_sc[:, None], -float(w_max), float(w_max))
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+        .contiguous()
+    )
+    entry = (w_fp8, w_sc)
+    if ptr != 0:
+        _FP8_W_V11_CACHE[ckey] = entry
+    try:
+        if not isinstance(direct_entries, dict):
+            direct_entries = {}
+            weight._inkling_fp8_v11_entries = direct_entries  # type: ignore[attr-defined]
+        direct_entries[w_key] = entry
+    except Exception:
+        pass
+    return entry
+
+
+def pf_wo_ud_fused_a2a_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    world_size: int,
+    rank: int,
+):
+    """Wave-V11 fused BF16-in `wo_ud` (`314 TFLOPS` FP8-f16acc) -> direct register `A2A_INT8_g64`
+    epilogue returning `PreQuantA2APartial` (eliminates `quant_k768`, `attn_partial` BF16 write,
+    AND `a2a_quant_int8_g64_lowsm` on `comm_stream`!). Returns `None` on any guard miss."""
+    if not (_PF_DENSE_FP8 and _PF_WO_UD_FUSED_A2A):
+        return None
+    if not x.is_cuda or x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return None
+    if x.ndim != 2 or weight.ndim != 2 or x.stride(1) != 1 or weight.stride(1) != 1:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    m, k = int(x.shape[0]), int(x.shape[1])
+    n = int(weight.shape[0])
+    if m < max(_PF_DENSE_FP8_MIN_M, 1024) or world_size not in (2, 4, 8):
+        return None
+    if (m % world_size) != 0 or (k % 64) != 0 or (n % 128) != 0:
+        return None
+    s = m // world_size
+    if (s % 128) != 0:
+        return None
+    lib = _get_pf_dense_fp8_tc_v11_lib()
+    if lib is None:
+        return None
+    from .. import prefill_sp_rs as _sp_rs
+
+    w_fp8, w_sc = _get_cached_w_fp8_v11_f16safe(weight, _V11_W_MAX_WO_UD)
+    scale_off, peer_bytes = _sp_rs._rhd_g64_packed_bytes(s, n)
+    x_c = x if (x.stride(0) & 7) == 0 and (x.data_ptr() & 15) == 0 else x.contiguous()
+    send_buf = torch.empty((world_size, peer_bytes), dtype=torch.uint8, device=x.device)
+    local_shard = torch.empty((s, n), dtype=torch.bfloat16, device=x.device)
+    stream_u64 = int(torch.cuda.current_stream(x.device).cuda_stream)
+    rc = lib.pf_wo_ud_fused_a2a_int8_v11_fwd(
+        x_c.data_ptr(),
+        w_fp8.data_ptr(),
+        w_sc.data_ptr(),
+        send_buf.data_ptr(),
+        local_shard.data_ptr(),
+        int(x_c.stride(0)),
+        int(local_shard.stride(0)),
+        int(peer_bytes),
+        int(scale_off),
+        s,
+        n,
+        k,
+        world_size,
+        rank,
+        float(_V11_A_MAX_WO_UD),
+        0,
+        int(_PF_DENSE_FP8_RESERVE_SMS),
+        stream_u64,
+    )
+    if rc != 0:
+        return None
+    return _sp_rs.PreQuantA2APartial(
+        send_buf=send_buf,
+        local_shard=local_shard,
+        peer_bytes=peer_bytes,
+        scale_off=scale_off,
+        S=s,
+        H=n,
+        world_size=world_size,
+        rank=rank,
+        is_fp8=False,
+    )
 
 
 def pf_dense_fp8_linear_prequant(
@@ -375,10 +685,45 @@ def pf_dense_fp8_linear_prequant(
     m, k = int(x_fp8.shape[0]), int(x_fp8.shape[1])
     n = int(weight.shape[0])
     n_floor = _PF_DENSE_FP8_MIN_N if min_n is None else min_n
-    if m <= 0 or k < 256 or (k & 15) != 0 or n < n_floor:
+    if m <= 0 or int(weight.shape[1]) != k or k < 256 or (k & 15) != 0 or n < n_floor:
         return None
-    if out is not None and out.dtype != torch.bfloat16:
+    if out is not None and (out.dtype != torch.bfloat16 or out.ndim != 2 or out.shape != (m, n)):
         return None
+    # Wave-V11 314 TFLOPS SM121a FP8 `m16n8k32.f16`-inner / FP32-outer (`W_MAX=2.2`, 0 overflow,
+    # native `N % 8 == 0` -> kills `n_pad=1904` copy & doubles TC peak 157 -> 314 TFLOPS!)
+    if (
+        _PF_DENSE_FP8_F16ACC
+        and m >= max(_PF_DENSE_FP8_MIN_M, 1024)
+        and (k % 64) == 0
+        and (n % 8) == 0
+        and x_fp8.is_contiguous()
+        and (out is None or (out.stride(1) == 1 and (out.stride(0) & 7) == 0 and (out.data_ptr() & 15) == 0))
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        v11_lib = _get_pf_dense_fp8_tc_v11_lib()
+        if v11_lib is not None:
+            w_fp8_v11, w_sc_v11 = _get_cached_w_fp8_v11_f16safe(weight, _V11_W_MAX_PREQUANT)
+            s_in_v11 = (
+                x_scale
+                if (x_scale.dtype == torch.float32 and x_scale.is_contiguous() and x_scale.numel() == m)
+                else x_scale.to(torch.float32).reshape(m).contiguous()
+            )
+            out_buf = out if out is not None else torch.empty((m, n), dtype=torch.bfloat16, device=x_fp8.device)
+            rc_v11 = v11_lib.pf_dense_fp8_f16acc_v11_fwd(
+                x_fp8.data_ptr(),
+                s_in_v11.data_ptr(),
+                w_fp8_v11.data_ptr(),
+                w_sc_v11.data_ptr(),
+                out_buf.data_ptr(),
+                m,
+                n,
+                k,
+                int(out_buf.stride(0)),
+                int(_PF_DENSE_FP8_RESERVE_SMS),
+                int(torch.cuda.current_stream(x_fp8.device).cuda_stream),
+            )
+            if rc_v11 == 0:
+                return out_buf
     mode, supports_out = _probe_fp8_cap(x_fp8.device)
     if mode != "rowwise":
         return None
@@ -432,8 +777,15 @@ def pf_dense_fp8_linear_prequant(
 def quantize_fp8_tensorwise(x: torch.Tensor, pad_m16: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamic per-tensor BF16 [M, K] -> (x_fp8 [M_pad, K] e4m3fn, x_scale [1] fp32)."""
     m, k = x.shape
+    if m == 0:
+        return (
+            torch.empty((0, k), dtype=torch.float8_e4m3fn, device=x.device),
+            torch.ones((1,), dtype=torch.float32, device=x.device),
+        )
     m_pad = ((m + 15) & ~15) if pad_m16 else m
-    amax = x.abs().amax().to(torch.float32)
+    # Wave-V15 NaN/Inf isolation: prevent a non-finite value in a padded row from poisoning global scale.
+    xf = x.to(torch.float32)
+    amax = torch.where(torch.isfinite(xf), xf.abs(), torch.zeros((), dtype=torch.float32, device=x.device)).amax()
     scale = torch.clamp(amax * (1.0 / _FP8_MAX), min=_FP8_EPS).reshape(1)
     inv = (1.0 / scale).to(x.dtype)
     q = torch.clamp(x * inv, -_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
@@ -565,10 +917,43 @@ def pf_dense_fp8_linear(
     m, k = int(x.shape[0]), int(x.shape[1])
     n = int(weight.shape[0])
     n_floor = _PF_DENSE_FP8_MIN_N if min_n is None else min_n
-    if k < 256 or (k & 15) != 0 or n < n_floor:
+    if m <= 0 or int(weight.shape[1]) != k or k < 256 or (k & 15) != 0 or n < n_floor:
         return None
-    if out is not None and out.dtype != torch.bfloat16:
+    if out is not None and (out.dtype != torch.bfloat16 or out.ndim != 2 or out.shape != (m, n)):
         return None
+
+    # Wave-V11 314 TFLOPS SM121a BF16-in FP8-f16acc dense GEMM (`A_MAX=22, W_MAX=22`, 0 overflow,
+    # eliminates `quantize_fp8_rowwise` `quant_k768` DRAM round-trip completely!)
+    if (
+        _PF_DENSE_FP8_F16ACC
+        and mode_override is None
+        and m >= max(_PF_DENSE_FP8_MIN_M, 1024)
+        and (k % 64) == 0
+        and (n % 8) == 0
+        and (out is None or (out.stride(1) == 1 and (out.stride(0) & 7) == 0 and (out.data_ptr() & 15) == 0))
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        v11_lib = _get_pf_dense_fp8_tc_v11_lib()
+        if v11_lib is not None:
+            w_fp8_v11, w_sc_v11 = _get_cached_w_fp8_v11_f16safe(weight, _V11_W_MAX_WO_UD)
+            x_c = x if ((x.stride(0) & 7) == 0 and (x.data_ptr() & 15) == 0) else x.contiguous()
+            out_buf = out if out is not None else torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+            rc_v11 = v11_lib.pf_wo_ud_bf16_to_bf16_v11_fwd(
+                x_c.data_ptr(),
+                w_fp8_v11.data_ptr(),
+                w_sc_v11.data_ptr(),
+                out_buf.data_ptr(),
+                m,
+                n,
+                k,
+                int(x_c.stride(0)),
+                int(out_buf.stride(0)),
+                float(_V11_A_MAX_WO_UD),
+                int(_PF_DENSE_FP8_RESERVE_SMS),
+                int(torch.cuda.current_stream(x.device).cuda_stream),
+            )
+            if rc_v11 == 0:
+                return out_buf
 
     if mode_override is not None:
         mode = mode_override
@@ -636,21 +1021,48 @@ def linear(
 ) -> torch.Tensor:
     """bf16 ``x @ weight.T`` with fp32 accumulation (into ``out`` if given)."""
     m = x.shape[0]
+    _is_wo_shape = weight.dim() == 2 and int(weight.shape[0]) == _PDL_WO_N and int(weight.shape[1]) == _PDL_WO_K
+    if m == 0:
+        if _is_wo_shape and (_PDL_WO or _PDL_WO_BF11):
+            try:
+                from . import sm12_attn
+                sm12_attn._WO_ARMED = False
+            except Exception:
+                pass
+        if out is not None:
+            return out
+        out_dt = torch.bfloat16 if x.dtype == torch.float8_e4m3fn else x.dtype
+        return torch.empty((0, int(weight.shape[0])), dtype=out_dt, device=x.device)
     if x.dtype == torch.float8_e4m3fn:
         x_scale = getattr(x, "_inkling_fp8_scale", None)
-        if x_scale is not None:
-            if _PF_DENSE_FP8 and not torch.cuda.is_current_stream_capturing():
+        if x_scale is None:
+            raise ValueError("FP8 tensor passed to ops.linear.linear without _inkling_fp8_scale")
+        if _PF_DENSE_FP8 and not torch.cuda.is_current_stream_capturing():
+            _fp8_ok, _n_dec = _classify_pf_decode_batch(m)
+            if _fp8_ok and _n_dec == 0:
                 res = pf_dense_fp8_linear_prequant(x, x_scale, weight, out)
                 if res is not None:
+                    if _is_wo_shape and (_PDL_WO or _PDL_WO_BF11):
+                        from . import sm12_attn
+                        sm12_attn._WO_ARMED = False
                     return res
-            x = dequantize_fp8_rowwise(x, x_scale)
+        x = dequantize_fp8_rowwise(x, x_scale)
     if _SKINNY and m <= 16:
         from . import skinny_bf11, skinny_bf12
         from .skinny import skinny_linear, supported
-        if supported(x, weight) and (out is None or out.stride(1) == 1):
+        if supported(x, weight) and (
+            out is None
+            or (
+                out.is_cuda
+                and out.dim() == 2
+                and out.shape == (m, int(weight.shape[0]))
+                and out.dtype == x.dtype
+                and out.stride(1) == 1
+            )
+        ):
             pdl_bf11 = _pdl_site(x, weight, out, for_bf11=True)
             pdl = _pdl_site(x, weight, out, for_bf11=False)
-            if tuple(weight.shape) == (_PDL_WO_N, _PDL_WO_K) and (_PDL_WO or (_PDL_WO_BF11 and skinny_bf11.ENABLED) or skinny_bf11.V12_ENABLED):
+            if _is_wo_shape and (_PDL_WO or (_PDL_WO_BF11 and skinny_bf11.ENABLED) or skinny_bf11.V12_ENABLED):
                 from . import sm12_attn
                 sm12_attn._WO_ARMED = False  # one-shot: consumed/cleared by this wo_ud launch
             if skinny_bf11.ENABLED:
@@ -669,29 +1081,61 @@ def linear(
             skinny_bf11.ENABLED
             and skinny_bf11.C32_ENABLED
             and m <= skinny_bf11.C32_MAX_M
+            and x.is_cuda
+            and weight.is_cuda
             and x.dim() == 2
+            and weight.dim() == 2
+            and int(x.shape[1]) == int(weight.shape[1])
             and x.dtype == torch.bfloat16
             and weight.dtype == torch.bfloat16
             and x.stride(1) == 1
             and weight.stride(1) == 1
-            and (out is None or out.stride(1) == 1)
+            and (
+                out is None
+                or (
+                    out.is_cuda
+                    and out.dim() == 2
+                    and out.shape == (m, int(weight.shape[0]))
+                    and out.dtype == x.dtype
+                    and out.stride(1) == 1
+                )
+            )
         ):
             pdl = _pdl_site(x, weight, out, for_bf11=True)
-            if tuple(weight.shape) == (_PDL_WO_N, _PDL_WO_K) and (_PDL_WO or _PDL_WO_BF11 or skinny_bf11.V12_ENABLED):
+            if _is_wo_shape and (_PDL_WO or _PDL_WO_BF11 or skinny_bf11.V12_ENABLED):
                 from . import sm12_attn
                 sm12_attn._WO_ARMED = False
             trig = pdl and (out is not None or weight.shape[1] == 4608)
             res = skinny_bf11.bf11_linear(x, weight, out, pdl=pdl, trig=trig)
             if res is not None:
                 return res
+    # Wave-V15 fix: clear one-shot _WO_ARMED on ANY wo_ud fallback path (e.g. M>64 C=32 M=128
+    # or eager prefill) so it can NEVER leak into a subsequent drafter o_proj call of shape (4608, 768)!
+    if _is_wo_shape and (_PDL_WO or _PDL_WO_BF11):
+        try:
+            from . import sm12_attn
+            sm12_attn._WO_ARMED = False
+        except Exception:
+            pass
     if (
         _PF_DENSE_FP8
         and m >= _PF_DENSE_FP8_MIN_M
         and not torch.cuda.is_current_stream_capturing()
     ):
-        res = pf_dense_fp8_linear(x, weight, out)
-        if res is not None:
-            return res
+        _fp8_ok, _n_dec = _classify_pf_decode_batch(m)
+        if _fp8_ok and _n_dec == 0:
+            res = pf_dense_fp8_linear(x, weight, out)
+            if res is not None:
+                return res
+        elif _fp8_ok and 0 < _n_dec < m and (m - _n_dec) >= _PF_DENSE_FP8_MIN_M:
+            w_bf16 = _resolve_bf16_weight(weight)
+            out_buf = out if out is not None else torch.empty((m, int(weight.shape[0])), dtype=x.dtype, device=x.device)
+            torch.mm(x[:_n_dec], w_bf16.t(), out=out_buf[:_n_dec])
+            res_pf = pf_dense_fp8_linear(x[_n_dec:], weight, out=out_buf[_n_dec:])
+            if res_pf is not None:
+                return out_buf
+            torch.mm(x[_n_dec:], w_bf16.t(), out=out_buf[_n_dec:])
+            return out_buf
     weight = _resolve_bf16_weight(weight)
     if out is not None:
         return torch.mm(x, weight.t(), out=out)
@@ -870,6 +1314,8 @@ def k_group_partials(
     directly with ZERO dequant/re-quant when fed from FP8-Direct SP AllGather!"""
     m = int(x.shape[0])
     target_dtype = torch.bfloat16 if out_dtype == torch.float8_e4m3fn else out_dtype
+    if m == 0:
+        return torch.empty((1, 0, int(weight.shape[0])), dtype=target_dtype, device=x.device)
     if x.dtype == torch.float8_e4m3fn:
         x_scale = getattr(x, "_inkling_fp8_scale", None)
         if x_scale is None:
@@ -879,11 +1325,13 @@ def k_group_partials(
             and m >= _PF_ROUTER_FP8_MIN_M
             and not torch.cuda.is_current_stream_capturing()
         ):
-            res = pf_dense_fp8_linear_prequant(x, x_scale, weight, min_n=16)
-            if res is not None:
-                if res.dtype != target_dtype:
-                    res = res.to(target_dtype)
-                return res.unsqueeze(0)
+            _rfp8_ok, _rn_dec = _classify_pf_decode_batch(m)
+            if _rfp8_ok and _rn_dec == 0:
+                res = pf_dense_fp8_linear_prequant(x, x_scale, weight, min_n=16)
+                if res is not None:
+                    if res.dtype != target_dtype:
+                        res = res.to(target_dtype)
+                    return res.unsqueeze(0)
         x = dequantize_fp8_rowwise(x, x_scale)
     elif (
         _PF_ROUTER_FP8
@@ -891,11 +1339,23 @@ def k_group_partials(
         and m >= _PF_ROUTER_FP8_MIN_M
         and not torch.cuda.is_current_stream_capturing()
     ):
-        res = pf_dense_fp8_linear(x, weight, min_n=16)
-        if res is not None:
-            if res.dtype != target_dtype:
-                res = res.to(target_dtype)
-            return res.unsqueeze(0)
+        _rfp8_ok, _rn_dec = _classify_pf_decode_batch(m)
+        if _rfp8_ok and _rn_dec == 0:
+            res = pf_dense_fp8_linear(x, weight, min_n=16)
+            if res is not None:
+                if res.dtype != target_dtype:
+                    res = res.to(target_dtype)
+                return res.unsqueeze(0)
+        elif _rfp8_ok and 0 < _rn_dec < m and (m - _rn_dec) >= _PF_ROUTER_FP8_MIN_M:
+            w_bf16 = _resolve_bf16_weight(weight)
+            out_r = torch.empty((m, int(weight.shape[0])), dtype=torch.bfloat16, device=x.device)
+            torch.mm(x[:_rn_dec], w_bf16.t(), out=out_r[:_rn_dec])
+            res_pf = pf_dense_fp8_linear(x[_rn_dec:], weight, out=out_r[_rn_dec:], min_n=16)
+            if res_pf is None:
+                torch.mm(x[_rn_dec:], w_bf16.t(), out=out_r[_rn_dec:])
+            if out_r.dtype != target_dtype:
+                out_r = out_r.to(target_dtype)
+            return out_r.unsqueeze(0)
     weight = _resolve_bf16_weight(weight)
     out = torch.matmul(x, weight.t())
     if out.dtype != target_dtype:

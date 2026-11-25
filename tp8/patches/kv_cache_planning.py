@@ -21,6 +21,7 @@ from vllm.v1.core.kv_cache_config_builder import (
 )
 from vllm.v1.core.kv_cache_utils import (
     _kv_cache_device_name,
+    resolve_dcp_kv_block_size,
     update_kv_cache_capacity,
 )
 from vllm.v1.hisparse.layout import (
@@ -1871,8 +1872,12 @@ def get_global_kv_cache_groups(
         builder, vllm_config, merged_kv_cache_specs
     )
     if global_kv_cache_groups:
+        dcp = vllm_config.parallel_config.decode_context_parallel_size
         scheduler_block_size = math.lcm(
-            *(g.kv_cache_spec.block_size for g in global_kv_cache_groups)
+            *(
+                resolve_dcp_kv_block_size(g.kv_cache_spec, dcp)
+                for g in global_kv_cache_groups
+            )
         )
         for group in global_kv_cache_groups:
             if (

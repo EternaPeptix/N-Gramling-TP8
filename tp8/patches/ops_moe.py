@@ -30,6 +30,9 @@ _COMBINE_C32_V6_OR_V8_V9 = (
     or os.environ.get("INKLING_C48_MOE_V8", "").strip().lower() not in _OFF_TOKENS
     or os.environ.get("INKLING_C48_MOE_V9", "").strip().lower() not in _OFF_TOKENS
     or os.environ.get("INKLING_C48_MOE_V10", "").strip().lower() not in _OFF_TOKENS
+    or os.environ.get("INKLING_C48_MOE_V12", "").strip().lower() not in _OFF_TOKENS
+    or os.environ.get("INKLING_C48_MOE_V13", "").strip().lower() not in _OFF_TOKENS
+    or os.environ.get("INKLING_MX7_C48_V14", "").strip().lower() not in _OFF_TOKENS
 )
 _RAR_MOD_CACHE = None
 _RAR_MOD_TRIED = False
@@ -938,6 +941,9 @@ def route(
     weight_amax: torch.Tensor | None,
     weight_denominator: torch.Tensor | None,
     is_padding: torch.Tensor | None = None,
+    *,
+    allow_s8_zs: bool = True,
+    allow_c32_zs: bool = True,
 ) -> tuple[
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
@@ -960,8 +966,33 @@ def route(
     assert is_padding is None or (
         is_padding.shape == (tokens,) and is_padding.dtype == torch.bool
     )
+    if is_padding is not None and not is_padding.is_contiguous():
+        is_padding = is_padding.contiguous()
     experts = gate_weight.shape[0]
     assert x.is_contiguous() and gate_weight.is_contiguous()
+    nvfp4 = weight_amax is not None
+    device = x.device
+    if tokens == 0:
+        tiles_z = torch.zeros(2 * plan.max_ctas + 3, dtype=torch.int32, device=device)
+        outputs_z = (
+            torch.empty(0, dtype=torch.int32, device=device),
+            torch.empty(plan.rows, dtype=torch.float32, device=device),
+            torch.empty(0, dtype=torch.int32, device=device),
+            tiles_z,
+        )
+        if nvfp4:
+            quantized_z = (
+                torch.empty((plan.rows, hidden // 2), dtype=torch.uint8, device=device),
+                torch.empty((plan.rows, hidden // 16), dtype=torch.float8_e4m3fn, device=device),
+                torch.empty(plan.rows, dtype=torch.float32, device=device),
+            )
+        else:
+            quantized_z = (
+                torch.empty((plan.rows, hidden), dtype=torch.float8_e4m3fn, device=device),
+                torch.empty((plan.rows, hidden // 32), dtype=torch.uint8, device=device),
+                None,
+            )
+        return outputs_z, quantized_z
     x_is_fp8 = x.dtype == torch.float8_e4m3fn
     x_fp8_scale = getattr(x, "_inkling_fp8_scale", None) if x_is_fp8 else None
     if x_is_fp8 and x_fp8_scale is None:
@@ -974,19 +1005,33 @@ def route(
         assert plan.tile >= tokens
         router_bf12 = _get_router_bf12_mod()
         if router_bf12.ENABLED:
-            nlive_buf = None
-            _rar = _get_rar_mod()
-            if _rar is not None and _rar.ROWAR.get("scope") == tokens:
-                nlive_buf = _rar.ROWAR.get("buf")
-            res = router_bf12.route_bf12(
-                x, gate_weight, bias, counters, counts, topk, route_scale,
-                expert_bounds, plan, weight_amax, weight_denominator,
-                is_padding=is_padding, nlive_buf=nlive_buf, pdl=2,
-            )
-            if res is not None:
-                return res
+            _skip_rb12_for_zs = False
+            if not allow_s8_zs:
+                try:
+                    from . import moe_s8_runtime as _s8_rt
+
+                    _skip_rb12_for_zs = bool(
+                        _s8_rt.S8_ROUTER
+                        or _s8_rt.S8_ZERO_SCATTER
+                        or _s8_rt.S8_FUSE_SITU
+                    )
+                except Exception:
+                    _skip_rb12_for_zs = False
+            if not _skip_rb12_for_zs:
+                nlive_buf = None
+                _rar = _get_rar_mod()
+                if _rar is not None and _rar.ROWAR.get("scope") == tokens:
+                    nlive_buf = _rar.ROWAR.get("buf")
+                res = router_bf12.route_bf12(
+                    x, gate_weight, bias, counters, counts, topk, route_scale,
+                    expert_bounds, plan, weight_amax, weight_denominator,
+                    is_padding=is_padding, nlive_buf=nlive_buf, pdl=2,
+                )
+                if res is not None:
+                    return res
     if (
-        tokens > FUSED_ROUTING_MAX_TOKENS
+        allow_c32_zs
+        and tokens > FUSED_ROUTING_MAX_TOKENS
         and tokens <= 256
         and not x_is_fp8
         and plan.tile in (8, 16, 32)
@@ -1016,6 +1061,9 @@ def route(
         tokens > FUSED_ROUTING_MAX_TOKENS
         and hidden == 4608
         and topk == 8
+        and x.is_cuda
+        and bias.is_contiguous()
+        and expert_bounds.is_contiguous()
         and (x.dtype == torch.bfloat16 or (x_is_fp8 and x_fp8_scale is not None))
     ):
         try:
@@ -1244,6 +1292,21 @@ def route(
             if _rowmaj_sc:
                 quantized[1]._inkling_rowmaj = True
             return outputs, quantized
+        if _zero_scat and quantized[0].shape[0] < rows:
+            # Wave-V15 fix: _pqf_lib scatter failed after allocating Zero-Scatter qrows=tokens (< plan.rows).
+            # Reallocate full [plan.rows] quantized buffers before Triton scatter to prevent OOB writes!
+            if nvfp4:
+                quantized = (
+                    torch.empty((rows, hidden // 2), dtype=torch.uint8, device=device),
+                    torch.empty((rows, hidden // 16), dtype=torch.float8_e4m3fn, device=device),
+                    quantized[2],
+                )
+            else:
+                quantized = (
+                    torch.empty((rows, hidden), dtype=torch.float8_e4m3fn, device=device),
+                    torch.empty((rows, hidden // 32), dtype=torch.uint8, device=device),
+                    None,
+                )
     if x_is_fp8:
         x = dequantize_fp8_rowwise(x, x_fp8_scale)
         x_is_fp8 = False
@@ -1403,6 +1466,8 @@ def _combine(
 ) -> None:
     hidden = down.shape[1]
     tokens = src2dst.numel() // topk
+    if tokens == 0:
+        return
     block = 512
     assert hidden % block == 0
     nlive_buf = None
@@ -1417,11 +1482,14 @@ def _combine(
         and (tokens <= 256 or nlive_buf is not None)
         and hidden == 4608
         and topk == 8
+        and down.is_cuda
         and down.dtype == torch.bfloat16
         and out is not None
+        and out.is_cuda
         and out.dtype == torch.bfloat16
         and down.is_contiguous()
         and out.is_contiguous()
+        and src2dst.is_cuda
         and src2dst.dtype == torch.int32
         and src2dst.is_contiguous()
     ):
@@ -1464,11 +1532,16 @@ def _combine(
         and tokens >= 32
         and hidden == 4608
         and topk == 8
+        and down.is_cuda
         and down.dtype == torch.bfloat16
         and out is not None
+        and out.is_cuda
         and out.dtype == torch.bfloat16
         and down.is_contiguous()
         and out.is_contiguous()
+        and src2dst.is_cuda
+        and src2dst.dtype == torch.int32
+        and src2dst.is_contiguous()
     ):
         try:
             from . import prefill_qf as _pqf

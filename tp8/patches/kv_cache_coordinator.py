@@ -99,6 +99,8 @@ def replay_boundaries(
     resend's hit to 0. The alignment is the scheduler block size, not the
     finer hash granularity, which would over-estimate the reach.
     """
+    if num_prompt_tokens <= 0:
+        return (0,)
     if not use_eagle:
         return (num_prompt_tokens - 1,)
     block = scheduler_block_size
@@ -221,6 +223,193 @@ class KVCacheCoordinator(ABC):
             use_eagle=bool(self.drop_eagle_group_ids),
         )
 
+    def _effective_retention_interval(
+        self, request: Request | None, num_tokens: int
+    ) -> int | None:
+        effective_retention = self.retention_interval
+        if (
+            request is not None
+            and _MULTITURN_TAIL_CACHE_STRIDE > 0
+            and self.retention_interval == 0
+            and num_tokens > request.num_prompt_tokens
+        ):
+            effective_retention = max(
+                self.scheduler_block_size,
+                cdiv(_MULTITURN_TAIL_CACHE_STRIDE, self.scheduler_block_size)
+                * self.scheduler_block_size,
+            )
+        return effective_retention
+
+    def snapshot_request_allocation(self, request_id: str) -> list[tuple]:
+        """Capture lightweight per-manager checkpoints for atomic rollback."""
+        snaps: list[tuple] = []
+        for manager in self.single_type_managers:
+            had_req = request_id in manager.req_to_blocks
+            prev_len = len(manager.req_to_blocks[request_id]) if had_req else 0
+            had_cached = request_id in manager.num_cached_block
+            prev_cached = manager.num_cached_block.get(request_id)
+            had_nhl = request_id in manager._null_head_idx
+            prev_nhl = manager._null_head_idx.get(request_id)
+            had_partial = request_id in manager._partial_hit_reqs
+            prev_partial = manager._partial_hit_reqs.get(request_id)
+            prev_cow_len = len(manager._pending_cow_copies)
+            prev_new_ids_len = len(manager.new_block_ids)
+            had_discard_user = False
+            had_rmap = False
+            if (
+                isinstance(manager, SlidingWindowManager)
+                and manager.sparse_prefill_discard
+            ):
+                users = getattr(manager.block_pool, "_sparse_discard_users", None)
+                had_discard_user = (
+                    users is not None
+                    and (manager.kv_cache_group_id, request_id) in users
+                )
+                had_rmap = request_id in manager._sparse_real_blocks
+            mamba_snap = None
+            if (
+                isinstance(manager, MambaManager)
+                and manager.mamba_cache_mode == "align"
+            ):
+                mamba_snap = (
+                    request_id in manager._allocated_block_reqs,
+                    request_id in manager.last_state_block_idx,
+                    manager.last_state_block_idx.get(request_id),
+                    len(manager._pending_boundary_state_offloads),
+                )
+            snaps.append(
+                (
+                    had_req,
+                    prev_len,
+                    had_cached,
+                    prev_cached,
+                    had_nhl,
+                    prev_nhl,
+                    had_partial,
+                    prev_partial,
+                    prev_cow_len,
+                    prev_new_ids_len,
+                    had_discard_user,
+                    had_rmap,
+                    mamba_snap,
+                )
+            )
+        return snaps
+
+    def rollback_request_allocation(
+        self, request_id: str, snaps: list[tuple]
+    ) -> None:
+        """Roll back any partial multi-group allocation mutations on exception."""
+        for manager, snap in reversed(
+            list(zip(self.single_type_managers, snaps))
+        ):
+            (
+                had_req,
+                prev_len,
+                had_cached,
+                prev_cached,
+                had_nhl,
+                prev_nhl,
+                had_partial,
+                prev_partial,
+                prev_cow_len,
+                prev_new_ids_len,
+                had_discard_user,
+                had_rmap,
+                mamba_snap,
+            ) = snap
+            # 1. Undo any pending CoW copies created during this step.
+            if len(manager._pending_cow_copies) > prev_cow_len:
+                added_cows = manager._pending_cow_copies[prev_cow_len:]
+                del manager._pending_cow_copies[prev_cow_len:]
+                req_blocks = manager.req_to_blocks.get(request_id)
+                for source_block, cow_block in reversed(added_cows):
+                    restored_slot = False
+                    if req_blocks is not None:
+                        for b_idx in range(len(req_blocks) - 1, -1, -1):
+                            if req_blocks[b_idx] is cow_block:
+                                req_blocks[b_idx] = source_block
+                                if (
+                                    isinstance(manager, SlidingWindowManager)
+                                    and manager.sparse_prefill_discard
+                                    and request_id in manager._sparse_real_blocks
+                                ):
+                                    manager._sparse_real_blocks[request_id][
+                                        b_idx
+                                    ] = source_block
+                                # Drop extra copy-retention ref, then release cow_block.
+                                if cow_block.ref_cnt > 1:
+                                    cow_block.ref_cnt -= 1
+                                manager.block_pool.free_blocks([cow_block])
+                                restored_slot = True
+                                break
+                    if not restored_slot:
+                        # Running Mamba CoW kept source_block in req_blocks and took
+                        # an extra ref on source_block + allocated cow_block.
+                        if source_block.ref_cnt > 1:
+                            source_block.ref_cnt -= 1
+                        manager.block_pool.free_blocks([cow_block])
+
+            # 2. Free newly appended real blocks and truncate req_to_blocks.
+            req_blocks = manager.req_to_blocks.get(request_id)
+            if req_blocks is not None:
+                if len(req_blocks) > prev_len:
+                    added = req_blocks[prev_len:]
+                    del req_blocks[prev_len:]
+                    real_added = [
+                        blk
+                        for blk in reversed(added)
+                        if not blk.is_null and not blk.is_discard
+                    ]
+                    if real_added:
+                        manager.block_pool.free_blocks(real_added)
+                if not had_req:
+                    manager.req_to_blocks.pop(request_id, None)
+
+            # 3. Restore bookkeeping dicts & new_block_ids.
+            if had_cached:
+                manager.num_cached_block[request_id] = prev_cached  # type: ignore[assignment]
+            else:
+                manager.num_cached_block.pop(request_id, None)
+
+            if had_nhl:
+                manager._null_head_idx[request_id] = prev_nhl  # type: ignore[assignment]
+            else:
+                manager._null_head_idx.pop(request_id, None)
+
+            if had_partial:
+                manager._partial_hit_reqs[request_id] = prev_partial  # type: ignore[assignment]
+            else:
+                manager._partial_hit_reqs.pop(request_id, None)
+
+            if len(manager.new_block_ids) > prev_new_ids_len:
+                del manager.new_block_ids[prev_new_ids_len:]
+
+            if (
+                isinstance(manager, SlidingWindowManager)
+                and manager.sparse_prefill_discard
+            ):
+                if not had_discard_user:
+                    manager._rollback_discard_user(request_id)
+                if not had_rmap:
+                    manager._sparse_real_blocks.pop(request_id, None)
+                else:
+                    rmap = manager._sparse_real_blocks.get(request_id)
+                    if rmap is not None:
+                        for idx in [k for k in rmap if k >= prev_len]:
+                            rmap.pop(idx, None)
+
+            if mamba_snap is not None and isinstance(manager, MambaManager):
+                had_alloc_req, had_last, prev_last, prev_offloads_len = mamba_snap
+                if not had_alloc_req:
+                    manager._allocated_block_reqs.discard(request_id)
+                if had_last:
+                    manager.last_state_block_idx[request_id] = prev_last  # type: ignore[assignment]
+                else:
+                    manager.last_state_block_idx.pop(request_id, None)
+                if len(manager._pending_boundary_state_offloads) > prev_offloads_len:
+                    del manager._pending_boundary_state_offloads[prev_offloads_len:]
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -271,6 +460,10 @@ class KVCacheCoordinator(ABC):
         if self.retention_interval != 0:
             prefill_end = 0
         sparse_boundaries: tuple[int, ...] | None = None
+        effective_retention = self._effective_retention_interval(
+            request, num_tokens_main_model
+        )
+        discard_pools_needed: set[int] = set()
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
@@ -301,7 +494,8 @@ class KVCacheCoordinator(ABC):
                     prefill_end=prefill_end,
                     request=request,
                     replay_boundaries=sparse_boundaries,
-                    retention_interval=self.retention_interval,
+                    retention_interval=effective_retention,
+                    discard_pools_needed=discard_pools_needed,
                 )
             else:
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
@@ -314,7 +508,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                     prefill_end=prefill_end,
                 )
-        return num_blocks_to_allocate
+        return num_blocks_to_allocate + len(discard_pools_needed)
 
     def allocate_new_computed_blocks(
         self,
@@ -394,6 +588,9 @@ class KVCacheCoordinator(ABC):
 
         """
         sparse_boundaries: tuple[int, ...] | None = None
+        effective_retention = self._effective_retention_interval(
+            request, num_tokens_main_model
+        )
         results: list[list[KVCacheBlock]] = []
         for manager in self.single_type_managers:
             if (
@@ -409,7 +606,7 @@ class KVCacheCoordinator(ABC):
                         num_tokens_main_model,
                         request=request,
                         replay_boundaries=sparse_boundaries,
-                        retention_interval=self.retention_interval,
+                        retention_interval=effective_retention,
                     )
                 )
             else:
@@ -447,17 +644,9 @@ class KVCacheCoordinator(ABC):
             self.scheduler_block_size,
             use_eagle=bool(self.drop_eagle_group_ids),
         )
-        effective_retention = self.retention_interval
-        if (
-            _MULTITURN_TAIL_CACHE_STRIDE > 0
-            and self.retention_interval == 0
-            and num_computed_tokens > request.num_prompt_tokens
-        ):
-            effective_retention = max(
-                self.scheduler_block_size,
-                cdiv(_MULTITURN_TAIL_CACHE_STRIDE, self.scheduler_block_size)
-                * self.scheduler_block_size,
-            )
+        effective_retention = self._effective_retention_interval(
+            request, num_computed_tokens
+        )
         for group_id, manager in enumerate(self.single_type_managers):
             if not manager.enable_caching:
                 continue
@@ -917,7 +1106,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         """
         num_groups = len(self.kv_cache_config.kv_cache_groups)
-        hit_length = max_cache_hit_length
+        hit_length = max(0, max_cache_hit_length)
+        if hit_length == 0:
+            return tuple([] for _ in range(num_groups)), 0, 0
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
         hit_length_by_group: list[int] = [0] * num_groups
@@ -939,6 +1130,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
                 self.attention_groups
             ):
+                if curr_hit_length == 0:
+                    for group_id in group_ids:
+                        hit_blocks_by_group[group_id] = []
+                        hit_length_by_group[group_id] = 0
+                    continue
                 first_group_id = group_ids[0]
                 # DCP/PCP shard each block's KV across ranks, so the manager's
                 # effective block size may exceed the spec's.
@@ -987,11 +1183,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         first_group_id
                     ].pcp_world_size,
                 )
+                # Always invalidate previously-verified EAGLE groups when
+                # candidate length shrinks (incl. when a 2nd EAGLE group such
+                # as Draft SWA-4096 shrinks below Draft SWA-1024!).
+                if _new_hit_length < curr_hit_length:
+                    eagle_verified.clear()
                 if drop_eagle_block:
                     eagle_verified.add(idx)
-                elif _new_hit_length < curr_hit_length:
-                    # length shrunk; invalidate previous eagle verifications
-                    eagle_verified.clear()
                 curr_hit_length = _new_hit_length
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
@@ -999,6 +1197,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
                 longest_hit_length = max(longest_hit_length, curr_hit_length)
 
+            if curr_hit_length == 0:
+                hit_length = 0
+                for group in self.attention_groups:
+                    manager = self.single_type_managers[group.group_ids[0]]
+                    if manager.retains_longer_hit:
+                        continue
+                    for group_id in group.group_ids:
+                        hit_blocks_by_group[group_id] = []
+                        hit_length_by_group[group_id] = 0
+                break
             if curr_hit_length >= hit_length:
                 break
             hit_length = curr_hit_length

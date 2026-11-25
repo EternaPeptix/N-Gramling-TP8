@@ -39,6 +39,20 @@ KV_BF12_ENABLED = os.environ.get("INKLING_KV_BF12", "0").strip().lower() in ("1"
 #   INKLING_FUSED_ATTN_V11_C1632_GLOBAL=1: extend paired L2-threshold FUSE_MT=1 to B=16..32 & G>=2
 #   INKLING_FUSED_ATTN_V11_TARGET_CTAS   : 96 (default, 2 CTAs/SM) or 48 (1 full wave)
 V11_S48 = os.environ.get("INKLING_FUSED_ATTN_V11_S48", "0").strip().lower() in ("1", "true", "on", "yes")
+V13_ENABLED = os.environ.get("INKLING_FUSED_ATTN_V13", "0").strip().lower() in ("1", "true", "on", "yes")
+# Wave-V14 opt-in knobs (strictly default-OFF so V13/V12 & B=1 1dcfb306 stay 100% invariant!):
+#   INKLING_FUSED_ATTN_V14_SWA_C28=1      : mtiles-aware 100%-SM 0-dead-split SWA-1024 ladder
+#                                           S in (1,2,3,4,5,6,9) for B=2..24 (B=1 strictly untouched!)
+#   INKLING_FUSED_ATTN_V14_GLOBAL_SHORT=1 : 1-wave quantization-free Global short-ctx Node-1 ladder
+#                                           S in (1,2,3,4,5,6,8,9,10,12,16) for B=2..8 (B=1 untouched!)
+V14_SWA_C28 = os.environ.get("INKLING_FUSED_ATTN_V14_SWA_C28", "0").strip().lower() in ("1", "true", "on", "yes")
+V14_GLOBAL_SHORT = os.environ.get("INKLING_FUSED_ATTN_V14_GLOBAL_SHORT", "0").strip().lower() in ("1", "true", "on", "yes")
+# Wave-V16 opt-in 3-slot rotating cp.async Global S=48 decode attention (strictly default OFF!):
+# Preserves 100% of V14 B=2..8 SWA ladder & tot_kv <= 65536 1dcfb306 exactness while overlapping
+# 256-token KV block DRAM fetches inside S=48 global splits for tot_kv > 65536!
+V16_ENABLED = os.environ.get("INKLING_FUSED_ATTN_V16", "0").strip().lower() in ("1", "true", "on", "yes")
+_V14_GLOBAL_SHORT_TARGET_CTAS = max(16, min(96, int(os.environ.get("INKLING_FUSED_ATTN_V14_GLOBAL_SHORT_TARGET_CTAS", "48"))))
+_V14_SWA_MAX_B = max(2, min(24, int(os.environ.get("INKLING_FUSED_ATTN_V14_SWA_MAX_B", "24"))))
 V11_C1632_GLOBAL = os.environ.get("INKLING_FUSED_ATTN_V11_C1632_GLOBAL", "0").strip().lower() in ("1", "true", "on", "yes")
 _V11_TARGET_CTAS_RAW = os.environ.get("INKLING_FUSED_ATTN_V11_TARGET_CTAS", "").strip()
 _V11_TARGET_CTAS = max(16, min(96, int(_V11_TARGET_CTAS_RAW))) if _V11_TARGET_CTAS_RAW else 96
@@ -53,6 +67,9 @@ _V8_LIB_PATH = os.environ.get("INKLING_FUSED_ATTN_V8_LIB", "/rdma/libfused_decod
 _V9_LIB_PATH = os.environ.get("INKLING_FUSED_ATTN_V9_LIB", "/rdma/libfused_decode_attn_exact_sm121_v9.so")
 _V10_LIB_PATH = os.environ.get("INKLING_FUSED_ATTN_V10_LIB", "/rdma/libfused_decode_attn_exact_sm121_v10.so")
 _V11_LIB_PATH = os.environ.get("INKLING_FUSED_ATTN_V11_LIB", "/rdma/libfused_decode_attn_exact_sm121_v11.so")
+_V13_LIB_PATH = os.environ.get("INKLING_FUSED_ATTN_V13_LIB", "/rdma/libfused_decode_attn_exact_sm121_v13.so")
+_V14_LIB_PATH = os.environ.get("INKLING_FUSED_ATTN_V14_LIB", "/rdma/libfused_decode_attn_exact_sm121_v14.so")
+_V16_LIB_PATH = os.environ.get("INKLING_FUSED_ATTN_V16_LIB", "/rdma/libfused_decode_attn_exact_sm121_v16.so")
 _KV_BF12_PAGED_LIB_PATH = os.environ.get("INKLING_KV_BF12_PAGED_LIB", "/rdma/libkv_bf12_paged_v10.so")
 _TREE_LIB_PATH = os.environ.get("INKLING_FUSED_ATTN_TREE_LIB", "/rdma/libfused_decode_attn_tree_exact_sm121.so")
 _C32_LIB_PATH = os.environ.get("INKLING_FUSED_ATTN_C32_LIB", "/rdma/libfused_decode_attn_exact_sm121_c32.so")
@@ -90,6 +107,8 @@ _V9_C915_GLOBAL = os.environ.get(
 _V9_SHORT_SPLIT_LADDER = (1, 2, 4, 6, 8, 12, 16)
 _V9_LONG_SPLIT_LADDER = (2, 4, 6, 8, 12, 16, 24, 32)
 _V11_SHORT_SPLIT_LADDER = (1, 2, 3, 4, 6, 8, 12, 16)
+_V14_SWA_SPLIT_LADDER = (1, 2, 3, 4, 5, 6, 9)
+_V14_SHORT_SPLIT_LADDER = (1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 16)
 _V11_LONG_SPLIT_LADDER = (2, 3, 4, 6, 8, 12, 16, 24, 32, 48)
 _V8_LOCAL_SPLIT_LADDER = (1, 2, 4, 6, 8)
 _V8_GLOBAL_SPLIT_LADDER = (1, 2, 4, 6, 8, 12, 16, 24, 32)
@@ -115,6 +134,9 @@ _IS_V8_LIB = False
 _IS_V9_LIB = False
 _IS_V10_LIB = False
 _IS_V11_LIB = False
+_IS_V13_LIB = False
+_IS_V14_LIB = False
+_IS_V16_LIB = False
 _HAS_V10_BF12_SYM = False
 _KV_BF12_PAGED_LIB = None
 _KV_BF12_PAGED_LIB_TRIED = False
@@ -130,18 +152,25 @@ _REL_PROJ_T_CACHE: dict[int, object] = {}
 
 
 def _load_lib():
-    global _LIB, _HAS_C32_SYM, _HAS_V9_SYM, _IS_V7_LIB, _IS_V8_LIB, _IS_V9_LIB, _IS_V10_LIB, _IS_V11_LIB, _HAS_V10_BF12_SYM
+    global _LIB, _HAS_C32_SYM, _HAS_V9_SYM, _IS_V7_LIB, _IS_V8_LIB, _IS_V9_LIB, _IS_V10_LIB, _IS_V11_LIB, _IS_V13_LIB, _IS_V14_LIB, _IS_V16_LIB, _HAS_V10_BF12_SYM
     if _LIB is not None:
         return _LIB
     with _LIB_LOCK:
         if _LIB is None:
-            want_v11 = V11_S48 or V11_C1632_GLOBAL
+            want_v16 = V16_ENABLED or bool(os.environ.get("INKLING_FUSED_ATTN_V16_LIB"))
+            want_v14 = want_v16 or V14_SWA_C28 or V14_GLOBAL_SHORT or bool(os.environ.get("INKLING_FUSED_ATTN_V14_LIB"))
+            want_v13 = want_v14 or V13_ENABLED or V11_S48 or V11_C1632_GLOBAL
+            want_v11 = want_v13
             want_v10 = want_v11 or KV_BF12_ENABLED
             want_v9 = want_v10 or V9_ENABLED
             want_v8 = want_v9 or V8_ENABLED or _V8_C28_FUSE_MT or _V8_C1_FUSE_MT
             if os.environ.get("INKLING_FUSED_ATTN_LIB"):
-                if want_v11:
-                    cands = [_LIB_PATH, _V11_LIB_PATH, _V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH]
+                if want_v16:
+                    cands = [_LIB_PATH, _V16_LIB_PATH, _V14_LIB_PATH, _V13_LIB_PATH, _V11_LIB_PATH, _V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH]
+                elif want_v14:
+                    cands = [_LIB_PATH, _V14_LIB_PATH, _V13_LIB_PATH, _V11_LIB_PATH, _V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH]
+                elif want_v13:
+                    cands = [_LIB_PATH, _V13_LIB_PATH, _V11_LIB_PATH, _V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH]
                 elif want_v10:
                     cands = [_LIB_PATH, _V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH]
                 elif want_v9:
@@ -152,8 +181,12 @@ def _load_lib():
                     cands = [_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH]
                 else:
                     cands = [_LIB_PATH, _C32_LIB_PATH]
-            elif want_v11:
-                cands = [_V11_LIB_PATH, _V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH, _LIB_PATH]
+            elif want_v16:
+                cands = [_V16_LIB_PATH, _V14_LIB_PATH, _V13_LIB_PATH, _V11_LIB_PATH, _V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH, _LIB_PATH]
+            elif want_v14:
+                cands = [_V14_LIB_PATH, _V13_LIB_PATH, _V11_LIB_PATH, _V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH, _LIB_PATH]
+            elif want_v13:
+                cands = [_V13_LIB_PATH, _V11_LIB_PATH, _V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH, _LIB_PATH]
             elif want_v10:
                 cands = [_V10_LIB_PATH, _V9_LIB_PATH, _V8_LIB_PATH, _V7_LIB_PATH, _C32_LIB_PATH, _LIB_PATH]
             elif want_v9:
@@ -247,7 +280,40 @@ def _load_lib():
             if hasattr(lib, "fused_decode_attn_v11_version"):
                 lib.fused_decode_attn_v11_version.argtypes = []
                 lib.fused_decode_attn_v11_version.restype = ctypes.c_int
-                _IS_V11_LIB = int(lib.fused_decode_attn_v11_version()) >= 11
+                _v11_ver = int(lib.fused_decode_attn_v11_version())
+                _IS_V11_LIB = _v11_ver >= 11
+                _IS_V13_LIB = _v11_ver >= 13
+            if hasattr(lib, "fused_decode_attn_v13_version"):
+                lib.fused_decode_attn_v13_version.argtypes = []
+                lib.fused_decode_attn_v13_version.restype = ctypes.c_int
+                _v13_ver = int(lib.fused_decode_attn_v13_version())
+                if _v13_ver >= 13:
+                    _IS_V13_LIB = True
+                    _IS_V11_LIB = True
+                    _IS_V10_LIB = True
+                if _v13_ver >= 14:
+                    _IS_V14_LIB = True
+            if hasattr(lib, "fused_decode_attn_v14_version"):
+                lib.fused_decode_attn_v14_version.argtypes = []
+                lib.fused_decode_attn_v14_version.restype = ctypes.c_int
+                _v14_ver = int(lib.fused_decode_attn_v14_version())
+                if _v14_ver >= 14:
+                    _IS_V14_LIB = True
+                    _IS_V13_LIB = True
+                    _IS_V11_LIB = True
+                    _IS_V10_LIB = True
+                if _v14_ver >= 16:
+                    _IS_V16_LIB = True
+            if hasattr(lib, "fused_decode_attn_v16_version"):
+                lib.fused_decode_attn_v16_version.argtypes = []
+                lib.fused_decode_attn_v16_version.restype = ctypes.c_int
+                _v16_ver = int(lib.fused_decode_attn_v16_version())
+                if _v16_ver >= 16:
+                    _IS_V16_LIB = True
+                    _IS_V14_LIB = True
+                    _IS_V13_LIB = True
+                    _IS_V11_LIB = True
+                    _IS_V10_LIB = True
             if (
                 hasattr(lib, "attn_prologue_kvq_bf12_exact_v10_fwd")
                 and hasattr(lib, "fused_decode_attn_otf_mgs_bf12_v10_fwd")
@@ -275,7 +341,21 @@ def _load_lib():
                 )
                 lib.fused_decode_attn_otf_mgs_v10_bf12_paired_fwd.restype = ctypes.c_int
                 _HAS_V10_BF12_SYM = True
-            if hasattr(lib, "fused_decode_attn_v11_init_smem"):
+            if hasattr(lib, "fused_decode_attn_v16_init_smem"):
+                lib.fused_decode_attn_v16_init_smem.argtypes = []
+                lib.fused_decode_attn_v16_init_smem.restype = ctypes.c_int
+                if torch is None or not torch.cuda.is_current_stream_capturing():
+                    rc_smem = int(lib.fused_decode_attn_v16_init_smem())
+                    if rc_smem != 0:
+                        raise RuntimeError(f"fused_decode_attn_v16_init_smem failed: cudaError={rc_smem}")
+            elif hasattr(lib, "fused_decode_attn_v13_init_smem"):
+                lib.fused_decode_attn_v13_init_smem.argtypes = []
+                lib.fused_decode_attn_v13_init_smem.restype = ctypes.c_int
+                if torch is None or not torch.cuda.is_current_stream_capturing():
+                    rc_smem = int(lib.fused_decode_attn_v13_init_smem())
+                    if rc_smem != 0:
+                        raise RuntimeError(f"fused_decode_attn_v13_init_smem failed: cudaError={rc_smem}")
+            elif hasattr(lib, "fused_decode_attn_v11_init_smem"):
                 lib.fused_decode_attn_v11_init_smem.argtypes = []
                 lib.fused_decode_attn_v11_init_smem.restype = ctypes.c_int
                 if torch is None or not torch.cuda.is_current_stream_capturing():
@@ -907,7 +987,7 @@ def _next_scratch_v11(device, num_splits: int, T: int, H: int, need_sem: int):
 
 
 def _next_scratch(device, num_splits: int, T: int, H: int, need_sem: int):
-    if V11_S48 or V11_C1632_GLOBAL:
+    if V11_S48 or V11_C1632_GLOBAL or V14_SWA_C28 or V14_GLOBAL_SHORT or V16_ENABLED:
         return _next_scratch_v11(device, num_splits, T, H, need_sem)
     v8_active = V9_ENABLED or _V8_C28_FUSE_MT or _V8_C1_FUSE_MT
     min_splits = 32 if v8_active else 16
@@ -1013,6 +1093,34 @@ def _pick_v11_global_splits(
     return best_s
 
 
+def _pick_v14_swa_splits(num_reqs: int, mtiles: int, target_ctas: int = 48) -> int:
+    """Wave-V14 0-dead-split 1-wave SWA-1024 split selector over `(1, 2, 3, 4, 5, 6, 9)`.
+    Every S in this ladder has 0 dead splits at span=1025..1031 (17 KV tiles, BN=64)."""
+    base = max(1, int(mtiles) * int(num_reqs))
+    target = max(16, min(48, int(target_ctas)))
+    best = 1
+    for s in _V14_SWA_SPLIT_LADDER:
+        if base * s <= target:
+            best = s
+    return best
+
+
+def _pick_v14_global_short_splits(
+    num_reqs: int,
+    mtiles: int,
+    target_ctas: int = _V14_GLOBAL_SHORT_TARGET_CTAS,
+) -> int:
+    """Wave-V14 wave-quantization-free Global short-ctx split selector over
+    `(1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 16)` (default target=48 -> 1 full wave, 0 tail!)."""
+    base = max(1, int(mtiles) * int(num_reqs))
+    target = max(16, min(96, int(target_ctas)))
+    best = 1
+    for s in _V14_SHORT_SPLIT_LADDER:
+        if base * s <= target:
+            best = s
+    return best
+
+
 def _select_v9_global_paired_plan(
     num_reqs: int,
     mtiles: int,
@@ -1022,6 +1130,7 @@ def _select_v9_global_paired_plan(
     has_v9: bool,
     is_v9: bool,
     is_v11: bool | None = None,
+    is_v14: bool | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Select `(s_short, s_long, kv_tok_thresh, kv_evict_first_long)` for Wave-V9/V11
     CUDAGraph-safe GPU-side L2-threshold paired Global dispatch (`window < 0`).
@@ -1030,12 +1139,18 @@ def _select_v9_global_paired_plan(
     if not (V9_ENABLED and has_v9 and is_v9):
         return None
     eff_v11 = _IS_V11_LIB if is_v11 is None else bool(is_v11)
+    eff_v14 = _IS_V14_LIB if is_v14 is None else bool(is_v14)
     v11_s48_on = V11_S48 and eff_v11
     v11_c1632_on = V11_C1632_GLOBAL and eff_v11
     min_g = 2 if (v11_s48_on or v11_c1632_on) else 3
     if window >= 0 or G < min_g or mtiles not in (2, 3):
         return None
-    short_ladder = _V11_SHORT_SPLIT_LADDER if (v11_s48_on or v11_c1632_on) else _V9_SHORT_SPLIT_LADDER
+    if V14_GLOBAL_SHORT and eff_v14:
+        short_ladder = _V14_SHORT_SPLIT_LADDER
+    elif v11_s48_on or v11_c1632_on:
+        short_ladder = _V11_SHORT_SPLIT_LADDER
+    else:
+        short_ladder = _V9_SHORT_SPLIT_LADDER
     if s_short not in short_ladder:
         return None
     thresh = _V9_GLOBAL_L2_THRESH_TOKS
@@ -1076,8 +1191,20 @@ def _select_num_splits(
     window: int,
     has_c32: bool,
     has_global_s8: bool,
+    is_v14: bool | None = None,
 ) -> int | None:
-    """Select split-KV factor S. Strictly unchanged for B == 1, B >= 9, and default-OFF."""
+    """Select split-KV factor S. Strictly unchanged for B == 1 and default-OFF."""
+    eff_v14 = _IS_V14_LIB if is_v14 is None else bool(is_v14)
+    if eff_v14 and num_reqs >= 2:
+        if window >= 0 and V14_SWA_C28 and num_reqs <= _V14_SWA_MAX_B:
+            if num_reqs > 4 and not has_c32:
+                return None
+            if mtiles * num_reqs <= 48:
+                return _pick_v14_swa_splits(num_reqs, mtiles, 48)
+        elif window < 0 and V14_GLOBAL_SHORT and num_reqs <= 8:
+            if num_reqs > 4 and not has_c32:
+                return None
+            return _pick_v14_global_short_splits(num_reqs, mtiles, _V14_GLOBAL_SHORT_TARGET_CTAS)
     if _C28_SPLITS and 2 <= num_reqs <= 8:
         if window >= 0:
             if num_reqs == 2:
@@ -1166,7 +1293,14 @@ def fused_target_decode_attn(
         if num_splits is None:
             return False
         use_fuse_mt = False
-        if _HAS_C32_SYM and T > 16 and 1 <= mtiles <= 3 and num_splits in (1, 2, 4):
+        _v14_swa_pinned = (
+            V14_SWA_C28
+            and _IS_V14_LIB
+            and window >= 0
+            and 2 <= num_reqs <= _V14_SWA_MAX_B
+            and mtiles * num_reqs <= 48
+        )
+        if _HAS_C32_SYM and T > 16 and 1 <= mtiles <= 3 and num_splits in (1, 2, 4) and not _v14_swa_pinned:
             if _C32_FUSE_MT == "1":
                 use_fuse_mt = True
             elif _C32_FUSE_MT == "auto":

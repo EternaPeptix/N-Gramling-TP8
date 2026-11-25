@@ -16,16 +16,36 @@ import os
 
 ENABLED = os.environ.get("INKLING_PREFILL_QF", "0").strip().lower() not in ("0", "", "off", "false", "no")
 LIB_PATH = os.environ.get("INKLING_PREFILL_QF_LIB", "/rdma/libprefill_moe_qf.so")
-ROWMAJ_SCALES = os.environ.get("INKLING_MOE_ROWMAJ_SCALES", "0").strip().lower() in ("1", "on", "true")
-ZERO_SCATTER = os.environ.get("INKLING_MOE_ZERO_SCATTER", "0").strip().lower() in ("1", "on", "true")
+ROWMAJ_SCALES = os.environ.get("INKLING_MOE_ROWMAJ_SCALES", "0").strip().lower() in ("1", "on", "true", "yes")
+ZERO_SCATTER = os.environ.get("INKLING_MOE_ZERO_SCATTER", "0").strip().lower() in ("1", "on", "true", "yes")
 
 _LIB = None
 _TRIED = False
 
 
+def _is_stream_capturing() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def is_eligible(tokens: int) -> bool:
+    """Strictly gate prefill_qf CUDA kernels to eager prefill (T > 16, never CUDA graph capture)."""
+    if not ENABLED or int(tokens) <= 16:
+        return False
+    return get_lib() is not None
+
+
 def get_lib():
     global _LIB, _TRIED
     if not ENABLED:
+        return None
+    # Wave-V15 hardening: never dlopen or return prefill_qf kernels during CUDA graph capture,
+    # and never poison `_TRIED` if first queried while capturing a decode graph.
+    if _is_stream_capturing():
         return None
     if not _TRIED:
         _TRIED = True

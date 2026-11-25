@@ -1,0 +1,49 @@
+# Wave-V15 Permanent 24/7 Cluster Supervisor Service (Install on Head Node: spark-one)
+# Parameterized template: substitute @V15_USER@ and @V15_INSTALL_DIR@ before enabling,
+# and configure cluster hosts/paths in /etc/inkling-v15/supervisor.env (ZERO hardcoded secrets!).
+[Unit]
+Description=Inkling-2-Small TP8 Wave-V15 8-Node Production Supervisor & Self-Healing Watchdog
+Documentation=file://@V15_INSTALL_DIR@/REPORT.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=@V15_USER@
+Group=@V15_USER@
+WorkingDirectory=@V15_INSTALL_DIR@
+EnvironmentFile=-/etc/inkling-v15/supervisor.env
+
+# Preflight directories & lock/state permissions (systemd creates /var/log/inkling-v15 & /var/lib/inkling-v15)
+LogsDirectory=inkling-v15
+LogsDirectoryMode=0750
+StateDirectory=inkling-v15
+StateDirectoryMode=0750
+RuntimeDirectory=inkling-v15
+RuntimeDirectoryMode=0750
+
+ExecStart=/usr/bin/env bash @V15_INSTALL_DIR@/v15_cluster_supervisor.sh supervise
+ExecStopPost=/usr/bin/env bash -lc 'echo "[systemd] inkling-tp8-v15-supervisor exited (result=${SERVICE_RESULT:-unknown})"'
+
+# Resilience & resource limits (never OOM-kill the supervisor daemon!)
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=600s
+TimeoutStopSec=90s
+WatchdogSec=180s
+OOMScoreAdjust=-500
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+# Hardening (compatible with Docker + SSH orchestration)
+NoNewPrivileges=false
+PrivateTmp=false
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=inkling-v15-supervisor
+
+[Install]
+WantedBy=multi-user.target

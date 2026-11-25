@@ -36,14 +36,35 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
+import weakref
 
 import torch
 
+_TRITON_OK = True
 try:
     from vllm.triton_utils import tl, triton
 except Exception:  # Standalone bench / local test without vllm
-    import triton
-    import triton.language as tl
+    try:
+        import triton
+        import triton.language as tl
+    except Exception:
+        _TRITON_OK = False
+
+        class _DummyTriton:
+            @staticmethod
+            def jit(fn):
+                return fn
+
+            @staticmethod
+            def cdiv(a: int, b: int) -> int:
+                return (a + b - 1) // b
+
+        class _DummyTL:
+            constexpr = object
+
+        triton = _DummyTriton()  # type: ignore[assignment]
+        tl = _DummyTL()  # type: ignore[assignment]
 
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
@@ -77,18 +98,58 @@ _PF_NONMOE_V4_LIB_ENV = os.environ.get(
 ).strip()
 # Wave-V10 opt-in FP8 P@V attention v6 library (`libpf_fp8_attn_v6.so`, default OFF;
 # strictly gated on `max_seqlen_q >= 1024` & `!capturing` so Warm-1M `qlen=436` stays on v5_zspill!)
-_PF_FP8_ATTN_V6 = os.environ.get("INKLING_PF_FP8_ATTN_V6", "0").strip().lower() in (
+_PF_FP8_ATTN_V13 = os.environ.get("INKLING_PF_FP8_ATTN_V13", "0").strip().lower() in (
     "1", "on", "true", "yes",
 )
-_PF_FP8_ATTN_V6_LIB_ENV = os.environ.get(
-    "INKLING_PF_FP8_ATTN_V6_LIB", "/rdma/libpf_fp8_attn_v6.so"
+_PF_FP8_ATTN_V6 = _PF_FP8_ATTN_V13 or (
+    os.environ.get("INKLING_PF_FP8_ATTN_V6", "0").strip().lower() in (
+        "1", "on", "true", "yes",
+    )
+)
+_PF_FP8_ATTN_V13_LIB_ENV = os.environ.get(
+    "INKLING_PF_FP8_ATTN_V13_LIB", "/rdma/libpf_fp8_attn_v13.so"
 ).strip()
+_PF_FP8_ATTN_V6_LIB_ENV = (
+    _PF_FP8_ATTN_V13_LIB_ENV
+    if (_PF_FP8_ATTN_V13 and _PF_FP8_ATTN_V13_LIB_ENV and os.path.exists(_PF_FP8_ATTN_V13_LIB_ENV))
+    else os.environ.get("INKLING_PF_FP8_ATTN_V6_LIB", "/rdma/libpf_fp8_attn_v6.so").strip()
+)
 _PF_FP8_PV_F16_ACC = os.environ.get("INKLING_PF_FP8_PV_F16_ACC", "0").strip().lower() in (
     "1", "on", "true", "yes",
 )
+# Wave-V15 production hardening knobs (default-safe: 0-impact on decode / pure prefill!):
+#   - INKLING_PF_SHADOW_K_STRICT_VERIFY=1: per-slot physical-block + 64-bit content-fingerprint
+#     verification on GPU (~16 us/layer) so multi-1M session eviction & physical block reuse
+#     can NEVER serve stale Shadow K values.
+#   - INKLING_PF_GLOBAL_GUARD_MIXED_DECODE=1: skip FP8/TopK/PV-skip shortcuts if unsplit decode
+#     requests (qlen <= INKLING_PF_GLOBAL_DECODE_QLEN_MAX) are mixed into a prefill batch.
+_PF_SHADOW_K_STRICT_VERIFY = os.environ.get(
+    "INKLING_PF_SHADOW_K_STRICT_VERIFY", "1"
+).strip().lower() not in ("0", "", "off", "false", "no")
+_PF_GLOBAL_GUARD_MIXED_DECODE = os.environ.get(
+    "INKLING_PF_GLOBAL_GUARD_MIXED_DECODE", "1"
+).strip().lower() not in ("0", "", "off", "false", "no")
+_PF_GLOBAL_DECODE_QLEN_MAX = max(
+    int(os.environ.get("INKLING_PF_GLOBAL_DECODE_QLEN_MAX", "16") or 16), 1
+)
+# Wave-V16 opt-in 3-stage Triton software pipelining for `_global_biased_tail_merge_kernel`
+# (default 0 -> V15's num_stages=2; set 3 to overlap K/V loads across the 16 biased-tail tiles!).
+_PF_GLOBAL_V16_TAIL_STAGES = int(os.environ.get("INKLING_PF_GLOBAL_V16_TAIL_STAGES", "0") or 0)
+_LINEAR_MOD_CACHE = None
+_LINEAR_MOD_TRIED = False
+
+
+def _tail_merge_num_stages(bs: int, block_n: int) -> int:
+    if _PF_GLOBAL_V16_TAIL_STAGES >= 3 and int(bs) == 256 and int(block_n) == 64:
+        return 3
+    return 2
 _NONMOE_V4_LIB = None
 _NONMOE_V4_TRIED = False
 _TOPK_SEL_SCRATCH: dict[object, tuple[torch.Tensor, torch.Tensor]] = {}
+_COMPACT_ARANGE_BT_LOCAL: dict[tuple[object, int], torch.Tensor] = {}
+# Per-Shadow-K-cache weakref-backed integrity table:
+#   ptr -> {"ref": weakref, "shape": tuple, "pblk": int32[CAP], "sig": int64[CAP, Hkv], "full": uint8[CAP]}
+_SHADOW_K_SLOT_SIG: dict[int, dict] = {}
 
 
 def get_nonmoe_v4_lib():
@@ -184,10 +245,14 @@ def _get_topk_scores_scratch(device, n_ctas: int, max_pblks: int) -> torch.Tenso
 
 def _get_cuda_scratch(device, T: int, H: int, D: int):
     """Cached contiguous scratch (acc, m, l) for CUDA prefix -> Triton tail merge."""
+    global _LINEAR_MOD_CACHE, _LINEAR_MOD_TRIED
     try:
-        from . import linear as _lin_mod
-
-        if getattr(_lin_mod, "_SHARED_PF_SCRATCH", False):
+        if not _LINEAR_MOD_TRIED:
+            _LINEAR_MOD_TRIED = True
+            from . import linear as _lin_mod
+            _LINEAR_MOD_CACHE = _lin_mod
+        _lin_mod = _LINEAR_MOD_CACHE
+        if _lin_mod is not None and getattr(_lin_mod, "_SHARED_PF_SCRATCH", False):
             acc_bytes = (T * H * D * 4 + 255) & ~255
             ml_bytes = (T * H * 4 + 255) & ~255
             buf = _lin_mod.get_shared_pf_scratch(device, acc_bytes + 2 * ml_bytes)
@@ -207,6 +272,179 @@ def _get_cuda_scratch(device, T: int, H: int, D: int):
         entry = (acc, m, l)
         _CUDA_SCRATCH[key] = entry
     return entry[0][:T], entry[1][:T], entry[2][:T]
+
+
+def _is_stream_capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def release_prefill_scratch() -> int:
+    """Release non-graphed 1M global-attn prefill scratch pools."""
+    if _is_stream_capturing():
+        return 0
+    freed = 0
+    for acc, m, l in _CUDA_SCRATCH.values():
+        freed += sum(int(x.numel() * x.element_size()) for x in (acc, m, l))
+    _CUDA_SCRATCH.clear()
+    for buf in _TOPK_SCORE_SCRATCH.values():
+        freed += int(buf.numel() * buf.element_size())
+    _TOPK_SCORE_SCRATCH.clear()
+    for sb, sc in _TOPK_SEL_SCRATCH.values():
+        freed += int(sb.numel() * sb.element_size()) + int(sc.numel() * sc.element_size())
+    _TOPK_SEL_SCRATCH.clear()
+    for ar in _COMPACT_ARANGE_BT_LOCAL.values():
+        freed += int(ar.numel() * ar.element_size())
+    _COMPACT_ARANGE_BT_LOCAL.clear()
+    # Prune dead Shadow-K integrity entries (live caches keep their 52 KiB metadata for 2.3s warm Turn-2!).
+    dead_ptrs = [
+        k for k, entry in _SHADOW_K_SLOT_SIG.items()
+        if entry.get("ref") is not None and entry["ref"]() is None
+    ]
+    for k in dead_ptrs:
+        entry = _SHADOW_K_SLOT_SIG.pop(k, None)
+        if isinstance(entry, dict):
+            for tk in ("pblk", "sig", "full"):
+                t = entry.get(tk)
+                if isinstance(t, torch.Tensor):
+                    freed += int(t.numel() * t.element_size())
+    return freed
+
+
+def _get_compact_arange_bt_local(device, cap_blks: int) -> torch.Tensor:
+    key = (device, int(cap_blks))
+    t = _COMPACT_ARANGE_BT_LOCAL.get(key)
+    if t is None:
+        t = torch.arange(int(cap_blks), dtype=torch.int32, device=device).unsqueeze(0).contiguous()
+        _COMPACT_ARANGE_BT_LOCAL[key] = t
+    return t
+
+
+def _get_shadow_k_slot_state(k_fp8_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return weakref-backed `(slot_pblk [CAP] int32, slot_sig [CAP, Hkv] int64, slot_full [CAP] uint8)`
+    for `k_fp8_cache` (~52 KiB/layer @ CAP=4096, auto-freed when `k_fp8_cache` is garbage-collected)."""
+    ptr = int(k_fp8_cache.data_ptr())
+    cap = int(k_fp8_cache.shape[0])
+    hkv = int(k_fp8_cache.shape[2])
+    shape_key = (cap, int(k_fp8_cache.shape[1]), hkv, int(k_fp8_cache.shape[3]), k_fp8_cache.device)
+    entry = _SHADOW_K_SLOT_SIG.get(ptr)
+    if entry is not None:
+        ref = entry.get("ref")
+        alive_obj = ref() if ref is not None else None
+        if alive_obj is k_fp8_cache and entry.get("shape") == shape_key:
+            return entry["pblk"], entry["sig"], entry["full"]
+    pblk = torch.full((cap,), -1, dtype=torch.int32, device=k_fp8_cache.device)
+    sig = torch.zeros((cap, hkv), dtype=torch.int64, device=k_fp8_cache.device)
+    full = torch.zeros((cap,), dtype=torch.uint8, device=k_fp8_cache.device)
+
+    def _cleanup(_ref, _p=ptr):
+        cur = _SHADOW_K_SLOT_SIG.get(_p)
+        if cur is not None and cur.get("ref") is _ref:
+            _SHADOW_K_SLOT_SIG.pop(_p, None)
+
+    try:
+        ref_obj = weakref.ref(k_fp8_cache, _cleanup)
+    except TypeError:
+        ref_obj = None
+    _SHADOW_K_SLOT_SIG[ptr] = {
+        "ref": ref_obj,
+        "shape": shape_key,
+        "pblk": pblk,
+        "sig": sig,
+        "full": full,
+    }
+    return pblk, sig, full
+
+
+def invalidate_shadow_k_slots(k_fp8_cache: torch.Tensor | None = None) -> None:
+    """Explicitly invalidate per-slot Shadow-K integrity metadata (one cache or all)."""
+    if k_fp8_cache is None:
+        for entry in _SHADOW_K_SLOT_SIG.values():
+            entry["pblk"].fill_(-1)
+            entry["sig"].zero_()
+            entry["full"].zero_()
+        return
+    entry = _SHADOW_K_SLOT_SIG.get(int(k_fp8_cache.data_ptr()))
+    if entry is not None:
+        entry["pblk"].fill_(-1)
+        entry["sig"].zero_()
+        entry["full"].zero_()
+
+
+def compute_block_content_sig(key_cache: torch.Tensor, block_ids: torch.Tensor) -> torch.Tensor:
+    """Deterministic bit-exact 64-bit content fingerprint `[num_blks, Hkv]` int64 for paged BF16
+    `key_cache [NBLK, BS, Hkv, D]` blocks. Samples BOTH endpoints of every 64-token group
+    (slots `{0, 63, 64, 127, 128, 191, 192, 255}` at `BS=256`) across all 128 head dimensions
+    (16 BF16 elements per sample row), bit-identical to `_compute_block_sig_triton`."""
+    _, bs, hkv, d = key_cache.shape
+    ids = block_ids.reshape(-1).to(torch.int64)
+    n = int(ids.numel())
+    if n == 0:
+        return torch.empty((0, hkv), dtype=torch.int64, device=key_cache.device)
+    ku16 = key_cache.view(torch.int16)
+    h = torch.zeros((n, hkv), dtype=torch.int64, device=key_cache.device)
+    span = min(16, d)
+    coeffs = (torch.arange(span, dtype=torch.int64, device=key_cache.device) * 2654435761 + 1)
+    # 8 sample rows covering first & last token of all 4 64-token groups (BS=256: 0,63,64,127,128,191,192,255)
+    sample_rows = [
+        min((i * bs) // 8, bs - 1) if (i & 1) == 0 else min(((i + 1) * bs) // 8 - 1, bs - 1)
+        for i in range(8)
+    ]
+    sample_rows[-1] = bs - 1
+    mul = 6364136223846793005
+    inc = 1442695040888963407
+    for i, s_idx in enumerate(sample_rows):
+        d0 = (i * span) % d
+        sl = ku16[ids, s_idx, :, d0 : d0 + span].to(torch.int64) & 0xFFFF  # [n, hkv, span]
+        row_mix = (sl * coeffs.view(1, 1, span)).sum(dim=-1)
+        h = h * mul + row_mix + inc
+    h = h ^ (h >> 33)
+    return torch.where(h == 0, torch.ones_like(h), h)
+
+
+def _has_unsplit_decode_reqs(
+    num_reqs: int,
+    max_seqlen_q: int,
+    query_lens_cpu=None,
+    attn_metadata=None,
+) -> bool:
+    """Zero-sync guard: return True when a multi-request batch entering global prefill attention
+    still contains unsplit decode requests (`qlen <= _PF_GLOBAL_DECODE_QLEN_MAX`) packed alongside
+    a prefill chunk (`max_seqlen_q > _PF_GLOBAL_DECODE_QLEN_MAX`)."""
+    if not _PF_GLOBAL_GUARD_MIXED_DECODE or int(num_reqs) <= 1:
+        return False
+    if int(max_seqlen_q) <= _PF_GLOBAL_DECODE_QLEN_MAX:
+        return False
+    ql = query_lens_cpu
+    if ql is None:
+        sm12_mod = sys.modules.get("vllm.models.inkling2.ops.sm12_attn") or sys.modules.get("sm12_attn")
+        if sm12_mod is not None:
+            pair = getattr(sm12_mod, "_PREFILL_CPU_LENS", None)
+            if isinstance(pair, tuple) and len(pair) >= 2:
+                ql = pair[1]
+    if ql is not None and len(ql) >= int(num_reqs):
+        min_q = min(int(ql[r]) for r in range(int(num_reqs)))
+        return min_q <= _PF_GLOBAL_DECODE_QLEN_MAX
+    meta = attn_metadata
+    if meta is None:
+        try:
+            from vllm.forward_context import get_forward_context, is_forward_context_available
+
+            if is_forward_context_available():
+                meta = get_forward_context().attn_metadata
+        except Exception:
+            meta = None
+    if isinstance(meta, dict):
+        for md in meta.values():
+            nd = getattr(md, "num_decode_reqs", None)
+            npf = getattr(md, "num_prefill_reqs", None)
+            if nd is not None and npf is not None:
+                if int(nd) > 0 and int(num_reqs) >= int(nd) + int(npf):
+                    return True
+                break
+    return False
 
 
 def get_cuda_lib(lib_path: str | None = None):
@@ -639,6 +877,11 @@ def quantize_k_to_fp8_blocks_v3(
     num_blks = int(ids.numel()) if has_ids else nblk
     if num_blks == 0:
         return k_fp8_cache, k_scale64_cache, k_mid_cache, k_rad_cache
+    if compact_out and (int(out_offset) < 0 or int(out_offset) + num_blks > int(k_fp8_cache.shape[0])):
+        raise ValueError(
+            f"compact Shadow K out of bounds: out_offset={out_offset}, num_blks={num_blks}, "
+            f"cap={int(k_fp8_cache.shape[0])}"
+        )
     v4_boxes = getattr(k_mid_cache, "_v4_fp8_boxes", None) if want_kmax else None
     v4_lib = get_nonmoe_v4_lib() if (_PF_TOPK_V4 and v4_boxes is not None) else None
     if (
@@ -676,6 +919,16 @@ def quantize_k_to_fp8_blocks_v3(
             int(torch.cuda.current_stream(key_cache.device).cuda_stream),
         )
         if rc == 0:
+            if _PF_SHADOW_K_STRICT_VERIFY and key_cache.is_cuda and _TRITON_OK:
+                slot_pblk, slot_sig, _ = _get_shadow_k_slot_state(k_fp8_cache)
+                _record_shadow_k_slots_kernel[(num_blks, hkv)](
+                    key_cache, ids, slot_pblk, slot_sig,
+                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                    slot_sig.stride(0),
+                    num_blks, 0, 0,
+                    HAS_IDS=True, COMPACT_OUT=bool(compact_out), SKIP_MATCHING=False,
+                    BS=bs, D=d, num_warps=1,
+                )
             return k_fp8_cache, k_scale64_cache, k_mid_cache, k_rad_cache
     dummy_m = k_mid_cache if want_kmax else key_cache
     dummy_r = k_rad_cache if want_kmax else key_cache
@@ -715,12 +968,108 @@ def quantize_k_to_fp8_blocks_v3(
             kr8.index_copy_(0, sel_idx, (kr_sub * (22.0 / kr_am)).to(torch.float8_e4m3fn))
             sc_pair = torch.stack((km_am.squeeze(-1) * (1.0 / 22.0), kr_am.squeeze(-1) * (1.0 / 22.0)), dim=-1)
             kb_sc.index_copy_(0, sel_idx, sc_pair)
+    if _PF_SHADOW_K_STRICT_VERIFY and key_cache.is_cuda and _TRITON_OK:
+        slot_pblk, slot_sig, _ = _get_shadow_k_slot_state(k_fp8_cache)
+        _record_shadow_k_slots_kernel[(num_blks, hkv)](
+            key_cache, ids, slot_pblk, slot_sig,
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+            slot_sig.stride(0),
+            num_blks, int(out_offset), 0,
+            HAS_IDS=has_ids, COMPACT_OUT=bool(compact_out), SKIP_MATCHING=False,
+            BS=bs, D=d, num_warps=1,
+        )
     return k_fp8_cache, k_scale64_cache, k_mid_cache, k_rad_cache
 
 
 # ==================================================================================================
 # Sync-Free GPU Shadow K Quantizers (`INKLING_PF_GLOBAL_ZERO_SYNC=1`, ZERO DtoH sync!)
+# + Wave-V15 Per-Slot Physical-Block & 64-Bit Content-Fingerprint Eviction Integrity!
 # ==================================================================================================
+@triton.jit
+def _compute_block_sig_triton(
+    K_IN, blk, kvh, sk_b, sk_s, sk_h,
+    BS: tl.constexpr,
+    D: tl.constexpr,
+):
+    """64-bit content fingerprint of paged BF16 block `K_IN[blk, :, kvh, :]`.
+    Samples first & last token of each 64-token group (8 rows) across all 128 dims
+    (16 BF16 elements per row), bit-identical to `compute_block_content_sig`."""
+    SPAN: tl.constexpr = 16 if D >= 16 else D
+    k_u16 = K_IN.to(tl.pointer_type(tl.uint16))
+    blk_base = blk.to(tl.int64) * sk_b + kvh.to(tl.int64) * sk_h
+    offs = tl.arange(0, SPAN)
+    coeffs = offs.to(tl.int64) * 2654435761 + 1
+    h = tl.full((), 0, tl.int64)
+    for i in tl.static_range(8):
+        s_raw = (i * BS) // 8 if (i % 2 == 0) else (((i + 1) * BS) // 8 - 1)
+        s_idx = (BS - 1) if i == 7 else (s_raw if s_raw < BS else (BS - 1))
+        d0 = (i * SPAN) % D
+        w = tl.load(k_u16 + blk_base + s_idx * sk_s + d0 + offs).to(tl.int64)
+        row_mix = tl.sum(w * coeffs, axis=0)
+        h = h * 6364136223846793005 + row_mix + 1442695040888963407
+    h = h ^ (h >> 33)
+    return tl.where(h == 0, tl.full((), 1, tl.int64), h)
+
+
+@triton.jit
+def _verify_shadow_k_slots_kernel(
+    K_IN, BT_ROW, BT_STATE, SLOT_PBLK, SLOT_SIG,
+    sk_b, sk_s, sk_h,
+    ssig_b,
+    CHECK_BLKS,
+    COMPACT_OUT: tl.constexpr,
+    BS: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Zero-sync GPU eviction verifier (~16 us @ 4096 blks): verifies BOTH physical block ID
+    AND 64-bit BF16 content fingerprint for every prefix slot `b_idx < CHECK_BLKS`. On ANY
+    eviction, physical block reuse, or middle-block divergence, invalidates `BT_STATE[0] = -1`
+    so downstream `v4_lib` unconditionally re-quantizes all `0..NUM_BLKS-1`."""
+    b_idx = tl.program_id(0)
+    kvh = tl.program_id(1)
+    if b_idx >= CHECK_BLKS:
+        return
+    blk = tl.load(BT_ROW + b_idx).to(tl.int64)
+    out_blk = b_idx.to(tl.int64) if COMPACT_OUT else blk
+    prev_pblk = tl.load(SLOT_PBLK + out_blk).to(tl.int64)
+    if prev_pblk != blk:
+        tl.store(BT_STATE, tl.full((), -1, tl.int32))
+        return
+    prev_sig = tl.load(SLOT_SIG + out_blk * ssig_b + kvh)
+    live_sig = _compute_block_sig_triton(K_IN, blk, kvh, sk_b, sk_s, sk_h, BS=BS, D=D)
+    if prev_sig != live_sig:
+        tl.store(BT_STATE, tl.full((), -1, tl.int32))
+
+
+@triton.jit
+def _record_shadow_k_slots_kernel(
+    K_IN, BLK_IDS, SLOT_PBLK, SLOT_SIG,
+    sk_b, sk_s, sk_h,
+    ssig_b,
+    NUM_BLKS, OUT_OFFSET, START_BLK,
+    HAS_IDS: tl.constexpr,
+    COMPACT_OUT: tl.constexpr,
+    SKIP_MATCHING: tl.constexpr,
+    BS: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Zero-sync GPU recorder stamping `(slot_pblk, slot_sig)` for quantized Shadow-K slots."""
+    b_idx = tl.program_id(0)
+    kvh = tl.program_id(1)
+    if b_idx >= NUM_BLKS:
+        return
+    blk = tl.load(BLK_IDS + b_idx).to(tl.int64) if HAS_IDS else b_idx.to(tl.int64)
+    out_blk = (OUT_OFFSET + b_idx).to(tl.int64) if COMPACT_OUT else blk
+    live_sig = _compute_block_sig_triton(K_IN, blk, kvh, sk_b, sk_s, sk_h, BS=BS, D=D)
+    if SKIP_MATCHING and b_idx < START_BLK:
+        if tl.load(SLOT_PBLK + out_blk).to(tl.int64) == blk:
+            if tl.load(SLOT_SIG + out_blk * ssig_b + kvh) == live_sig:
+                return
+    tl.store(SLOT_SIG + out_blk * ssig_b + kvh, live_sig)
+    if kvh == 0:
+        tl.store(SLOT_PBLK + out_blk, blk.to(tl.int32))
+
+
 @triton.jit
 def _update_bt_state_kernel(BT_ROW, BT_STATE, END_IDX):
     """Record `[BT_ROW[0], BT_ROW[END_IDX]]` in a 2-int32 GPU state tensor (0 host sync)."""
@@ -730,33 +1079,50 @@ def _update_bt_state_kernel(BT_ROW, BT_STATE, END_IDX):
 
 @triton.jit
 def _quantize_k_blocks_fp8_v3_syncfree_kernel(
-    K_IN, K_FP8_OUT, KS64_OUT, K_MID_OUT, K_RAD_OUT, BT_ROW, BT_STATE,
+    K_IN, K_FP8_OUT, KS64_OUT, K_MID_OUT, K_RAD_OUT,
+    KM8_OUT, KR8_OUT, KBSC_OUT,
+    BT_ROW, BT_STATE, SLOT_PBLK, SLOT_SIG,
     sk_b, sk_s, sk_h,
     sk8_b, sk8_s, sk8_h,
     sks_b, sks_h,
     smid_b, smid_h,
+    skm8_b, skm8_h,
+    skbsc_b, skbsc_h,
+    ssig_b,
     NUM_BLKS, START_BLK, PREV_IDX,
     CHECK_CONTIG: tl.constexpr,
+    STRICT_VERIFY: tl.constexpr,
     COMPUTE_KMAX: tl.constexpr,
+    COMPUTE_V4_BOXES: tl.constexpr,
     COMPACT_OUT: tl.constexpr,
     BS: tl.constexpr,
     D: tl.constexpr,
 ):
-    """Sync-free v3 shadow K quantizer: checks `[BT_ROW[0], BT_ROW[PREV_IDX]] == BT_STATE`
-    entirely on GPU. Contiguous chunks early-exit CTAs `< START_BLK` in < 3 us; any new
-    request or evicted block automatically re-quantizes all `0..NUM_BLKS-1` (0 stale blocks).
-    When `COMPACT_OUT=True`, writes to logical compact slot `b_idx` (constant 1.016 GiB!)."""
+    """Sync-free v3 shadow K quantizer with Wave-V15 per-slot eviction integrity AND synchronized
+    V4 FP8 Quest boxes (`km8/kr8/kb_sc`). Contiguous unchanged slots `< START_BLK` early-exit
+    after verifying `(BT endpoints, slot_pblk, 64-bit content sig)`; ANY evicted/reused/modified
+    block re-quantizes automatically on GPU (0 host sync, 0 stale blocks)."""
     b_idx = tl.program_id(0)
     kvh = tl.program_id(1)
     if b_idx >= NUM_BLKS:
         return
+    blk = tl.load(BT_ROW + b_idx).to(tl.int64)
+    out_blk = b_idx.to(tl.int64) if COMPACT_OUT else blk
+    live_sig = (
+        _compute_block_sig_triton(K_IN, blk, kvh, sk_b, sk_s, sk_h, BS=BS, D=D)
+        if STRICT_VERIFY
+        else tl.full((), 0, tl.int64)
+    )
     if CHECK_CONTIG:
         if b_idx < START_BLK:
             if tl.load(BT_ROW) == tl.load(BT_STATE):
                 if tl.load(BT_ROW + PREV_IDX) == tl.load(BT_STATE + 1):
-                    return
-    blk = tl.load(BT_ROW + b_idx).to(tl.int64)
-    out_blk = b_idx.to(tl.int64) if COMPACT_OUT else blk
+                    if STRICT_VERIFY:
+                        if tl.load(SLOT_PBLK + out_blk).to(tl.int64) == blk:
+                            if tl.load(SLOT_SIG + out_blk * ssig_b + kvh) == live_sig:
+                                return
+                    else:
+                        return
     dd = tl.arange(0, D)
     s_off = tl.arange(0, 64)
 
@@ -780,20 +1146,36 @@ def _quantize_k_blocks_fp8_v3_syncfree_kernel(
         k_rad = (0.5 * (b_max - b_min)).to(tl.bfloat16)
         tl.store(K_MID_OUT + out_blk * smid_b + kvh * smid_h + dd, k_mid)
         tl.store(K_RAD_OUT + out_blk * smid_b + kvh * smid_h + dd, k_rad)
+        if COMPUTE_V4_BOXES:
+            km_f = k_mid.to(tl.float32)
+            kr_f = k_rad.to(tl.float32)
+            km_am = tl.maximum(tl.max(tl.abs(km_f), axis=0), 1.0e-12)
+            kr_am = tl.maximum(tl.max(tl.abs(kr_f), axis=0), 1.0e-12)
+            tl.store(KM8_OUT + out_blk * skm8_b + kvh * skm8_h + dd, (km_f * (22.0 / km_am)).to(tl.float8e4nv))
+            tl.store(KR8_OUT + out_blk * skm8_b + kvh * skm8_h + dd, (kr_f * (22.0 / kr_am)).to(tl.float8e4nv))
+            tl.store(KBSC_OUT + out_blk * skbsc_b + kvh * skbsc_h + 0, km_am * (1.0 / 22.0))
+            tl.store(KBSC_OUT + out_blk * skbsc_b + kvh * skbsc_h + 1, kr_am * (1.0 / 22.0))
+
+    if STRICT_VERIFY:
+        tl.store(SLOT_SIG + out_blk * ssig_b + kvh, live_sig)
+        if kvh == 0:
+            tl.store(SLOT_PBLK + out_blk, blk.to(tl.int32))
 
 
 @triton.jit
 def _quantize_k_blocks_fp8_v3_local_syncfree_kernel(
     K_IN, K_FP8_OUT, KS64_OUT, K_MID_OUT, K_RAD_OUT,
-    KM8_OUT, KR8_OUT, KBSC_OUT, BT_ROW, BT_STATE,
+    KM8_OUT, KR8_OUT, KBSC_OUT, BT_ROW, BT_STATE, SLOT_PBLK, SLOT_SIG,
     sk_b, sk_s, sk_h,
     sk8_b, sk8_s, sk8_h,
     sks_b, sks_h,
     smid_b, smid_h,
     skm8_b, skm8_h,
     skbsc_b, skbsc_h,
+    ssig_b,
     NUM_BLKS, OUT_OFFSET, PREV_IDX,
     CHECK_CONTIG: tl.constexpr,
+    STRICT_VERIFY: tl.constexpr,
     COMPUTE_KMAX: tl.constexpr,
     COMPUTE_V4_BOXES: tl.constexpr,
     COMPACT_OUT: tl.constexpr,
@@ -801,20 +1183,29 @@ def _quantize_k_blocks_fp8_v3_local_syncfree_kernel(
     D: tl.constexpr,
 ):
     """Zero-sync chunked Shadow-K quantizer for KV-BF12 unpacked `[NUM_BLKS, BS, Hkv, D]` staging.
-    Reads local index `b_idx` from `K_IN`; when `CHECK_CONTIG=True`, early-exits in 1 cycle if
-    `[BT_ROW[0], BT_ROW[PREV_IDX]] == BT_STATE` (0 DRAM reads on contiguous prefix chunks).
-    Updates `k_fp8`, `ks64`, `k_mid/k_rad`, AND pre-quantized FP8 Quest boxes (`km8/kr8/kb_sc`)."""
+    Verifies both BT endpoints AND per-slot `(slot_pblk, slot_sig)` on GPU before early-exit."""
     b_idx = tl.program_id(0)
     kvh = tl.program_id(1)
     if b_idx >= NUM_BLKS:
         return
+    src_blk = b_idx.to(tl.int64)
+    log_blk = (OUT_OFFSET + b_idx).to(tl.int64)
+    phys_blk = tl.load(BT_ROW + log_blk).to(tl.int64)
+    out_blk = log_blk if COMPACT_OUT else phys_blk
+    live_sig = (
+        _compute_block_sig_triton(K_IN, src_blk, kvh, sk_b, sk_s, sk_h, BS=BS, D=D)
+        if STRICT_VERIFY
+        else tl.full((), 0, tl.int64)
+    )
     if CHECK_CONTIG:
         if tl.load(BT_ROW) == tl.load(BT_STATE):
             if tl.load(BT_ROW + PREV_IDX) == tl.load(BT_STATE + 1):
-                return
-    src_blk = b_idx.to(tl.int64)
-    log_blk = (OUT_OFFSET + b_idx).to(tl.int64)
-    out_blk = log_blk if COMPACT_OUT else tl.load(BT_ROW + log_blk).to(tl.int64)
+                if STRICT_VERIFY:
+                    if tl.load(SLOT_PBLK + out_blk).to(tl.int64) == phys_blk:
+                        if tl.load(SLOT_SIG + out_blk * ssig_b + kvh) == live_sig:
+                            return
+                else:
+                    return
     dd = tl.arange(0, D)
     s_off = tl.arange(0, 64)
 
@@ -848,20 +1239,27 @@ def _quantize_k_blocks_fp8_v3_local_syncfree_kernel(
             tl.store(KBSC_OUT + out_blk * skbsc_b + kvh * skbsc_h + 0, km_am * (1.0 / 22.0))
             tl.store(KBSC_OUT + out_blk * skbsc_b + kvh * skbsc_h + 1, kr_am * (1.0 / 22.0))
 
+    if STRICT_VERIFY:
+        tl.store(SLOT_SIG + out_blk * ssig_b + kvh, live_sig)
+        if kvh == 0:
+            tl.store(SLOT_PBLK + out_blk, phys_blk.to(tl.int32))
+
 
 @triton.jit
 def _quantize_k_blocks_fp8_v2_syncfree_kernel(
-    K_IN, K_FP8_OUT, K_SCALE_OUT, BT_ROW, BT_STATE,
+    K_IN, K_FP8_OUT, K_SCALE_OUT, BT_ROW, BT_STATE, SLOT_PBLK, SLOT_SIG,
     sk_b, sk_s, sk_h,
     sk8_b, sk8_s, sk8_h,
     sks_b, sks_h,
+    ssig_b,
     NUM_BLKS, START_BLK, PREV_IDX,
     CHECK_CONTIG: tl.constexpr,
+    STRICT_VERIFY: tl.constexpr,
     BS: tl.constexpr,
     D: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
-    """Sync-free v2 shadow K quantizer (per-token FP32 scale, 0 DtoH sync, 0 stale blocks)."""
+    """Sync-free v2 shadow K quantizer (per-token FP32 scale, per-slot content verification)."""
     pid = tl.program_id(0)
     kvh = tl.program_id(1)
     chunks_per_blk = BS // BLOCK_S
@@ -869,12 +1267,22 @@ def _quantize_k_blocks_fp8_v2_syncfree_kernel(
     s_chunk = pid % chunks_per_blk
     if b_idx >= NUM_BLKS:
         return
+    blk = tl.load(BT_ROW + b_idx).to(tl.int64)
+    live_sig = (
+        _compute_block_sig_triton(K_IN, blk, kvh, sk_b, sk_s, sk_h, BS=BS, D=D)
+        if STRICT_VERIFY
+        else tl.full((), 0, tl.int64)
+    )
     if CHECK_CONTIG:
         if b_idx < START_BLK:
             if tl.load(BT_ROW) == tl.load(BT_STATE):
                 if tl.load(BT_ROW + PREV_IDX) == tl.load(BT_STATE + 1):
-                    return
-    blk = tl.load(BT_ROW + b_idx).to(tl.int64)
+                    if STRICT_VERIFY:
+                        if tl.load(SLOT_PBLK + blk).to(tl.int64) == blk:
+                            if tl.load(SLOT_SIG + blk * ssig_b + kvh) == live_sig:
+                                return
+                    else:
+                        return
     ss = s_chunk * BLOCK_S + tl.arange(0, BLOCK_S)
     dd = tl.arange(0, D)
 
@@ -885,6 +1293,10 @@ def _quantize_k_blocks_fp8_v2_syncfree_kernel(
 
     tl.store(K_FP8_OUT + blk * sk8_b + ss[:, None] * sk8_s + kvh * sk8_h + dd[None, :], k_fp8)
     tl.store(K_SCALE_OUT + blk * sks_b + kvh * sks_h + ss, k_scale)
+    if STRICT_VERIFY and s_chunk == 0:
+        tl.store(SLOT_SIG + blk * ssig_b + kvh, live_sig)
+        if kvh == 0:
+            tl.store(SLOT_PBLK + blk, blk.to(tl.int32))
 
 
 def quantize_k_to_fp8_blocks_v3_syncfree(
@@ -902,13 +1314,21 @@ def quantize_k_to_fp8_blocks_v3_syncfree(
     with_kmax: bool = False,
     compact_out: bool = False,
 ) -> None:
-    """Zero-sync GPU shadow K update for v3 (updates `bt_state` on GPU after quantization)."""
+    """Zero-sync GPU shadow K update for v3 (updates `bt_state` & per-slot integrity on GPU)."""
     if nblks <= 0:
         return
+    if compact_out and int(nblks) > int(k_fp8_cache.shape[0]):
+        bt_state.fill_(-1)
+        raise ValueError(
+            f"compact Shadow K overflow: nblks={nblks} > cap={int(k_fp8_cache.shape[0])}"
+        )
     _, bs, hkv, d = key_cache.shape
     want_kmax = with_kmax and (k_mid_cache is not None) and (k_rad_cache is not None)
     v4_boxes = getattr(k_mid_cache, "_v4_fp8_boxes", None) if want_kmax else None
     v4_lib = get_nonmoe_v4_lib() if _PF_TOPK_V4 else None
+    strict_v = bool(_PF_SHADOW_K_STRICT_VERIFY)
+    slot_pblk, slot_sig, _ = _get_shadow_k_slot_state(k_fp8_cache) if strict_v else (bt_row, bt_row, None)
+    ssig_b = int(slot_sig.stride(0)) if strict_v else 0
     if (
         v4_lib is not None
         and d == 128
@@ -921,6 +1341,16 @@ def quantize_k_to_fp8_blocks_v3_syncfree(
         and k_fp8_cache.stride(3) == 1
         and (not want_kmax or v4_boxes is not None)
     ):
+        if strict_v and check_contig and int(start_blk) > 0 and _TRITON_OK:
+            # Verify ALL prefix slots [0, start_blk) on GPU before v4_lib's 2-endpoint check:
+            # any evicted/reused physical block or middle-block mismatch sets bt_state[0] = -1!
+            _verify_shadow_k_slots_kernel[(int(start_blk), hkv)](
+                key_cache, bt_row, bt_state, slot_pblk, slot_sig,
+                key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                ssig_b,
+                int(start_blk),
+                COMPACT_OUT=bool(compact_out), BS=bs, D=d, num_warps=1,
+            )
         km8, kr8, kb_sc = v4_boxes if v4_boxes is not None else (None, None, None)
         rc = v4_lib.quantize_k_shadow_v4_sm121_fwd(
             key_cache.data_ptr(),
@@ -950,19 +1380,43 @@ def quantize_k_to_fp8_blocks_v3_syncfree(
             int(torch.cuda.current_stream(key_cache.device).cuda_stream),
         )
         if rc == 0:
+            if strict_v and _TRITON_OK:
+                _record_shadow_k_slots_kernel[(int(nblks), hkv)](
+                    key_cache, bt_row, slot_pblk, slot_sig,
+                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                    ssig_b,
+                    int(nblks), 0, int(start_blk) if check_contig else 0,
+                    HAS_IDS=True, COMPACT_OUT=bool(compact_out), SKIP_MATCHING=bool(check_contig),
+                    BS=bs, D=d, num_warps=1,
+                )
             return
+    has_v4_boxes = want_kmax and (v4_boxes is not None)
+    km8, kr8, kb_sc = v4_boxes if has_v4_boxes else (key_cache, key_cache, key_cache)
     dummy_m = k_mid_cache if want_kmax else key_cache
     dummy_r = k_rad_cache if want_kmax else key_cache
     smid_b = k_mid_cache.stride(0) if want_kmax else 0
     smid_h = k_mid_cache.stride(1) if want_kmax else 0
+    skm8_b = km8.stride(0) if has_v4_boxes else 0
+    skm8_h = km8.stride(1) if has_v4_boxes else 0
+    skbsc_b = kb_sc.stride(0) if has_v4_boxes else 0
+    skbsc_h = kb_sc.stride(1) if has_v4_boxes else 0
     _quantize_k_blocks_fp8_v3_syncfree_kernel[(nblks, hkv)](
-        key_cache, k_fp8_cache, k_scale64_cache, dummy_m, dummy_r, bt_row, bt_state,
+        key_cache, k_fp8_cache, k_scale64_cache, dummy_m, dummy_r,
+        km8, kr8, kb_sc,
+        bt_row, bt_state, slot_pblk, slot_sig,
         key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
         k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
         k_scale64_cache.stride(0), k_scale64_cache.stride(1),
         smid_b, smid_h,
+        skm8_b, skm8_h,
+        skbsc_b, skbsc_h,
+        ssig_b,
         nblks, start_blk, prev_idx,
-        CHECK_CONTIG=bool(check_contig), COMPUTE_KMAX=want_kmax, COMPACT_OUT=bool(compact_out),
+        CHECK_CONTIG=bool(check_contig),
+        STRICT_VERIFY=strict_v,
+        COMPUTE_KMAX=want_kmax,
+        COMPUTE_V4_BOXES=has_v4_boxes,
+        COMPACT_OUT=bool(compact_out),
         BS=bs, D=d,
         num_warps=4, num_stages=2,
     )
@@ -993,6 +1447,12 @@ def quantize_k_to_fp8_blocks_v3_local_syncfree(
     (for KV-BF12 unpacked chunks). Caller calls `update_bt_state_gpu` once after all chunks complete."""
     if n_sub <= 0:
         return
+    if compact_out and (int(out_offset) < 0 or int(out_offset) + int(n_sub) > int(k_fp8_cache.shape[0])):
+        bt_state.fill_(-1)
+        raise ValueError(
+            f"compact Shadow K local overflow: out_offset={out_offset}, n_sub={n_sub}, "
+            f"cap={int(k_fp8_cache.shape[0])}"
+        )
     _, bs, hkv, d = k_local_stage.shape
     want_kmax = with_kmax and (k_mid_cache is not None) and (k_rad_cache is not None)
     v4_boxes = getattr(k_mid_cache, "_v4_fp8_boxes", None) if want_kmax else None
@@ -1006,17 +1466,22 @@ def quantize_k_to_fp8_blocks_v3_local_syncfree(
     skm8_h = km8.stride(1) if has_v4_boxes else 0
     skbsc_b = kb_sc.stride(0) if has_v4_boxes else 0
     skbsc_h = kb_sc.stride(1) if has_v4_boxes else 0
+    strict_v = bool(_PF_SHADOW_K_STRICT_VERIFY)
+    slot_pblk, slot_sig, _ = _get_shadow_k_slot_state(k_fp8_cache) if strict_v else (bt_row, bt_row, None)
+    ssig_b = int(slot_sig.stride(0)) if strict_v else 0
     _quantize_k_blocks_fp8_v3_local_syncfree_kernel[(int(n_sub), hkv)](
         k_local_stage, k_fp8_cache, k_scale64_cache, dummy_m, dummy_r,
-        km8, kr8, kb_sc, bt_row, bt_state,
+        km8, kr8, kb_sc, bt_row, bt_state, slot_pblk, slot_sig,
         k_local_stage.stride(0), k_local_stage.stride(1), k_local_stage.stride(2),
         k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
         k_scale64_cache.stride(0), k_scale64_cache.stride(1),
         smid_b, smid_h,
         skm8_b, skm8_h,
         skbsc_b, skbsc_h,
+        ssig_b,
         int(n_sub), int(out_offset), int(prev_idx),
         CHECK_CONTIG=bool(check_contig),
+        STRICT_VERIFY=strict_v,
         COMPUTE_KMAX=want_kmax,
         COMPUTE_V4_BOXES=has_v4_boxes,
         COMPACT_OUT=bool(compact_out),
@@ -1036,22 +1501,110 @@ def quantize_k_to_fp8_blocks_v2_syncfree(
     prev_idx: int,
     check_contig: bool,
 ) -> None:
-    """Zero-sync GPU shadow K update for v2 (updates `bt_state` on GPU after quantization)."""
+    """Zero-sync GPU shadow K update for v2 (updates `bt_state` & per-slot integrity on GPU)."""
     if nblks <= 0:
         return
     _, bs, hkv, d = key_cache.shape
     block_s = 64 if bs >= 64 and bs % 64 == 0 else bs
     grid = (nblks * (bs // block_s), hkv)
+    strict_v = bool(_PF_SHADOW_K_STRICT_VERIFY)
+    slot_pblk, slot_sig, _ = _get_shadow_k_slot_state(k_fp8_cache) if strict_v else (bt_row, bt_row, None)
+    ssig_b = int(slot_sig.stride(0)) if strict_v else 0
     _quantize_k_blocks_fp8_v2_syncfree_kernel[grid](
-        key_cache, k_fp8_cache, k_scale_cache, bt_row, bt_state,
+        key_cache, k_fp8_cache, k_scale_cache, bt_row, bt_state, slot_pblk, slot_sig,
         key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
         k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
         k_scale_cache.stride(0), k_scale_cache.stride(1),
+        ssig_b,
         nblks, start_blk, prev_idx,
-        CHECK_CONTIG=bool(check_contig), BS=bs, D=d, BLOCK_S=block_s,
+        CHECK_CONTIG=bool(check_contig), STRICT_VERIFY=strict_v, BS=bs, D=d, BLOCK_S=block_s,
         num_warps=4, num_stages=2,
     )
     _update_bt_state_kernel[(1,)](bt_row, bt_state, nblks - 1, num_warps=1)
+
+
+def syncfree_shadow_k_update_cpu_ref(
+    key_cache: torch.Tensor,
+    k_fp8_cache: torch.Tensor,
+    k_scale64_cache: torch.Tensor,
+    bt_row: torch.Tensor,
+    bt_state: torch.Tensor,
+    nblks: int,
+    start_blk: int,
+    prev_idx: int,
+    check_contig: bool,
+    *,
+    compact_out: bool = True,
+    strict_verify: bool | None = None,
+    k_mid_cache: torch.Tensor | None = None,
+    k_rad_cache: torch.Tensor | None = None,
+) -> int:
+    """Pure-PyTorch bit-exact reference of `quantize_k_to_fp8_blocks_v3_syncfree` using the
+    exact same `_get_shadow_k_slot_state` and `compute_block_content_sig` logic.
+    Returns the number of blocks actually re-quantized (for offline verification & soak testing)."""
+    if nblks <= 0:
+        return 0
+    if compact_out and int(nblks) > int(k_fp8_cache.shape[0]):
+        bt_state.fill_(-1)
+        raise ValueError(
+            f"compact Shadow K overflow: nblks={nblks} > cap={int(k_fp8_cache.shape[0])}"
+        )
+    strict_v = _PF_SHADOW_K_STRICT_VERIFY if strict_verify is None else bool(strict_verify)
+    _, bs, hkv, d = key_cache.shape
+    slot_pblk, slot_sig, _ = _get_shadow_k_slot_state(k_fp8_cache)
+    bt_ids = bt_row[:nblks].to(torch.int64)
+    live_sigs = compute_block_content_sig(key_cache, bt_ids)
+    endpoints_ok = bool(
+        check_contig
+        and int(bt_row[0].item()) == int(bt_state[0].item())
+        and int(bt_row[prev_idx].item()) == int(bt_state[1].item())
+    )
+    requant_count = 0
+    want_kmax = k_mid_cache is not None and k_rad_cache is not None
+    v4_boxes = getattr(k_mid_cache, "_v4_fp8_boxes", None) if want_kmax else None
+    for b_idx in range(nblks):
+        blk = int(bt_ids[b_idx].item())
+        out_blk = b_idx if compact_out else blk
+        if endpoints_ok and b_idx < start_blk:
+            if not strict_v:
+                continue
+            if int(slot_pblk[out_blk].item()) == blk and bool(
+                torch.equal(slot_sig[out_blk], live_sigs[b_idx])
+            ):
+                continue
+        requant_count += 1
+        k_blk = key_cache[blk].float()  # [BS, Hkv, D]
+        for g in range(bs // 64):
+            sl = slice(g * 64, (g + 1) * 64)
+            for kvh in range(hkv):
+                kg = k_blk[sl, kvh, :]
+                amax64 = max(float(kg.abs().max().item()), 1.0e-12)
+                k_fp8_cache[out_blk, sl, kvh, :].copy_((kg * (22.0 / amax64)).to(torch.float8_e4m3fn))
+                k_scale64_cache[out_blk, kvh, g] = amax64 * (1.0 / 22.0)
+        if want_kmax:
+            assert k_mid_cache is not None and k_rad_cache is not None
+            b_min = k_blk.amin(dim=0)  # [Hkv, D]
+            b_max = k_blk.amax(dim=0)
+            km = (0.5 * (b_max + b_min)).to(torch.bfloat16)
+            kr = (0.5 * (b_max - b_min)).to(torch.bfloat16)
+            k_mid_cache[out_blk].copy_(km)
+            k_rad_cache[out_blk].copy_(kr)
+            if v4_boxes is not None:
+                km8, kr8, kb_sc = v4_boxes
+                km_f = km.float()
+                kr_f = kr.float()
+                km_am = km_f.abs().amax(dim=-1, keepdim=True).clamp(min=1.0e-12)
+                kr_am = kr_f.abs().amax(dim=-1, keepdim=True).clamp(min=1.0e-12)
+                km8[out_blk].copy_((km_f * (22.0 / km_am)).to(torch.float8_e4m3fn))
+                kr8[out_blk].copy_((kr_f * (22.0 / kr_am)).to(torch.float8_e4m3fn))
+                kb_sc[out_blk, :, 0].copy_(km_am.squeeze(-1) * (1.0 / 22.0))
+                kb_sc[out_blk, :, 1].copy_(kr_am.squeeze(-1) * (1.0 / 22.0))
+        if strict_v:
+            slot_pblk[out_blk] = blk
+            slot_sig[out_blk].copy_(live_sigs[b_idx])
+    bt_state[0] = bt_row[0]
+    bt_state[1] = bt_row[nblks - 1]
+    return requant_count
 
 
 @triton.jit
@@ -1065,6 +1618,7 @@ def _score_kmax_blocks_kernel(
     SINK_BLKS, LOCAL_BLKS, K_SEL,
     H: tl.constexpr, G: tl.constexpr, BS: tl.constexpr, E: tl.constexpr, D: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr,
+    DIRECT_LOGICAL_BT: tl.constexpr = False,
 ):
     """Optimized FP8-f16 Quest upper-bound block scorer with coalesced [BLOCK_B, D] loads,
     fused sink/local +1e30 boost, >= n_pblks -1e30 mask, and SEL_COUNTS write (3 launches total!)."""
@@ -1127,7 +1681,10 @@ def _score_kmax_blocks_kernel(
             tl.store(sc_base + lb, blk_sc, mask=b_in)
         else:
             b_ok = lb < n_pblks
-            pblk = tl.load(bt_row + lb, mask=b_ok, other=0).to(tl.int64)
+            if DIRECT_LOGICAL_BT:
+                pblk = lb.to(tl.int64)
+            else:
+                pblk = tl.load(bt_row + lb, mask=b_ok, other=0).to(tl.int64)
             # Coalesced [BLOCK_B, D] loads (fixes strided [D, BLOCK_B] gather!)
             km = tl.load(
                 K_MID + pblk[:, None] * sm_b + kvh * sm_h + dd[None, :],
@@ -1181,6 +1738,8 @@ def select_topk_blocks_exact_kmax(
     Uses native SM121a FP8-f16 CUDA scorer (`score_kmax_blocks_fp8_sm121_fwd`) when available,
     else upgraded coalesced FP8-f16 Triton scorer. Only 3 GPU launches (score -> topk -> sort)
     and ZERO host sync when `max_seq` is provided!"""
+    if int(num_reqs) <= 0 or int(max_seqlen_q) <= 0 or int(BS) <= 0 or int(q.shape[0]) <= 0:
+        return None, None
     s_blks = GLOBAL_SINK_BLKS if sink_blocks is None else int(sink_blocks)
     l_blks = GLOBAL_LOCAL_BLKS if local_blocks is None else int(local_blocks)
     if max_seq is None:
@@ -1188,6 +1747,13 @@ def select_topk_blocks_exact_kmax(
     # Prefix blocks NEVER include the final E-token biased tail!
     max_prefix_toks = max(max_seq - E, 0) if E > 0 else max_seq
     max_pblks = min(int(block_table.shape[1]), max_prefix_toks // BS)
+    if int(k_bt_mode) == 1:
+        # Compact Shadow K (`k_bt_mode == 1`) is single-request logical-block indexed.
+        if int(num_reqs) != 1 or max_pblks > int(k_mid.shape[0]):
+            return None, None
+    elif int(k_bt_mode) == 2:
+        if int(block_table.shape[0]) < int(num_reqs):
+            return None, None
     topk_blks = max(1, topk_tokens // BS)
     budget = s_blks + l_blks + topk_blks
     if max_pblks <= budget:
@@ -1209,7 +1775,7 @@ def select_topk_blocks_exact_kmax(
         and q.stride(2) == 1
     ):
         km8, kr8, kb_sc = v4_boxes
-        if _PF_GLOBAL_ZERO_SYNC and not torch.cuda.is_current_stream_capturing():
+        if _PF_GLOBAL_ZERO_SYNC and not _is_stream_capturing():
             sel_blocks_v4, sel_counts_v4 = _get_topk_sel_scratch(q.device, n_ctas, k_sel)
         else:
             sel_blocks_v4 = torch.empty((n_ctas, k_sel), dtype=torch.int32, device=q.device)
@@ -1238,7 +1804,7 @@ def select_topk_blocks_exact_kmax(
         if rc_v4 == 0:
             return sel_blocks_v4, sel_counts_v4
 
-    if _PF_GLOBAL_ZERO_SYNC and not torch.cuda.is_current_stream_capturing():
+    if _PF_GLOBAL_ZERO_SYNC and not _is_stream_capturing():
         scores = _get_topk_scores_scratch(q.device, n_ctas, max_pblks)
     else:
         scores = torch.empty((n_ctas, max_pblks), dtype=torch.float32, device=q.device)
@@ -1256,14 +1822,19 @@ def select_topk_blocks_exact_kmax(
         and k_mid.stride(2) == 1
         and k_rad.stride(2) == 1
     ):
+        bt_for_cuda = (
+            _get_compact_arange_bt_local(q.device, max_pblks)
+            if int(k_bt_mode) == 1
+            else block_table
+        )
         stream = int(torch.cuda.current_stream(q.device).cuda_stream)
         rc = cuda_lib.score_kmax_blocks_fp8_sm121_fwd(
             q.data_ptr(), k_mid.data_ptr(), k_rad.data_ptr(),
-            block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+            bt_for_cuda.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
             scores.data_ptr(), sel_counts.data_ptr(),
             q.stride(0), q.stride(1),
             k_mid.stride(0), k_mid.stride(1),
-            block_table.stride(0),
+            bt_for_cuda.stride(0),
             scores.stride(0),
             int(num_reqs), int(max_seqlen_q), int(max_pblks),
             int(H), int(G), int(BS), int(E),
@@ -1281,6 +1852,7 @@ def select_topk_blocks_exact_kmax(
             scores.stride(0),
             max_pblks, s_blks, l_blks, k_sel,
             H=H, G=G, BS=BS, E=E, D=D, BLOCK_M=128, BLOCK_B=64,
+            DIRECT_LOGICAL_BT=(int(k_bt_mode) == 1),
             num_warps=4, num_stages=2,
         )
 
@@ -1615,6 +2187,7 @@ def _global_prefill_fp8_sage2_kernel(
             else:
                 s_raw = tl.dot(q_fp8, tl.trans(k_fp8), out_dtype=tl.float32)
             s = s_raw * qs_log2[:, None] * k_scale[None, :]
+            s = tl.where(row_ok[:, None], s, float("-inf"))
 
             tile_max = tl.max(s, 1)
             m_new = tl.maximum(m_i, tile_max)
@@ -1918,9 +2491,36 @@ def _pick_cfg(mode: str, max_seqlen_q: int, bm=None, bn=None, warps=None, stages
     c_w = warps or _ENV_WARPS or d_w
     c_s = stages or _ENV_STAGES or d_s
     # Sheared bias `off` formula assumes all rows in a CTA share one 128-token bias window.
-    if c_bm > 128:
-        c_bm = 128
+    if c_bm not in (64, 128):
+        c_bm = 128 if c_bm >= 128 else 64
+    if c_bn not in (32, 64, 128):
+        c_bn = 64
     return c_bm, c_bn, c_w, c_s
+
+
+def _k_bt_mode_valid(
+    k_bt_mode: int,
+    num_reqs: int,
+    k_fp8_cache: torch.Tensor | None,
+    k_bt: torch.Tensor | None,
+    max_seq: int | None,
+    BS: int,
+) -> bool:
+    """Validate `k_bt_mode` invariants before launching native CUDA prefix kernels."""
+    mode = int(k_bt_mode)
+    if mode == 0:
+        return True
+    if mode == 1:
+        if int(num_reqs) != 1 or k_fp8_cache is None or int(BS) <= 0:
+            return False
+        if max_seq is not None:
+            nblks = (max(int(max_seq), 0) + int(BS) - 1) // int(BS)
+            if nblks > int(k_fp8_cache.shape[0]):
+                return False
+        return int(k_fp8_cache.shape[0]) > 0
+    if mode == 2:
+        return k_bt is not None and int(k_bt.shape[0]) >= int(num_reqs)
+    return False
 
 
 def launch_global_sage2_prefix_v3_only(
@@ -1957,6 +2557,10 @@ def launch_global_sage2_prefix_v3_only(
     """Run ONLY the SM121a Sage2 v3/v4/v5/v6 FP8 prefix kernel and return
     `(acc_buf, m_buf, l_buf, prefix_bm=128, tail_prefix_bn)` for direct handoff to
     `libpf_fp8_attn_v6.so` or `libglobal_tail_otf_rel_sm121.so`."""
+    if int(num_reqs) <= 0 or int(max_seqlen_q) <= 0 or int(q.shape[0]) <= 0:
+        return None
+    if _PF_GLOBAL_GUARD_MIXED_DECODE and _has_unsplit_decode_reqs(num_reqs, max_seqlen_q):
+        return None
     lib = get_cuda_lib(cuda_lib_path)
     try:
         from . import sm12_attn as _sm12_a
@@ -1976,6 +2580,8 @@ def launch_global_sage2_prefix_v3_only(
                 k_bt_mode = 2
     except Exception:
         pass
+    if not _k_bt_mode_valid(k_bt_mode, num_reqs, k_fp8_cache, k_bt, max_seq, BS):
+        return None
     p_bn = bn or _ENV_BN or 64
     if p_bn not in (64, 128):
         p_bn = 64
@@ -1984,23 +2590,22 @@ def launch_global_sage2_prefix_v3_only(
         p_min_ctas = 2
     tau = PV_SKIP_TAU if pv_skip_tau is None else float(pv_skip_tau)
     need_v5 = int(k_bt_mode) != 0
+    v53_sym = "global_sage2_prefix_v5_sm121_fwd" if need_v5 else "global_sage2_prefix_v3_sm121_fwd"
     can_v6 = (
         bool(use_v6_fp8)
         and int(max_seqlen_q) >= 1024
-        and not torch.cuda.is_current_stream_capturing()
+        and not _is_stream_capturing()
         and lib is not None
         and hasattr(lib, "global_sage2_prefix_v6_sm121_fwd")
     )
+    # If v6-only library is passed on a tiny tail chunk (max_seqlen_q < 1024), resolve default v5/v3 lib!
+    fb_lib = lib if (lib is not None and hasattr(lib, v53_sym)) else None
+    if fb_lib is None and cuda_lib_path is not None:
+        _def_lib = get_cuda_lib(None)
+        if _def_lib is not None and hasattr(_def_lib, v53_sym):
+            fb_lib = _def_lib
     if not (
-        lib is not None
-        and (
-            can_v6
-            or (
-                hasattr(lib, "global_sage2_prefix_v5_sm121_fwd")
-                if need_v5
-                else hasattr(lib, "global_sage2_prefix_v3_sm121_fwd")
-            )
-        )
+        (can_v6 or fb_lib is not None)
         and k_fp8_cache is not None
         and k_scale64_cache is not None
         and k_scale64_cache.shape[-1] == BS // 64
@@ -2022,15 +2627,17 @@ def launch_global_sage2_prefix_v3_only(
     sel_blocks = sel_counts = None
     if eff_topk > 0 and k_mid_cache is not None and k_rad_cache is not None:
         score_bt = k_bt if (need_v5 and k_bt is not None) else block_table
+        score_lib = fb_lib if (fb_lib is not None and hasattr(fb_lib, "score_kmax_blocks_fp8_sm121_fwd")) else lib
         sel_blocks, sel_counts = select_topk_blocks_exact_kmax(
             q, k_mid_cache, k_rad_cache, score_bt, cache_seqlens, cu_seqlens_q,
             max_seqlen_q, E, BS, H, G, D, num_reqs, eff_topk,
-            max_seq=max_seq, cuda_lib=lib, k_bt_mode=int(k_bt_mode),
+            max_seq=max_seq, cuda_lib=score_lib, k_bt_mode=int(k_bt_mode),
         )
     use_sparse = sel_blocks is not None and sel_counts is not None
     T = q.shape[0]
     acc_buf, m_buf, l_buf = _get_cuda_scratch(q.device, T, H, D)
     stream = int(torch.cuda.current_stream(q.device).cuda_stream)
+    rc = -1
     if can_v6:
         eff_pv_f16 = int(_PF_FP8_PV_F16_ACC if pv_f16_acc is None else bool(pv_f16_acc))
         rc = lib.global_sage2_prefix_v6_sm121_fwd(
@@ -2054,45 +2661,46 @@ def launch_global_sage2_prefix_v3_only(
             eff_pv_f16,
             stream,
         )
-    elif need_v5:
-        rc = lib.global_sage2_prefix_v5_sm121_fwd(
-            q.data_ptr(), k_fp8_cache.data_ptr(), k_scale64_cache.data_ptr(), value_cache.data_ptr(),
-            block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
-            sel_blocks.data_ptr() if use_sparse else 0,
-            sel_counts.data_ptr() if use_sparse else 0,
-            acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
-            q.stride(0), q.stride(1),
-            k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
-            k_scale64_cache.stride(0), k_scale64_cache.stride(1),
-            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-            block_table.stride(0),
-            int(num_reqs), int(max_seqlen_q), int(H), int(G),
-            int(BS), int(E), int(p_bn), int(p_min_ctas),
-            int(sel_blocks.shape[1]) if use_sparse else 0,
-            float(softmax_scale * LOG2E), float(tau),
-            k_bt.data_ptr() if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
-            int(k_bt.stride(0)) if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
-            int(k_bt_mode),
-            stream,
-        )
-    else:
-        rc = lib.global_sage2_prefix_v3_sm121_fwd(
-            q.data_ptr(), k_fp8_cache.data_ptr(), k_scale64_cache.data_ptr(), value_cache.data_ptr(),
-            block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
-            sel_blocks.data_ptr() if use_sparse else 0,
-            sel_counts.data_ptr() if use_sparse else 0,
-            acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
-            q.stride(0), q.stride(1),
-            k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
-            k_scale64_cache.stride(0), k_scale64_cache.stride(1),
-            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-            block_table.stride(0),
-            int(num_reqs), int(max_seqlen_q), int(H), int(G),
-            int(BS), int(E), int(p_bn), int(p_min_ctas),
-            int(sel_blocks.shape[1]) if use_sparse else 0,
-            float(softmax_scale * LOG2E), float(tau),
-            stream,
-        )
+    if rc != 0 and fb_lib is not None:
+        if need_v5:
+            rc = fb_lib.global_sage2_prefix_v5_sm121_fwd(
+                q.data_ptr(), k_fp8_cache.data_ptr(), k_scale64_cache.data_ptr(), value_cache.data_ptr(),
+                block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+                sel_blocks.data_ptr() if use_sparse else 0,
+                sel_counts.data_ptr() if use_sparse else 0,
+                acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
+                q.stride(0), q.stride(1),
+                k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
+                k_scale64_cache.stride(0), k_scale64_cache.stride(1),
+                value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                block_table.stride(0),
+                int(num_reqs), int(max_seqlen_q), int(H), int(G),
+                int(BS), int(E), int(p_bn), int(p_min_ctas),
+                int(sel_blocks.shape[1]) if use_sparse else 0,
+                float(softmax_scale * LOG2E), float(tau),
+                k_bt.data_ptr() if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
+                int(k_bt.stride(0)) if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
+                int(k_bt_mode),
+                stream,
+            )
+        else:
+            rc = fb_lib.global_sage2_prefix_v3_sm121_fwd(
+                q.data_ptr(), k_fp8_cache.data_ptr(), k_scale64_cache.data_ptr(), value_cache.data_ptr(),
+                block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+                sel_blocks.data_ptr() if use_sparse else 0,
+                sel_counts.data_ptr() if use_sparse else 0,
+                acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
+                q.stride(0), q.stride(1),
+                k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
+                k_scale64_cache.stride(0), k_scale64_cache.stride(1),
+                value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                block_table.stride(0),
+                int(num_reqs), int(max_seqlen_q), int(H), int(G),
+                int(BS), int(E), int(p_bn), int(p_min_ctas),
+                int(sel_blocks.shape[1]) if use_sparse else 0,
+                float(softmax_scale * LOG2E), float(tau),
+                stream,
+            )
     if rc != 0:
         return None
     return acc_buf, m_buf, l_buf, 128, (BS if use_sparse else p_bn)
@@ -2135,6 +2743,12 @@ def launch_global_prefill(
     m = (MODE if mode is None else mode).strip().lower()
     if window >= 0 or m in ("", "0", "off", "false", "no"):
         return False
+    if int(num_reqs) <= 0 or int(max_seqlen_q) <= 0 or int(q.shape[0]) <= 0:
+        return False
+    # Mixed decode+prefill guard: never apply FP8/PV-skip/TopK prefill shortcuts to unsplit decode reqs!
+    if _PF_GLOBAL_GUARD_MIXED_DECODE and m != "bf16_lockstep":
+        if _has_unsplit_decode_reqs(num_reqs, max_seqlen_q):
+            return False
 
     fuse = gate is not None
     dummy_g = gate if fuse else q
@@ -2155,13 +2769,22 @@ def launch_global_prefill(
             p_min_ctas = 2
         ks64 = k_scale64_cache if k_scale64_cache is not None else k_scale_cache
         need_v5 = int(k_bt_mode) != 0
+        v53_sym = "global_sage2_prefix_v5_sm121_fwd" if need_v5 else "global_sage2_prefix_v3_sm121_fwd"
+        can_v6 = (
+            bool(use_v6_fp8)
+            and int(max_seqlen_q) >= 1024
+            and not _is_stream_capturing()
+            and lib is not None
+            and hasattr(lib, "global_sage2_prefix_v6_sm121_fwd")
+        )
+        fb_lib = lib if (lib is not None and hasattr(lib, v53_sym)) else None
+        if fb_lib is None and cuda_lib_path is not None:
+            _def_lib = get_cuda_lib(None)
+            if _def_lib is not None and hasattr(_def_lib, v53_sym):
+                fb_lib = _def_lib
         if (
-            lib is not None
-            and (
-                hasattr(lib, "global_sage2_prefix_v5_sm121_fwd")
-                if need_v5
-                else hasattr(lib, "global_sage2_prefix_v3_sm121_fwd")
-            )
+            (can_v6 or fb_lib is not None)
+            and _k_bt_mode_valid(k_bt_mode, num_reqs, k_fp8_cache, k_bt, max_seq, BS)
             and k_fp8_cache is not None
             and ks64 is not None
             and ks64.shape[-1] == BS // 64
@@ -2181,21 +2804,17 @@ def launch_global_prefill(
             sel_blocks = sel_counts = None
             if eff_topk > 0 and k_mid_cache is not None and k_rad_cache is not None:
                 score_bt = k_bt if (need_v5 and k_bt is not None) else block_table
+                score_lib = fb_lib if (fb_lib is not None and hasattr(fb_lib, "score_kmax_blocks_fp8_sm121_fwd")) else lib
                 sel_blocks, sel_counts = select_topk_blocks_exact_kmax(
                     q, k_mid_cache, k_rad_cache, score_bt, cache_seqlens, cu_seqlens_q,
                     max_seqlen_q, E, BS, H, G, D, num_reqs, eff_topk,
-                    max_seq=max_seq, cuda_lib=lib, k_bt_mode=int(k_bt_mode),
+                    max_seq=max_seq, cuda_lib=score_lib, k_bt_mode=int(k_bt_mode),
                 )
             use_sparse = sel_blocks is not None and sel_counts is not None
             T = q.shape[0]
             acc_buf, m_buf, l_buf = _get_cuda_scratch(q.device, T, H, D)
             stream = int(torch.cuda.current_stream(q.device).cuda_stream)
-            can_v6 = (
-                bool(use_v6_fp8)
-                and int(max_seqlen_q) >= 1024
-                and not torch.cuda.is_current_stream_capturing()
-                and hasattr(lib, "global_sage2_prefix_v6_sm121_fwd")
-            )
+            rc = -1
             if can_v6:
                 eff_pv_f16 = int(_PF_FP8_PV_F16_ACC if pv_f16_acc is None else bool(pv_f16_acc))
                 rc = lib.global_sage2_prefix_v6_sm121_fwd(
@@ -2219,45 +2838,46 @@ def launch_global_prefill(
                     eff_pv_f16,
                     stream,
                 )
-            elif need_v5:
-                rc = lib.global_sage2_prefix_v5_sm121_fwd(
-                    q.data_ptr(), k_fp8_cache.data_ptr(), ks64.data_ptr(), value_cache.data_ptr(),
-                    block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
-                    sel_blocks.data_ptr() if use_sparse else 0,
-                    sel_counts.data_ptr() if use_sparse else 0,
-                    acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
-                    q.stride(0), q.stride(1),
-                    k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
-                    ks64.stride(0), ks64.stride(1),
-                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-                    block_table.stride(0),
-                    int(num_reqs), int(max_seqlen_q), int(H), int(G),
-                    int(BS), int(E), int(p_bn), int(p_min_ctas),
-                    int(sel_blocks.shape[1]) if use_sparse else 0,
-                    float(softmax_scale * LOG2E), float(tau),
-                    k_bt.data_ptr() if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
-                    int(k_bt.stride(0)) if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
-                    int(k_bt_mode),
-                    stream,
-                )
-            else:
-                rc = lib.global_sage2_prefix_v3_sm121_fwd(
-                    q.data_ptr(), k_fp8_cache.data_ptr(), ks64.data_ptr(), value_cache.data_ptr(),
-                    block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
-                    sel_blocks.data_ptr() if use_sparse else 0,
-                    sel_counts.data_ptr() if use_sparse else 0,
-                    acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
-                    q.stride(0), q.stride(1),
-                    k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
-                    ks64.stride(0), ks64.stride(1),
-                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-                    block_table.stride(0),
-                    int(num_reqs), int(max_seqlen_q), int(H), int(G),
-                    int(BS), int(E), int(p_bn), int(p_min_ctas),
-                    int(sel_blocks.shape[1]) if use_sparse else 0,
-                    float(softmax_scale * LOG2E), float(tau),
-                    stream,
-                )
+            if rc != 0 and fb_lib is not None:
+                if need_v5:
+                    rc = fb_lib.global_sage2_prefix_v5_sm121_fwd(
+                        q.data_ptr(), k_fp8_cache.data_ptr(), ks64.data_ptr(), value_cache.data_ptr(),
+                        block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+                        sel_blocks.data_ptr() if use_sparse else 0,
+                        sel_counts.data_ptr() if use_sparse else 0,
+                        acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
+                        q.stride(0), q.stride(1),
+                        k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
+                        ks64.stride(0), ks64.stride(1),
+                        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                        block_table.stride(0),
+                        int(num_reqs), int(max_seqlen_q), int(H), int(G),
+                        int(BS), int(E), int(p_bn), int(p_min_ctas),
+                        int(sel_blocks.shape[1]) if use_sparse else 0,
+                        float(softmax_scale * LOG2E), float(tau),
+                        k_bt.data_ptr() if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
+                        int(k_bt.stride(0)) if (int(k_bt_mode) == 2 and k_bt is not None) else 0,
+                        int(k_bt_mode),
+                        stream,
+                    )
+                else:
+                    rc = fb_lib.global_sage2_prefix_v3_sm121_fwd(
+                        q.data_ptr(), k_fp8_cache.data_ptr(), ks64.data_ptr(), value_cache.data_ptr(),
+                        block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+                        sel_blocks.data_ptr() if use_sparse else 0,
+                        sel_counts.data_ptr() if use_sparse else 0,
+                        acc_buf.data_ptr(), m_buf.data_ptr(), l_buf.data_ptr(),
+                        q.stride(0), q.stride(1),
+                        k_fp8_cache.stride(0), k_fp8_cache.stride(1), k_fp8_cache.stride(2),
+                        ks64.stride(0), ks64.stride(1),
+                        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                        block_table.stride(0),
+                        int(num_reqs), int(max_seqlen_q), int(H), int(G),
+                        int(BS), int(E), int(p_bn), int(p_min_ctas),
+                        int(sel_blocks.shape[1]) if use_sparse else 0,
+                        float(softmax_scale * LOG2E), float(tau),
+                        stream,
+                    )
             if rc == 0:
                 t_bm, t_bn = 128, 64
                 tail_prefix_bn = BS if use_sparse else p_bn
@@ -2274,7 +2894,7 @@ def launch_global_prefill(
                     sg_t, ssk_t, softmax_scale * LOG2E,
                     H=H, E=E, EW=EW, G=G, BS=BS, D=D,
                     BLOCK_M=t_bm, BLOCK_N=t_bn, PREFIX_BN=tail_prefix_bn, FUSE_GS=fuse,
-                    num_warps=4, num_stages=2,
+                    num_warps=4, num_stages=_tail_merge_num_stages(BS, t_bn),
                 )
                 return True
         # Graceful fallback to v2 / v1 if v3 symbol or ks64 absent
@@ -2288,6 +2908,7 @@ def launch_global_prefill(
             p_bn = 64
         if (
             lib is not None
+            and int(k_bt_mode) == 0
             and hasattr(lib, "global_sage2_prefix_v2_sm121_fwd")
             and k_fp8_cache is not None
             and k_scale_cache is not None
@@ -2335,7 +2956,7 @@ def launch_global_prefill(
                     sg_t, ssk_t, softmax_scale * LOG2E,
                     H=H, E=E, EW=EW, G=G, BS=BS, D=D,
                     BLOCK_M=t_bm, BLOCK_N=t_bn, PREFIX_BN=p_bn, FUSE_GS=fuse,
-                    num_warps=4, num_stages=2,
+                    num_warps=4, num_stages=_tail_merge_num_stages(BS, t_bn),
                 )
                 return True
         # Graceful fallback to v1 CUDA (online K quant) if shadow cache or v2 symbol absent
@@ -2387,7 +3008,7 @@ def launch_global_prefill(
                     sg_t, ssk_t, softmax_scale * LOG2E,
                     H=H, E=E, EW=EW, G=G, BS=BS, D=D,
                     BLOCK_M=t_bm, BLOCK_N=t_bn, FUSE_GS=fuse,
-                    num_warps=4, num_stages=2,
+                    num_warps=4, num_stages=_tail_merge_num_stages(BS, t_bn),
                 )
                 return True
         # Graceful fallback to Triton fp8_sage2 if CUDA .so absent/ineligible

@@ -1,0 +1,165 @@
+# Wave-V16 Prometheus Alerting Rules for 8x DGX Spark (GB10 TP8) Inkling-2-Small Serving
+# Scraped from v16_metrics_exporter.py (:9108/metrics) aggregating all 8 Sparks + spark-one:8010/metrics.
+groups:
+  - name: inkling_v16_uma_and_memory
+    interval: 15s
+    rules:
+      - alert: InklingV16NodeSwapHigh
+        expr: inkling_v16_node_swap_mib > 256
+        for: 2m
+        labels:
+          severity: warning
+          component: uma
+          wave: v16
+        annotations:
+          summary: "Spark rank {{ $labels.rank }} ({{ $labels.host }}) swap exceeds 256 MiB"
+          description: "GB10 UMA swap usage is {{ $value | printf \"%.1f\" }} MiB (> 256 MiB threshold). Schedule zero-drop drain + UMA defrag."
+
+      - alert: InklingV16NodeSwapCritical
+        expr: inkling_v16_node_swap_mib > 1024
+        for: 1m
+        labels:
+          severity: critical
+          component: uma
+          wave: v16
+        annotations:
+          summary: "Spark rank {{ $labels.rank }} ({{ $labels.host }}) swap critical (> 1024 MiB)"
+          description: "GB10 UMA swap usage is {{ $value | printf \"%.1f\" }} MiB. Risk of severe LPDDR5X stall or OOMKill."
+
+      - alert: InklingV16BuddyOrder13Fragmented
+        expr: inkling_v16_node_buddy_order13 < 2500
+        for: 5m
+        labels:
+          severity: warning
+          component: uma
+          wave: v16
+        annotations:
+          summary: "Spark rank {{ $labels.rank }} ({{ $labels.host }}) order-13 contiguous blocks < 2500"
+          description: "Contiguous 32 MiB buddy order-13 pool dropped to {{ $value }} (< 2500). Run v15_preboot_uma_guard.sh --auto-reboot-defrag on next maintenance window."
+
+      - alert: InklingV16NodeUMAAvailLow
+        expr: inkling_v16_node_uma_avail_gib < 5.0
+        for: 1m
+        labels:
+          severity: critical
+          component: uma
+          wave: v16
+        annotations:
+          summary: "Spark rank {{ $labels.rank }} ({{ $labels.host }}) UMA MemAvailable < 5.0 GiB"
+          description: "Available unified memory is {{ $value | printf \"%.2f\" }} GiB (< 5.0 GiB runtime guard)."
+
+  - name: inkling_v16_roce_and_gpu
+    interval: 15s
+    rules:
+      - alert: InklingV16RoCEHCADown
+        expr: inkling_v16_node_roce_active_hcas < 4
+        for: 30s
+        labels:
+          severity: critical
+          component: rocev2
+          wave: v16
+        annotations:
+          summary: "Spark rank {{ $labels.rank }} ({{ $labels.host }}) has < 4 active ConnectX-7 RoCEv2 HCAs"
+          description: "Active RoCEv2 HCAs = {{ $value }}/4. Inspect ibstat / link flaps before relaunch."
+
+      - alert: InklingV16GPUXidDetected
+        expr: inkling_v16_node_xid_count > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: gpu
+          wave: v16
+        annotations:
+          summary: "Fatal NVIDIA GPU Xid detected on rank {{ $labels.rank }} ({{ $labels.host }})"
+          description: "Detected {{ $value }} fatal NVRM Xid event(s) in dmesg. Capture crash bundle and inspect hardware."
+
+      - alert: InklingV16GPUTempHigh
+        expr: inkling_v16_node_gpu_temp_c >= 85
+        for: 2m
+        labels:
+          severity: warning
+          component: gpu
+          wave: v16
+        annotations:
+          summary: "GB10 GPU temperature high on rank {{ $labels.rank }} ({{ $labels.host }})"
+          description: "GPU temperature is {{ $value | printf \"%.1f\" }} C (>= 85 C warning threshold)."
+
+      - alert: InklingV16NodeUnreachable
+        expr: inkling_v16_node_up == 0
+        for: 30s
+        labels:
+          severity: critical
+          component: cluster
+          wave: v16
+        annotations:
+          summary: "Spark rank {{ $labels.rank }} ({{ $labels.host }}) unreachable by telemetry exporter"
+          description: "Telemetry collector failed to scrape rank {{ $labels.rank }} ({{ $labels.host }})."
+
+  - name: inkling_v16_kv_and_serving
+    interval: 15s
+    rules:
+      - alert: InklingV16KVLeakAnomaly
+        expr: inkling_v16_kv_audit_anomalies_total > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: kv_cache
+          wave: v16
+        annotations:
+          summary: "KV cache invariant/leak anomaly detected on Inkling-2-Small TP8"
+          description: "KV audit anomaly count is {{ $value }} (> 0). Inspect KVCacheManager logs and run quiescent audit."
+
+      - alert: InklingV16KVPoolNearFull
+        expr: inkling_v16_kv_utilization_ratio > 0.95
+        for: 2m
+        labels:
+          severity: warning
+          component: kv_cache
+          wave: v16
+        annotations:
+          summary: "Unified 14-group KV cache utilization > 95%"
+          description: "KV cache utilization is {{ $value | printf \"%.3f\" }}. Preemptions or prefix evictions imminent."
+
+      - alert: InklingV16CanaryLatencySpike
+        expr: inkling_v16_canary_latency_seconds > 5.0
+        for: 1m
+        labels:
+          severity: warning
+          component: serving
+          wave: v16
+        annotations:
+          summary: "Canary latency spike (> 5.0s) on spark-one:8010"
+          description: "Deterministic canary probe latency reached {{ $value | printf \"%.2f\" }}s (possible TP8 RDMA stall or heavy 1M prefill queueing)."
+
+      - alert: InklingV16CanaryLatencyCritical
+        expr: inkling_v16_canary_latency_seconds > 15.0
+        for: 30s
+        labels:
+          severity: critical
+          component: serving
+          wave: v16
+        annotations:
+          summary: "Canary latency critical (> 15.0s) on spark-one:8010"
+          description: "Canary probe latency reached {{ $value | printf \"%.2f\" }}s. Check for shm_broadcast / RDMA hang."
+
+      - alert: InklingV16VLLMDown
+        expr: inkling_v16_vllm_up == 0
+        for: 30s
+        labels:
+          severity: critical
+          component: serving
+          wave: v16
+        annotations:
+          summary: "Inkling-2-Small vLLM API endpoint (:8010) is DOWN"
+          description: "Exporter cannot reach spark-one:8010/metrics or /health."
+
+      - alert: InklingV16WatchdogCircuitOpen
+        expr: inkling_v16_watchdog_circuit_open == 1
+        for: 0m
+        labels:
+          severity: critical
+          component: watchdog
+          wave: v16
+        annotations:
+          summary: "Cluster watchdog circuit breaker is OPEN"
+          description: "Repeated crash recoveries tripped the circuit breaker. Inspect /var/log/inkling-v15/crash-* and run reset-breaker after hardware repair."

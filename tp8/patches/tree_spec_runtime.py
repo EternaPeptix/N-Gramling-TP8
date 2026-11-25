@@ -31,16 +31,35 @@ import torch
 TREE_SPEC_ENABLED = os.environ.get("INKLING_TREE_SPEC", "0").strip().lower() not in (
     "0", "", "off", "false", "no"
 )
-# Wave-V10 strict B==1-only guard (default OFF for 1dcfb306 invariance; when ON, hard-clamps
-# TREE_SPEC_MAX_B=1 and defaults TREE_WS_MAX=1 root-sibling so B>=2 stays 100% linear with 0% regression!).
-TREE_SPEC_B1_ONLY = os.environ.get("INKLING_TREE_SPEC_B1_ONLY", "0").strip().lower() not in (
-    "0", "", "off", "false", "no"
+# Wave-V16 opt-in Same-Budget M=8 Confidence-Triggered Beam-2 Tree (default OFF -> 100% V15 invariant!).
+# Requires INKLING_TREE_SPEC=1 so target ops (`sync_free.py`, `sconv_ops.py`, `sm12_attn*.py`,
+# `model_l2pf.py`) remain 100% synchronized with `speculator.py` (fail-closed if TREE_SPEC=0!).
+SAME_BUDGET_TREE_V16 = os.environ.get("INKLING_SAME_BUDGET_TREE_V16", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
+SAME_BUDGET_TREE_ACTIVE = bool(TREE_SPEC_ENABLED and SAME_BUDGET_TREE_V16)
+TREE_P1_MAX_V16 = float(os.environ.get("INKLING_TREE_P1_MAX_V16", "0.65") or "0.65")
+TREE_P12_MIN_V16 = float(os.environ.get("INKLING_TREE_P12_MIN_V16", "0.85") or "0.85")
+TREE_TAIL_SURV_MAX_V16 = float(os.environ.get("INKLING_TREE_TAIL_SURV_MAX_V16", "0.12") or "0.12")
+TREE_D1_ENABLE_V16 = os.environ.get("INKLING_TREE_D1_ENABLE_V16", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
+TREE_STRICT_SAME_NLIVE_V16 = os.environ.get("INKLING_TREE_STRICT_SAME_NLIVE_V16", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
+# Wave-V10 strict B==1-only guard (default OFF for 1dcfb306 invariance; when ON or when
+# SAME_BUDGET_TREE_V16=1, hard-clamps TREE_SPEC_MAX_B=1 so B>=2 stays 100% linear with 0% regression!).
+TREE_SPEC_B1_ONLY = (
+    os.environ.get("INKLING_TREE_SPEC_B1_ONLY", "0").strip().lower() not in (
+        "0", "", "off", "false", "no"
+    )
+    or SAME_BUDGET_TREE_ACTIVE
 )
 _TREE_SPEC_MAX_B_RAW = os.environ.get("INKLING_TREE_SPEC_MAX_B", "").strip()
 TREE_SPEC_MAX_B = 1 if TREE_SPEC_B1_ONLY else (max(1, int(_TREE_SPEC_MAX_B_RAW)) if _TREE_SPEC_MAX_B_RAW else 1)
 TREE_SPEC_MAX_M = int(os.environ.get("INKLING_TREE_SPEC_MAX_M", "8") or "8")
 _TREE_WS_MAX_RAW = os.environ.get("INKLING_TREE_WS_MAX", "").strip()
-_TREE_WS_MAX_DEF = "1" if TREE_SPEC_B1_ONLY else "2"
+_TREE_WS_MAX_DEF = "2" if (SAME_BUDGET_TREE_ACTIVE and not TREE_D1_ENABLE_V16) else ("1" if TREE_SPEC_B1_ONLY else "2")
 TREE_WS_MAX = max(1, min(4, int(_TREE_WS_MAX_RAW or _TREE_WS_MAX_DEF)))
 
 # Global registry (mirroring rdma_all_reduce.ROWAR) so target ops (`sconv_ops.py`, `sm12_attn.py`,
@@ -72,9 +91,12 @@ def set_active_batch_size(num_reqs: int) -> bool:
 def get_active_tree_state(num_tokens: int, num_reqs: int | None = None) -> "TreeSpecState | None":
     if not TREE_SPEC_ENABLED or TREE_STATE.get("suppressed", False):
         return None
-    if num_reqs is not None and int(num_reqs) > TREE_SPEC_MAX_B:
-        return None
-    if TREE_SPEC_B1_ONLY and int(TREE_STATE.get("active_b", 1)) > TREE_SPEC_MAX_B:
+    if num_reqs is not None:
+        nr = int(num_reqs)
+        if nr <= 0 or nr > TREE_SPEC_MAX_B:
+            return None
+    active_b = int(TREE_STATE.get("active_b", 1))
+    if active_b <= 0 or active_b > TREE_SPEC_MAX_B:
         return None
     if TREE_STATE.get("scope") == num_tokens:
         return TREE_STATE.get("state")  # type: ignore[return-value]
@@ -231,12 +253,44 @@ class TreeSpecState:
         # Registered per-KV/Conv-group cache pointer tables populated lazily by Inkling2Model
         self.compact_groups: list[dict[str, Any]] | None = None
         self._dummy_pos = torch.zeros((max_m,), dtype=torch.int64, device=self.device)
-        self.reset_linear(max_m)
+        # Pre-built device-resident linear tables for zero-alloc, zero-H2D reset_linear()
+        _lp, _ld, _lanc, _lpath = build_tree_tables([-1] + list(range(max_m - 1)), max_m=max_m)
+        self._lin_parent = torch.from_numpy(_lp).to(self.device)
+        self._lin_depth = torch.from_numpy(_ld).to(self.device)
+        self._lin_sconv_anc = torch.from_numpy(_lanc).to(self.device)
+        self._lin_path = torch.from_numpy(_lpath).to(self.device)
+        self._lin_meta = torch.tensor([0, max_m - 1, 0, max_m], dtype=torch.int32, device=self.device)
+        self._lin_acc_path = torch.arange(max_m, dtype=torch.int32, device=self.device)
+        self._dirty = True
+        self.reset_linear(max_m, force=True)
 
-    def reset_linear(self, n_live: int | None = None) -> None:
-        nl = self.max_m if n_live is None else int(n_live)
+    def mark_dirty(self) -> None:
+        """Mark device tree buffers potentially modified by GPU tree kernels or graph replay."""
+        self._dirty = True
+
+    def reset_linear(self, n_live: int | None = None, *, force: bool = False) -> None:
+        nl = self.max_m if n_live is None else max(1, min(self.max_m, int(n_live)))
+        if not force and not self._dirty and nl == self.max_m:
+            return
+        if nl == self.max_m:
+            self.tree_active.zero_()
+            self.n_live.fill_(self.max_m)
+            self.tree_parent.copy_(self._lin_parent)
+            self.tree_depth.copy_(self._lin_depth)
+            self.tree_sconv_anc.copy_(self._lin_sconv_anc)
+            self.tree_path.copy_(self._lin_path)
+            self.tree_meta.copy_(self._lin_meta)
+            self.accepted_path.copy_(self._lin_acc_path)
+            self.accepted_len.fill_(1)
+            self.needs_compact.zero_()
+            self._dirty = False
+            return
         parents = [-1] + list(range(nl - 1))
         self.set_tree(parents, is_tree=False)
+        self.accepted_path.copy_(self._lin_acc_path)
+        self.accepted_len.fill_(1)
+        self.needs_compact.zero_()
+        self._dirty = True
 
     def set_tree(self, parents: Sequence[int], is_tree: bool | None = None) -> None:
         n_live = len(parents)
@@ -245,10 +299,10 @@ class TreeSpecState:
             is_tree = any(int(parents[i]) != i - 1 for i in range(1, n_live))
         self.tree_active.fill_(1 if is_tree else 0)
         self.n_live.fill_(n_live)
-        self.tree_parent.copy_(torch.from_numpy(p_arr), non_blocking=True)
-        self.tree_depth.copy_(torch.from_numpy(d_arr), non_blocking=True)
-        self.tree_sconv_anc.copy_(torch.from_numpy(anc_arr), non_blocking=True)
-        self.tree_path.copy_(torch.from_numpy(path_arr), non_blocking=True)
+        self.tree_parent.copy_(torch.from_numpy(p_arr), non_blocking=False)
+        self.tree_depth.copy_(torch.from_numpy(d_arr), non_blocking=False)
+        self.tree_sconv_anc.copy_(torch.from_numpy(anc_arr), non_blocking=False)
+        self.tree_path.copy_(torch.from_numpy(path_arr), non_blocking=False)
         best_wp = 0
         for i in range(1, n_live):
             if int(parents[i]) == i - 1:
@@ -257,7 +311,9 @@ class TreeSpecState:
                 break
         rem = n_live - 1 - best_wp
         is_2b = (rem == 0) or (
-            int(parents[best_wp + 1]) == 0
+            rem <= 2
+            and best_wp + rem <= self.max_m - 1
+            and int(parents[best_wp + 1]) == 0
             and all(int(parents[best_wp + 1 + j]) == best_wp + j for j in range(1, rem))
         )
         best_ws = rem if is_2b else 0
@@ -265,7 +321,8 @@ class TreeSpecState:
             [1 if (is_tree and is_2b and best_ws > 0) else 0, best_wp, best_ws, n_live],
             dtype=np.int32,
         )
-        self.tree_meta.copy_(torch.from_numpy(meta_arr), non_blocking=True)
+        self.tree_meta.copy_(torch.from_numpy(meta_arr), non_blocking=False)
+        self._dirty = True
 
     def bind_global(self) -> None:
         TREE_STATE["scope"] = self.max_m
@@ -424,7 +481,9 @@ class ExactDinkelbachTreeSelector:
             p = candidates[i].parent_idx
             assert 0 <= p < i, "Candidates must be topologically ordered"
             children[p].append(i)
-            path_prob[i] = path_prob[p] * max(0.0, min(1.0, candidates[i].cond_prob))
+            cp = float(candidates[i].cond_prob)
+            cp = max(0.0, min(1.0, cp)) if math.isfinite(cp) else 0.0
+            path_prob[i] = path_prob[p] * cp
 
         cap = min(self.max_m, n)
         NEG = -1e18
@@ -546,3 +605,251 @@ def tree_greedy_reject_reference(
     num_rejected = n_scheduled_drafts - acc_depth
     needs_compact = any(accepted_path[d] != d for d in range(len(accepted_path)))
     return sampled, num_sampled, num_rejected, accepted_path, needs_compact
+
+
+def is_root_two_branch_compatible(parents: Sequence[int], max_m: int = 8, max_ws: int = 2) -> tuple[bool, int, int]:
+    """Check whether topological `parents` matches the 0-ULP 4-tile BM=16 two-branch format
+    (`[tree_active, best_wp, best_ws, n_live]` in `fused_decode_attn_exact_sm121_v14`).
+
+    Returns `(is_2b_root, best_wp, best_ws)`.
+    A depth-1 fork (`parents[best_wp + 1] == 1`) returns `(False, best_wp, 0)` so it NEVER
+    silently misroutes into the root-only 4-tile BM=16 attention kernel!
+    """
+    n_live = len(parents)
+    if n_live <= 0 or n_live > max_m or int(parents[0]) != -1:
+        return False, 0, 0
+    best_wp = 0
+    for i in range(1, n_live):
+        if int(parents[i]) == i - 1:
+            best_wp = i
+        else:
+            break
+    rem = n_live - 1 - best_wp
+    if rem == 0:
+        return True, best_wp, 0
+    if rem > max_ws or best_wp < 1:
+        return False, best_wp, 0
+    if int(parents[best_wp + 1]) != 0:
+        return False, best_wp, 0
+    for j in range(1, rem):
+        if int(parents[best_wp + 1 + j]) != best_wp + j:
+            return False, best_wp, 0
+    return True, best_wp, rem
+
+
+@dataclass(frozen=True)
+class SameBudgetTreeConfig:
+    """Configuration for Wave-V16 Same-Budget M=8 Confidence-Triggered Beam-2 Tree."""
+
+    max_m: int = 8
+    ws_max: int = 2
+    p1_max: float = 0.65          # Trigger branch only on uncertain split: p_1 < 0.65
+    p12_min: float = 0.85         # AND top-2 mass covers >= 85%: p_1 + p_2 >= 0.85
+    tail_surv_max: float = 0.12   # Replace ONLY doomed tail slots with p_cum < 0.12
+    sib_disc: float = 0.0
+    sib_penalty_ms: float = 0.10
+    sib_scale: float = 0.85
+    p2_min: float = 0.10
+    d1_enable: bool = False       # Default False -> 100% 4-tile BM=16 fused SM121a compatible
+    strict_same_nlive: bool = False  # If True, also caps wp + ws <= max(w_lin, 2)
+
+
+@dataclass
+class SameBudgetTreeDecision:
+    tokens: list[int]             # [n_live] draft token IDs (tokens[0] = anchor)
+    parents: list[int]            # [n_live] topological parents (parents[0] = -1)
+    depths: list[int]             # [n_live] node depths (depths[0] = 0)
+    best_wp: int                  # primary chain length (0..max_m-1)
+    best_ws: int                  # secondary branch length (0..ws_max)
+    fork_depth: int               # -1=linear, 0=root fork (parent=0), 1=depth-1 fork (parent=1)
+    is_branched: bool             # True iff best_ws > 0
+    expected_tokens: float        # E[num_sampled]
+    dinkelbach_obj: float         # E[num_sampled] - lam * lat
+    tree_meta: tuple[int, int, int, int]  # [meta_active_2b, best_wp, best_ws_2b, n_live]
+
+
+def select_same_budget_beam2_tree(
+    *,
+    anchor_token: int,
+    prim_tokens: Sequence[int],     # [K] K=max_m-1 (7 for M=8)
+    prim_p1: Sequence[float],       # [K] raw drafter p1
+    prim_c: Sequence[float],        # [K] calibrated conditional acceptance probs c[0..K-1]
+    sec0_tokens: Sequence[int],     # [>=ws_max] root-fork secondary tokens (t2_0, st1, ...)
+    sec0_p: Sequence[float],        # [>=ws_max] raw p2_0, sp1, ...
+    sec0_c: Sequence[float],        # [>=ws_max] calibrated cs1, cs2, ... for positions >= 1
+    step_ms: Sequence[float],       # [max_m] step latency for tot_w = 0..max_m-1
+    lam: float,
+    cfg: SameBudgetTreeConfig = SameBudgetTreeConfig(),
+    sec1_token: int = -1,           # optional depth-1 fork (parent=1) token t2_1
+    sec1_p2: float = 0.0,           # optional depth-1 raw p2_1
+) -> SameBudgetTreeDecision:
+    """Wave-V16 Same-Budget `M=8` Confidence-Triggered Beam-2 Tree Selector.
+
+    Matched bit-for-bit by GPU `_tree_dink_select_pack_kernel(..., SAME_BUDGET_V16=True)`:
+      1. Computes exact linear baseline `w_lin` & primary survival `surv_p[0..K-1]`.
+      2. Counts healthy primary slots `w_floor` with `surv_p[k] >= cfg.tail_surv_max`.
+         ONLY doomed tail slots (`k >= w_floor`, where `surv_p[k] < 0.12` or `prim_tokens[k] < 0`)
+         are eligible for replacement inside the exact same `M=8` budget (`1 + wp + ws <= max_m`).
+      3. Triggers Beam-2 branching ONLY when `d = 0` (or `d = 1` when `cfg.d1_enable=True`)
+         exhibits an uncertain 2-way split (`p_1 < p1_max` AND `p_1 + p_2 >= p12_min`) AND
+         replacing doomed tail slots strictly improves the Dinkelbach renewal-reward objective!
+      4. When `is_branched == False`: emits exact linear `w_lin` with `tree_meta = (0, w_lin, 0, 1 + w_lin)`
+         -> 0.00 us overhead in `sm12_attn` / `fused_decode_attn_exact_sm121_v14`!
+    """
+    max_k = cfg.max_m - 1
+    pt = [int(prim_tokens[k]) if k < len(prim_tokens) else -1 for k in range(max_k)]
+    pp = [
+        float(prim_p1[k]) if (k < len(prim_p1) and math.isfinite(float(prim_p1[k]))) else 0.0
+        for k in range(max_k)
+    ]
+    pc = [
+        max(0.0, min(1.0, float(prim_c[k]))) if (k < len(prim_c) and math.isfinite(float(prim_c[k]))) else 0.0
+        for k in range(max_k)
+    ]
+    lam_f = float(lam) if math.isfinite(float(lam)) and float(lam) > 0.0 else 0.0
+
+    # Step 1: Linear baseline + primary survival + healthy floor w_floor
+    surv_p: list[float] = []
+    gp_tbl: list[float] = [1.0]
+    prim_alive_tbl: list[bool] = [True]
+    s_acc = 1.0
+    alive = True
+    w_floor = 0
+    best_lin_obj = 1.0 - lam_f * float(step_ms[0])
+    w_lin = 0
+    for k in range(max_k):
+        if pt[k] < 0:
+            alive = False
+        prim_alive_tbl.append(alive)
+        s_acc = (s_acc * pc[k]) if alive else 0.0
+        surv_p.append(s_acc)
+        gp_tbl.append(gp_tbl[-1] + s_acc)
+        if alive and s_acc >= cfg.tail_surv_max:
+            w_floor = k + 1
+        if alive:
+            obj_k = gp_tbl[k + 1] - lam_f * float(step_ms[k + 1])
+            if obj_k > best_lin_obj:
+                best_lin_obj = obj_k
+                w_lin = k + 1
+
+    # Always preserve at least root primary child when branching (wp >= 1) and never evict healthy slots
+    w_floor_d0 = max(1, w_floor)
+    max_tot_w = min(max_k, max(w_lin, 2)) if cfg.strict_same_nlive else max_k
+
+    best_obj = best_lin_obj
+    best_wp = w_lin
+    best_ws = 0
+    best_fork = -1
+    best_exp = gp_tbl[w_lin]
+
+    # Step 2: Depth-0 uncertain-split trigger (100% 4-tile BM=16 fused SM121a compatible!)
+    p1_0 = max(1e-6, min(1.0 - 1e-6, pp[0]))
+    p2_0_raw = float(sec0_p[0]) if len(sec0_p) > 0 and math.isfinite(float(sec0_p[0])) else 0.0
+    p2_0 = max(0.0, min(1.0, p2_0_raw))
+    t2_0 = int(sec0_tokens[0]) if len(sec0_tokens) > 0 else -1
+    d0_trigger = (
+        prim_alive_tbl[1]
+        and t2_0 >= 0
+        and t2_0 != pt[0]
+        and p2_0 >= cfg.p2_min
+        and p1_0 < cfg.p1_max
+        and (p1_0 + p2_0) >= cfg.p12_min
+    )
+    if d0_trigger:
+        q2_obs = min(p2_0 / max(1.0 - p1_0, 1e-4), 0.95)
+        s0 = (1.0 - pc[0]) * q2_obs * cfg.sib_scale
+        gs_tbl = [0.0, s0]
+        sec_ok = [True, True]
+        sc_acc = s0
+        for j in range(1, cfg.ws_max):
+            tj = int(sec0_tokens[j]) if j < len(sec0_tokens) else -1
+            cj = (
+                max(0.0, min(1.0, float(sec0_c[j - 1])))
+                if (j - 1 < len(sec0_c) and math.isfinite(float(sec0_c[j - 1])))
+                else 0.0
+            )
+            ok_j = sec_ok[-1] and (tj >= 0)
+            sec_ok.append(ok_j)
+            sc_acc = (sc_acc * cj) if ok_j else 0.0
+            gs_tbl.append(gs_tbl[-1] + sc_acc)
+        for wp in range(w_floor_d0, max_k + 1):
+            if not prim_alive_tbl[wp]:
+                break
+            for ws in range(1, min(cfg.ws_max, max_tot_w - wp) + 1):
+                if not sec_ok[ws]:
+                    continue
+                tot_w = wp + ws
+                lat_hi = float(step_ms[tot_w])
+                lat_lo = float(step_ms[tot_w - 1])
+                lat = lat_hi + cfg.sib_penalty_ms - cfg.sib_disc * (lat_hi - lat_lo)
+                exp_t = gp_tbl[wp] + gs_tbl[ws]
+                obj = exp_t - lam_f * lat
+                if obj > best_obj:
+                    best_obj = obj
+                    best_wp = wp
+                    best_ws = ws
+                    best_fork = 0
+                    best_exp = exp_t
+
+    # Step 3: Optional Depth-1 uncertain-split trigger (canonical-lane HAS_TREE mode, d1_enable=True)
+    if cfg.d1_enable and max_k >= 3 and prim_alive_tbl[2]:
+        p1_1 = max(1e-6, min(1.0 - 1e-6, pp[1]))
+        p2_1 = max(0.0, min(1.0, float(sec1_p2) if math.isfinite(float(sec1_p2)) else 0.0))
+        d1_trigger = (
+            int(sec1_token) >= 0
+            and int(sec1_token) != pt[1]
+            and p2_1 >= cfg.p2_min
+            and p1_1 < cfg.p1_max
+            and (p1_1 + p2_1) >= cfg.p12_min
+        )
+        w_floor_d1 = max(2, w_floor)
+        if d1_trigger and w_floor_d1 + 1 <= max_tot_w:
+            q2_1 = min(p2_1 / max(1.0 - p1_1, 1e-4), 0.95)
+            s1 = pc[0] * (1.0 - pc[1]) * q2_1 * cfg.sib_scale
+            for wp in range(w_floor_d1, max_tot_w):
+                if not prim_alive_tbl[wp]:
+                    break
+                tot_w = wp + 1
+                lat_hi = float(step_ms[tot_w])
+                lat_lo = float(step_ms[tot_w - 1])
+                lat = lat_hi + cfg.sib_penalty_ms - cfg.sib_disc * (lat_hi - lat_lo)
+                exp_t = gp_tbl[wp] + s1
+                obj = exp_t - lam_f * lat
+                if obj > best_obj:
+                    best_obj = obj
+                    best_wp = wp
+                    best_ws = 1
+                    best_fork = 1
+                    best_exp = exp_t
+
+    # Pack primary nodes first so needs_compact == 0 whenever primary branch wins!
+    tokens = [int(anchor_token)] + [pt[k] for k in range(best_wp)]
+    parents = [-1] + [k for k in range(best_wp)]
+    depths = [0] + [k + 1 for k in range(best_wp)]
+    if best_ws > 0 and best_fork == 0:
+        for j in range(best_ws):
+            tokens.append(int(sec0_tokens[j]))
+            parents.append(0 if j == 0 else best_wp + j)
+            depths.append(1 + j)
+    elif best_ws == 1 and best_fork == 1:
+        tokens.append(int(sec1_token))
+        parents.append(1)
+        depths.append(2)
+
+    n_live = len(tokens)
+    is_branched = best_ws > 0
+    is_2b_ok, wp_2b, ws_2b = is_root_two_branch_compatible(parents, max_m=cfg.max_m, max_ws=2)
+    meta_active = 1 if (is_branched and is_2b_ok and ws_2b > 0) else 0
+    tree_meta = (meta_active, wp_2b if meta_active else best_wp, ws_2b if meta_active else 0, n_live)
+    return SameBudgetTreeDecision(
+        tokens=tokens,
+        parents=parents,
+        depths=depths,
+        best_wp=best_wp,
+        best_ws=best_ws,
+        fork_depth=best_fork,
+        is_branched=is_branched,
+        expected_tokens=best_exp,
+        dinkelbach_obj=best_obj,
+        tree_meta=tree_meta,
+    )

@@ -26,6 +26,10 @@ _DSPARK_V7_LIB_PATH = os.environ.get(
 )
 # At C=2..8 (2 <= rows <= 8), BM=8 fold_argmax_tc uses 144 slices (3.0x48 exact waves!)
 _MARKOV_FOLD_C48_SLICES = int(os.environ.get("INKLING_MARKOV_FOLD_C48_SLICES", "144") or "144")
+# Wave-V14: Opt-in 4-CTA/SM full-wave slice auto-bump (192 = 4.0x48 for BM=8 __launch_bounds__(128,4), default OFF=0).
+_MARKOV_FOLD_C48_AUTO_SLICES = os.environ.get("INKLING_MARKOV_FOLD_C48_AUTO_SLICES", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
 # Wave-V9: Opt-in wiring for already-compiled `dspark_select_and_rnn_step_v7_fwd` cross-step fusion
 # (eliminates K-1 launches + overlaps STATE_I load/GEMM behind RDMA_AG across B=1..32, default OFF).
 _MARKOV_FUSE_CROSS_STEP = os.environ.get("INKLING_MARKOV_FUSE_CROSS_STEP", "0").strip().lower() not in (
@@ -3026,6 +3030,7 @@ def run_markov_loop_v9_fused(
             and q.get("select_rnn_tc_es_ok", False)
             and q.get("fold_tc_skip_ok", False)
             and "es_pp_surv_b" in ws
+            and (conf_buf is not None or _CONF_SINK is not None)
         ):
             return False
     use_fp8 = fold_w8 is not None and fold_s8 is not None
@@ -3048,7 +3053,8 @@ def run_markov_loop_v9_fused(
     comm = getattr(get_tp_group().device_communicator, "rdma_comm", None)
     use_pdl = _DRAFT_PDL if pdl is None else bool(pdl)
     stream = int(torch.cuda.current_stream(base_logits.device).cuda_stream)
-    base_slices = _MARKOV_FOLD_C48_SLICES if (2 <= rows <= 8) else (_MARKOV_FOLD_TC_SLICES if rows >= 2 else _MARKOV_FOLD_SLICES)
+    _c48_slices = 192 if (_MARKOV_FOLD_C48_AUTO_SLICES and valid >= 16384) else _MARKOV_FOLD_C48_SLICES
+    base_slices = _c48_slices if (2 <= rows <= 8) else (_MARKOV_FOLD_TC_SLICES if rows >= 2 else _MARKOV_FOLD_SLICES)
     slices = min(base_slices, max(48, triton.cdiv(valid, 32)))
     ch = triton.cdiv(triton.cdiv(valid, slices), 8) * 8
     if rows * slices * 4 > ws["mk_rec"].numel():
@@ -3615,7 +3621,7 @@ def gathered_fold_argmax_fused(
         else None
     )
     if v7_lib is not None and 2 <= rows <= 8:
-        base_slices = _MARKOV_FOLD_C48_SLICES
+        base_slices = 192 if (_MARKOV_FOLD_C48_AUTO_SLICES and valid >= 16384) else _MARKOV_FOLD_C48_SLICES
     else:
         base_slices = _MARKOV_FOLD_TC_SLICES if rows >= 2 else _MARKOV_FOLD_SLICES
     # Dynamically clamp slices for pruned vocabularies so we never launch empty CTAs or pad NP2=512.

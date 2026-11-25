@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import operator
 import os
 import sys
 import threading
@@ -103,6 +104,8 @@ FUSED_DT_PREP_MAX_B = max(1, int(os.environ.get("INKLING_FUSED_DT_PREP_MAX_B", "
 FUSED_EMBED_DIRECT = os.environ.get("INKLING_FUSED_EMBED_DIRECT", "1").strip().lower() not in _OFF
 FUSED_DRAFT_STORE = os.environ.get("INKLING_FUSED_DRAFT_STORE", "1").strip().lower() not in _OFF
 PREFILL_PREWARM = os.environ.get("INKLING_PREFILL_PREWARM", "0").strip().lower() not in _OFF
+PF_SCRATCH_RELEASE_IDLE = os.environ.get("INKLING_PF_SCRATCH_RELEASE_IDLE", "0").strip().lower() not in _OFF
+PF_RELEASE_SHADOW_K_IDLE = os.environ.get("INKLING_PF_RELEASE_SHADOW_K_IDLE", "0").strip().lower() not in _OFF
 DTGRAPH_FASTPATH = os.environ.get("INKLING_DTGRAPH_FASTPATH", "0").strip().lower() not in _OFF
 FUSED_DT_PREP_INLINE_B8 = os.environ.get("INKLING_FUSED_DT_PREP_INLINE_B8", "0").strip().lower() not in _OFF
 # Wave-V9: Prewarm fused_dt_prep Triton kernels (bn & bn_inline) using real live runner buffer
@@ -128,6 +131,31 @@ STATIC_DT_FORCE_GPU_BT = os.environ.get("INKLING_DTGRAPH_STATIC_DT_FORCE_GPU_BT"
 #   - Pre-compiles AttentionMetadata refresh plan once at "dt" cert (eliminates per-step hasattr/id/cloned dict).
 #   - Defers B=2..8 _dt_prep_ptr_sig warmup probe until static "dt" cert misses & avoids duplicate idx_tuple.
 FAST_REPLAY_V11 = os.environ.get("INKLING_DTGRAPH_FAST_REPLAY_V11", "0").strip().lower() not in _OFF
+# Wave-V14 opt-in zero-overhead host replay loop on certified static "dt"+"td" replay (default OFF = 0, 0-ULP exact!):
+#   - Direct pre-bound cudaGraphExec_t launch with O(1) MRU stream/exec handles & pre-interned stat keys.
+#   - Compiled flat zero-alloc pointer/batch validators for "dt" and unified single-pass "td" (eliminates
+#     per-step nested ptr_sig tuples, _collect_dt_* traversals, duplicate spec queries, & set() allocs).
+#   - 4-slot pre-allocated InputBatch NumPy/Tensor ring + positional dataclass constructor (0 dict copy/kwargs).
+#   - 4-slot pre-cloned AttentionMetadata ring (0 copy.copy(), 0 48-key dict rebuilds, 0 sl_t.numpy()/np.max).
+#   - Cached inputs_embeds & draft_tokens slice views + zero-alloc B=2..8 eligibility checks.
+FAST_REPLAY_V14 = os.environ.get("INKLING_DTGRAPH_FAST_REPLAY_V14", "0").strip().lower() not in _OFF
+# Wave-V16 opt-in sub-25us zero-alloc static replay + O(1) 2D Dynamic-K LUT + fused step_meta_stamp
+# + SyncFree-Temp (temp > 0) static replay compatibility (strictly default OFF = 0, 0-ULP exact!):
+#   - Direct integer-keyed 2D LUT `dt_exec_lut[b][k]` (B=1..32, K=0..15) & `td_exec_lut[b][k][slot]`
+#     (0 tuple creation, 0 dict hashing, instant O(1) Dynamic-K K=7/11/15 switching + C=32 support!).
+#   - Fused single-call `step_meta_stamp` updating pre-built 4-slot InputBatch + AttentionMetadata ring
+#     slots in-place (0 InputBatch alloc, 0 AttentionMetadata copy/seq_lens_cpu churn, 4-slot non-aliasing!).
+#   - Compiled straight-line per-cert validator + direct inline cudaGraphLaunch (0 loop/attrgetter/wrapper frames).
+#   - Pre-validated V16 graph certification supporting BOTH temp == 0 (SyncFree greedy) AND temp > 0
+#     (SyncFree-Temp zero-sync GPU rejection sampling, including static GPU draft_logits) fail-closed!
+FAST_REPLAY_V16 = os.environ.get("INKLING_DTGRAPH_FAST_REPLAY_V16", "0").strip().lower() not in _OFF
+STATIC_TEMP_REPLAY_V16 = os.environ.get(
+    "INKLING_DTGRAPH_STATIC_TEMP_V16", "1" if FAST_REPLAY_V16 else "0"
+).strip().lower() not in _OFF
+_LUT_MAX_B = 32
+_LUT_MAX_K = 15
+_STAT_STATIC_REPLAY_DT = "static_replay:dt"
+_STAT_STATIC_REPLAY_TD = "static_replay:td"
 SLOT_BYTES = 64 * 1024
 NSLOT = 4
 ALIGN = 256
@@ -624,12 +652,17 @@ class TorchBackend:
         self._stream_handles: dict[int, object] = {}
         self._default_streams: dict[int, int] = {}
         self._cuda_ok = None
+        self._rt_launch = None
+        self._last_cs: int = -1
+        self._last_st_h = None
+        self._last_mru_key = None
         if update:
             try:
                 from cuda.bindings import runtime as cudart  # noqa: PLC0415
 
                 self.cudart = cudart
                 self._cuda_ok = cudart.cudaError_t.cudaSuccess
+                self._rt_launch = cudart.cudaGraphLaunch
             except Exception as e:  # noqa: BLE001
                 warnings.warn(
                     f"INKLING_DTGRAPH update: cuda.bindings unavailable ({e}); instantiate mode"
@@ -687,11 +720,14 @@ class TorchBackend:
         self.execs[key] = g
         self.exec_gen[key] = self.exec_gen.get(key, 0) + 1
         self.execs.move_to_end(key)
+        self._last_mru_key = key
         if self.max_execs > 0:
             while len(self.execs) > self.max_execs:
                 ek, evicted = self.execs.popitem(last=False)
                 self._exec_handles.pop(id(evicted), None)
                 self.exec_gen.pop(ek, None)
+                if self._last_mru_key == ek:
+                    self._last_mru_key = None
                 self.evictions += 1
 
     def _update_launch(self, g, key: tuple, stream) -> bool:
@@ -728,6 +764,7 @@ class TorchBackend:
                 self.update_fail += 1
                 return False
             self.execs.move_to_end(key)
+            self._last_mru_key = key
             self.exec_gen[key] = self.exec_gen.get(key, 0) + 1
             return True
         except Exception as e:  # noqa: BLE001
@@ -767,6 +804,83 @@ class TorchBackend:
         replay = _ORIG.get("CUDAGraph.replay", torch.cuda.CUDAGraph.replay)
         replay(owner)
         self.execs.move_to_end(key)
+        self._last_mru_key = key
+        self.static_replay_hits += 1
+        return True
+
+    def get_static_exec_bundle(self, key: tuple):
+        """Resolve (owner, cudaGraphExec_t_or_None, exec_gen) once at certification time."""
+        owner = self.execs.get(key)
+        if owner is None:
+            return None
+        gen = self.exec_gen.get(key)
+        ex = None
+        rt = self.cudart
+        if rt is not None:
+            oid = id(owner)
+            ex = self._exec_handles.get(oid)
+            if ex is None:
+                try:
+                    ex = rt.cudaGraphExec_t(init_value=owner.raw_cuda_graph_exec())
+                    self._exec_handles[oid] = ex
+                except Exception:  # noqa: BLE001
+                    ex = None
+        return owner, ex, gen
+
+    def replay_static_v14(
+        self,
+        key: tuple,
+        owner,
+        ex_handle,
+        expected_gen: int | None,
+        stream,
+    ) -> bool:
+        """Zero-alloc direct static launch with O(1) MRU stream/exec handle caching (100% fail-closed)."""
+        if self.execs.get(key) is not owner:
+            return False
+        if expected_gen is not None and self.exec_gen.get(key) != expected_gen:
+            return False
+        rt = self.cudart
+        if rt is not None:
+            ex = ex_handle
+            if ex is None:
+                oid = id(owner)
+                ex = self._exec_handles.get(oid)
+                if ex is None:
+                    try:
+                        ex = rt.cudaGraphExec_t(init_value=owner.raw_cuda_graph_exec())
+                        self._exec_handles[oid] = ex
+                    except Exception:  # noqa: BLE001
+                        return False
+            cs = stream.cuda_stream
+            if cs == self._last_cs:
+                st_h = self._last_st_h
+            else:
+                st_h = self._stream_handles.get(cs)
+                if st_h is None:
+                    try:
+                        st_h = rt.cudaStream_t(init_value=cs)
+                    except Exception:  # noqa: BLE001
+                        return False
+                    if len(self._stream_handles) < 64:
+                        self._stream_handles[cs] = st_h
+                self._last_cs = cs
+                self._last_st_h = st_h
+            try:
+                launch_fn = self._rt_launch if self._rt_launch is not None else rt.cudaGraphLaunch
+                res = launch_fn(ex, st_h)
+            except Exception:  # noqa: BLE001
+                return False
+            err = res[0] if type(res) is tuple else res
+            ok_code = self._cuda_ok
+            if err != (ok_code if ok_code is not None else rt.cudaError_t.cudaSuccess):
+                return False
+        else:
+            replay = _ORIG.get("CUDAGraph.replay", torch.cuda.CUDAGraph.replay)
+            replay(owner)
+        if self._last_mru_key is not key:
+            self.execs.move_to_end(key)
+            self._last_mru_key = key
         self.static_replay_hits += 1
         return True
 
@@ -901,6 +1015,24 @@ class Region:
         if not self.b.replay_static(key, stream):
             return False
         self.stats[f"static_replay:{region_name}"] += 1
+        self.n += 1
+        return True
+
+    def replay_static_region_v14(
+        self,
+        stream,
+        stat_key: str,
+        exec_key: tuple,
+        exec_owner,
+        exec_handle,
+        expected_exec_gen: int | None,
+    ) -> bool:
+        """Zero-alloc static replay using pre-resolved exec bundle & pre-interned stat key."""
+        if self.active:
+            return False
+        if not self.b.replay_static_v14(exec_key, exec_owner, exec_handle, expected_exec_gen, stream):
+            return False
+        self.stats[stat_key] += 1
         self.n += 1
         return True
 
@@ -1167,6 +1299,37 @@ class _RunnerState:
         self.dt_immutable_idx_bufs: OrderedDict[tuple, torch.Tensor] = OrderedDict()
         self.dt_bt_mode: str | None = None
         self.dt_sconv_builders: list | None = None
+        # Wave-V14 host fast-replay caches (strictly inactive unless INKLING_DTGRAPH_FAST_REPLAY_V14=1)
+        self._last_nondef_cs: int = -1
+        self._sf_ring_mod = None
+        self._sf_ring_mod_probed: bool = False
+        self._tree_spec_mod = None
+        self._tree_spec_mod_probed: bool = False
+        self._dt_sconv_shared: tuple = ()
+        self.dt_last_cert: dict | None = None
+        self.dt_last_sl: tuple | None = None
+        self._orig_qrfg = None
+        self._td_last_cert_by_slot: list = [None] * NSLOT
+        self._td_spec_cache: tuple | None = None
+        # Wave-V16 sub-25us host replay caches (strictly inactive unless INKLING_DTGRAPH_FAST_REPLAY_V16=1)
+        self.dt_exec_lut: list[list] = [[None] * (_LUT_MAX_K + 1) for _ in range(_LUT_MAX_B + 1)]
+        self.dt_fn_lut: list[list] = [[None] * (_LUT_MAX_K + 1) for _ in range(_LUT_MAX_B + 1)]
+        self.td_exec_lut: list[list[list]] = [
+            [[None] * NSLOT for _ in range(_LUT_MAX_K + 1)] for _ in range(_LUT_MAX_B + 1)
+        ]
+        self.td_fn_lut: list[list[list]] = [
+            [[None] * NSLOT for _ in range(_LUT_MAX_K + 1)] for _ in range(_LUT_MAX_B + 1)
+        ]
+        self._dt_v16_pa_ready = None
+        self._dt_v16_ie_ready = None
+        self._dt_v16_ie_meta = None
+        self._dt_v16_hit: bool = False
+        self._td_v16_armed = None
+        self._td_v16_hit: bool = False
+        self._sf_clear_fn = None
+        self._sf_get_ring_fn = None
+        self._sf_fence_fn = None
+        self._v16_imm_idx_by_ptr: dict[int, torch.Tensor] = {}
         try:
             from vllm.distributed import get_tensor_model_parallel_rank  # noqa: PLC0415
 
@@ -2010,9 +2173,27 @@ def _bn_prep_eligible(runner, scheduler_output, batch_req_state, batch_desc) -> 
     if num_tokens_after_padding > 512:
         return False
     nst_np = batch_req_state.num_scheduled_tokens
+    has_drafts = bool(getattr(scheduler_output, "scheduled_spec_decode_tokens", None))
+    if FAST_REPLAY_V14 and num_reqs <= 8:
+        ncpf = batch_req_state.num_computed_prefill_tokens_np
+        pfl = batch_req_state.prefill_len_np
+        if has_drafts:
+            nd_np = batch_req_state.num_draft_tokens_np
+            if nd_np is None:
+                return False
+            ql_m1 = q_len - 1
+            for _i in range(num_reqs):
+                if int(nst_np[_i]) != q_len or int(nd_np[_i]) != ql_m1 or int(ncpf[_i]) < int(pfl[_i]):
+                    return False
+        else:
+            if q_len != 1:
+                return False
+            for _i in range(num_reqs):
+                if int(nst_np[_i]) != 1 or int(ncpf[_i]) < int(pfl[_i]):
+                    return False
+        return getattr(runner, "device", None) is not None and runner.device.type == "cuda"
     if not bool(np.all(nst_np == q_len)):
         return False
-    has_drafts = bool(getattr(scheduler_output, "scheduled_spec_decode_tokens", None))
     if has_drafts:
         nd_np = batch_req_state.num_draft_tokens_np
         if nd_np is None or not bool(np.all(nd_np == (q_len - 1))):
@@ -2149,19 +2330,28 @@ def _get_dt_immutable_idx_cpu(
         buf = torch.empty((len(idx_mapping_np),), dtype=dtype)
     np.copyto(buf.numpy(), idx_mapping_np, casting="unsafe")
     st.dt_immutable_idx_bufs[key] = buf
+    if FAST_REPLAY_V16:
+        st._v16_imm_idx_by_ptr[int(buf.data_ptr())] = buf
     if st.region is not None:
         st.region.immutable_ptrs.add(int(buf.data_ptr()))
     max_imm = max(64, STATIC_DT_MAX_CERTS * 2)
     while len(st.dt_immutable_idx_bufs) > max_imm:
         _, old_buf = st.dt_immutable_idx_bufs.popitem(last=False)
         old_ptr = int(old_buf.data_ptr())
+        if FAST_REPLAY_V16:
+            st._v16_imm_idx_by_ptr.pop(old_ptr, None)
         if st.region is not None:
             st.region.immutable_ptrs.discard(old_ptr)
         stale_keys = [
             ck for ck, c in st.dt_static_cert.items() if c.get("imm_idx_ptr") == old_ptr
         ]
         for ck in stale_keys:
-            st.dt_static_cert.pop(ck, None)
+            _ev_c = st.dt_static_cert.pop(ck, None)
+            if _ev_c is not None:
+                if st.dt_last_cert is _ev_c:
+                    st.dt_last_cert = None
+                if FAST_REPLAY_V16:
+                    _evict_dt_v16_lut(st, _ev_c)
     return buf
 
 
@@ -2606,7 +2796,7 @@ def prewarm_prefill_c32(runner) -> dict[str, int | float]:
                             and wg.is_cuda
                             and wg.dtype == torch.bfloat16
                             and wg.ndim == 2
-                            and wg.untyped_storage().size() > 0
+                            and (wg.untyped_storage().size() > 0 or getattr(wg, "_inkling_router_bf12", None) is not None)
                         ):
                             _lin._get_cached_w_fp8(wg, mode)
                             summary["fp8_weights"] += 1
@@ -2632,6 +2822,12 @@ def prewarm_prefill_c32(runner) -> dict[str, int | float]:
     # 4. Sync warmup work cleanly before serving traffic
     try:
         torch.cuda.synchronize(device)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from . import host_pin as _hp_uma
+
+        _hp_uma.reclaim_host_uma(empty_cuda=True, tag="post_prewarm_prefill")
     except Exception:  # noqa: BLE001
         pass
     summary["ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
@@ -2781,11 +2977,36 @@ def _ensure_region(st: _RunnerState):
                 CFG["max_reqs"],
                 CFG["max_execs"],
             )
+    if FAST_REPLAY_V14 or FAST_REPLAY_V16:
+        if not _ORIG.get("_rdma"):
+            _hook_rdma()
+        stream = torch.cuda.current_stream()
+        cs = stream.cuda_stream
+        if cs != st._last_nondef_cs:
+            if st.region.b.is_default(stream):
+                raise RuntimeError("current stream is the default stream")
+            st._last_nondef_cs = cs
+        return stream
     _hook_rdma()
     stream = torch.cuda.current_stream()
     if st.region.b.is_default(stream):
         raise RuntimeError("current stream is the default stream")
     return stream
+
+
+def _get_sf_ring_mod_v14(st: _RunnerState):
+    """Per-runner cached sync_free module lookup (zero sys.modules scan on steady-state steps)."""
+    m = st._sf_ring_mod
+    if m is not None:
+        return m
+    if st._sf_ring_mod_probed:
+        return None
+    m = _get_sync_free_ring_mod()
+    if m is not None:
+        st._sf_ring_mod = m
+    else:
+        st._sf_ring_mod_probed = True
+    return m
 
 
 _SF_RING_MOD_CACHE = None
@@ -2832,6 +3053,62 @@ def _postprocess_args_match_ring(
     want_s, want_ns, want_nr = ring_state[1], ring_state[2], ring_state[3]
     if want_s == 0 or want_ns == 0 or want_nr == 0:
         return False
+    if FAST_REPLAY_V14:
+        hit_s = False
+        hit_ns = False
+        hit_nr = False
+        for val in args:
+            if val is None:
+                continue
+            if isinstance(val, torch.Tensor):
+                p = val.data_ptr()
+                if p == want_s:
+                    hit_s = True
+                elif p == want_ns:
+                    hit_ns = True
+                elif p == want_nr:
+                    hit_nr = True
+                if hit_s and hit_ns and hit_nr:
+                    return True
+            else:
+                t = getattr(val, "sampled_token_ids", None)
+                if isinstance(t, torch.Tensor) and t.data_ptr() == want_s:
+                    hit_s = True
+                t = getattr(val, "num_sampled", None)
+                if isinstance(t, torch.Tensor) and t.data_ptr() == want_ns:
+                    hit_ns = True
+                t = getattr(val, "num_rejected", None)
+                if isinstance(t, torch.Tensor) and t.data_ptr() == want_nr:
+                    hit_nr = True
+                if hit_s and hit_ns and hit_nr:
+                    return True
+        if kwargs:
+            for val in kwargs.values():
+                if val is None:
+                    continue
+                if isinstance(val, torch.Tensor):
+                    p = val.data_ptr()
+                    if p == want_s:
+                        hit_s = True
+                    elif p == want_ns:
+                        hit_ns = True
+                    elif p == want_nr:
+                        hit_nr = True
+                    if hit_s and hit_ns and hit_nr:
+                        return True
+                else:
+                    t = getattr(val, "sampled_token_ids", None)
+                    if isinstance(t, torch.Tensor) and t.data_ptr() == want_s:
+                        hit_s = True
+                    t = getattr(val, "num_sampled", None)
+                    if isinstance(t, torch.Tensor) and t.data_ptr() == want_ns:
+                        hit_ns = True
+                    t = getattr(val, "num_rejected", None)
+                    if isinstance(t, torch.Tensor) and t.data_ptr() == want_nr:
+                        hit_nr = True
+                    if hit_s and hit_ns and hit_nr:
+                        return True
+        return hit_s and hit_ns and hit_nr
     ptrs: set[int] = set()
     for val in (*args, *kwargs.values()):
         if isinstance(val, torch.Tensor):
@@ -2862,14 +3139,34 @@ def _td_static_fingerprint(
             if hasattr(spec, "_effective_tau_override")
             else 0.0
         )
-        if getattr(spec, "_hetero_budget_on", False) or getattr(spec, "_ctx_adaptive_tau_on", False):
+        hetero_active = (
+            bool(spec._hetero_is_active_for_b(num_reqs))
+            if hasattr(spec, "_hetero_is_active_for_b")
+            else bool(getattr(spec, "_hetero_budget_on", False) and num_reqs >= 2)
+        )
+        sam_active = (
+            bool(spec._sam_is_active_for_b(num_reqs))
+            if hasattr(spec, "_sam_is_active_for_b")
+            else bool(getattr(spec, "_sam_hybrid_on", False))
+        )
+        if (
+            getattr(spec, "_hetero_budget_on", False)
+            or getattr(spec, "_ctx_adaptive_tau_on", False)
+            or getattr(spec, "_sam_hybrid_on", False)
+        ):
+            m_cap_b = (
+                int(spec._hetero_m_cap_for_b(num_reqs))
+                if hasattr(spec, "_hetero_m_cap_for_b")
+                else int(getattr(spec, "_hetero_budget_m_cap", 0))
+            )
             vw_sig = (
                 draft_g,
                 w_cap,
                 tau_ov,
-                bool(getattr(spec, "_hetero_budget_on", False)),
-                int(getattr(spec, "_hetero_budget_m_cap", 0)),
+                hetero_active,
+                m_cap_b if hetero_active else 0,
                 bool(getattr(spec, "_ctx_adaptive_tau_on", False)),
+                sam_active,
             )
         else:
             vw_sig = (draft_g, w_cap, tau_ov)
@@ -2895,10 +3192,14 @@ def _td_static_fingerprint(
         ring_state[2],
         ring_state[3],
     )
+    if FAST_REPLAY_V16 and STATIC_TEMP_REPLAY_V16 and spec is not None:
+        _dl_t = getattr(spec, "draft_logits", None)
+        if isinstance(_dl_t, torch.Tensor):
+            ptr_sig = (*ptr_sig, int(_dl_t.data_ptr()), tuple(_dl_t.shape))
     return batch_sig, ptr_sig
 
 
-def _td_static_spec_ok(spec, num_reqs: int) -> bool:
+def _td_static_spec_ok(spec, num_reqs: int, num_spec_sched: int | None = None) -> bool:
     if spec is None:
         return False
     if (
@@ -2908,19 +3209,32 @@ def _td_static_spec_ok(spec, num_reqs: int) -> bool:
         or getattr(spec, "context_kv_only", False)
     ):
         return False
-    if getattr(spec, "draft_logits", None) is not None:
-        return False
+    _dl = getattr(spec, "draft_logits", None)
+    if _dl is not None:
+        if not (FAST_REPLAY_V16 and STATIC_TEMP_REPLAY_V16 and isinstance(_dl, torch.Tensor)):
+            return False
     has_cap_lut = hasattr(spec, "_next_draft_cap_g")
     draft_g = spec._next_draft_cap_g(num_reqs) if has_cap_lut else None
     if getattr(spec, "_sam_hybrid_on", False):
-        if getattr(spec, "_sam_mode", "") == "cpu" or not getattr(spec, "_sam_gpu_ready", False):
-            return False
-        cap_sam = getattr(spec, "_sam_boost_in_graph_captured", ())
-        if has_cap_lut:
-            if draft_g is None or draft_g not in cap_sam:
+        if getattr(spec, "_sam_mode", "") == "cpu":
+            sam_max_b = int(getattr(spec, "_sam_max_b", 1))
+            if num_reqs <= sam_max_b:
                 return False
-        elif not any(g >= num_reqs for g in cap_sam):
-            return False
+        else:
+            sam_active = (
+                bool(spec._sam_is_active_for_b(num_reqs))
+                if hasattr(spec, "_sam_is_active_for_b")
+                else bool(getattr(spec, "_sam_gpu_ready", False))
+            )
+            if sam_active:
+                if not getattr(spec, "_sam_gpu_ready", False):
+                    return False
+                cap_sam = getattr(spec, "_sam_boost_in_graph_captured", ())
+                if has_cap_lut:
+                    if draft_g is None or draft_g not in cap_sam:
+                        return False
+                elif not any(g >= num_reqs for g in cap_sam):
+                    return False
     if getattr(spec, "_vw_mode", "off") != "off":
         if not getattr(spec, "_vw_is_conf", False) or not getattr(spec, "_graph_vw_conf_captured", None):
             return False
@@ -2928,6 +3242,29 @@ def _td_static_spec_ok(spec, num_reqs: int) -> bool:
         if has_cap_lut:
             if draft_g is None or draft_g not in cap_vw:
                 return False
+            cap_entry = cap_vw[draft_g]
+            if isinstance(cap_entry, tuple) and len(cap_entry) >= 2:
+                want_w_cap = (
+                    int(spec._effective_w_cap(num_reqs, num_spec_sched))
+                    if hasattr(spec, "_effective_w_cap")
+                    else int(cap_entry[0])
+                )
+                hetero_active = (
+                    bool(spec._hetero_is_active_for_b(num_reqs))
+                    if hasattr(spec, "_hetero_is_active_for_b")
+                    else bool(getattr(spec, "_hetero_budget_on", False) and num_reqs >= 2)
+                )
+                want_tau_key = (
+                    -2.0
+                    if hetero_active
+                    else (
+                        float(spec._effective_tau_override(num_reqs))
+                        if hasattr(spec, "_effective_tau_override")
+                        else float(cap_entry[1])
+                    )
+                )
+                if int(cap_entry[0]) != want_w_cap or float(cap_entry[1]) != want_tau_key:
+                    return False
         elif not any(g >= num_reqs for g in cap_vw):
             return False
     return True
@@ -2975,10 +3312,23 @@ def _discover_sconv_builders(runner, st: _RunnerState) -> list:
         _visit(getattr(runner, root_attr, None), 0)
     if found:
         st.dt_sconv_builders = found
+        _seen_sd: set[int] = set()
+        _shared_list: list = []
+        for _b in found:
+            _sd = getattr(_b, "_inkling_shared", None)
+            if isinstance(_sd, dict) and id(_sd) not in _seen_sd:
+                _seen_sd.add(id(_sd))
+                _shared_list.append(_sd)
+        st._dt_sconv_shared = tuple(_shared_list)
     return found
 
 
-def _sconv_any_dirty(builders: list) -> bool:
+def _sconv_any_dirty(builders: list, st: _RunnerState | None = None) -> bool:
+    if FAST_REPLAY_V14 and st is not None and st._dt_sconv_shared:
+        for sd in st._dt_sconv_shared:
+            if sd.get("dirty", False):
+                return True
+        return False
     for b in builders:
         sd = getattr(b, "_inkling_shared", None)
         if isinstance(sd, dict) and bool(sd.get("dirty", False)):
@@ -2986,7 +3336,13 @@ def _sconv_any_dirty(builders: list) -> bool:
     return False
 
 
-def _sconv_mark_dirty(builders: list, num_padded_tokens: int) -> None:
+def _sconv_mark_dirty(builders: list, num_padded_tokens: int, st: _RunnerState | None = None) -> None:
+    if FAST_REPLAY_V14 and st is not None and st._dt_sconv_shared:
+        for sd in st._dt_sconv_shared:
+            sd["dirty"] = True
+            if num_padded_tokens > (sd.get("dirty_len") or 0):
+                sd["dirty_len"] = num_padded_tokens
+        return
     seen: set[int] = set()
     for b in builders:
         sd = getattr(b, "_inkling_shared", None)
@@ -2997,7 +3353,7 @@ def _sconv_mark_dirty(builders: list, num_padded_tokens: int) -> None:
                 sd["dirty_len"] = int(num_padded_tokens)
 
 
-def _is_tree_spec_active(runner, num_reqs: int | None = None) -> bool:
+def _is_tree_spec_active(runner, num_reqs: int | None = None, st: _RunnerState | None = None) -> bool:
     spec = getattr(runner, "speculator", None)
     if spec is not None and bool(getattr(spec, "_tree_spec_on", False)):
         if (
@@ -3007,6 +3363,26 @@ def _is_tree_spec_active(runner, num_reqs: int | None = None) -> bool:
         ):
             return False
         return True
+    if FAST_REPLAY_V14 and st is not None:
+        m = st._tree_spec_mod
+        if m is None and not st._tree_spec_mod_probed:
+            for mod_name in ("vllm.models.inkling2.ops.tree_spec_runtime", "tree_spec_runtime"):
+                m = sys.modules.get(mod_name)
+                if m is not None:
+                    st._tree_spec_mod = m
+                    break
+            st._tree_spec_mod_probed = True
+        if m is not None and getattr(m, "TREE_SPEC_ENABLED", False):
+            ts = getattr(m, "TREE_STATE", None)
+            if isinstance(ts, dict) and (ts.get("scope") or 0) > 0 and not ts.get("suppressed", False):
+                if (
+                    num_reqs is not None
+                    and getattr(m, "TREE_SPEC_B1_ONLY", False)
+                    and num_reqs > getattr(m, "TREE_SPEC_MAX_B", 1)
+                ):
+                    return False
+                return True
+        return False
     for mod_name in ("vllm.models.inkling2.ops.tree_spec_runtime", "tree_spec_runtime"):
         m = sys.modules.get(mod_name)
         if m is not None and bool(getattr(m, "TREE_SPEC_ENABLED", False)):
@@ -3244,6 +3620,1664 @@ def _dt_static_fingerprint(
     return batch_sig, ptr_sig
 
 
+def _compile_dt_v14_plan(
+    cert: dict,
+    runner,
+    st: _RunnerState,
+    batch_desc,
+    *,
+    is_b1: bool,
+    req_ids,
+    idx_tuple: tuple[int, ...],
+    num_reqs: int,
+    num_tokens: int,
+    num_tokens_after_padding: int,
+    num_reqs_padded: int,
+    q_len: int,
+    has_drafts: bool,
+    write_pad: bool,
+    imm_idx_ptr: int,
+    sconv_builders: list,
+    has_so: bool,
+    dge: bool,
+    exec_key: tuple,
+) -> None:
+    """Compile zero-alloc flat pointer & batch validation plan + exec bundle on a certified 'dt' entry."""
+    ib_buf = getattr(runner, "input_buffers", None)
+    rs_buf = getattr(runner, "req_states", None)
+    prep_bufs = st.b1_bufs if is_b1 else st.bn_bufs
+    if ib_buf is None or rs_buf is None or prep_bufs is None:
+        return
+    last_sampled = getattr(rs_buf, "last_sampled_tokens", None)
+    if not isinstance(last_sampled, torch.Tensor):
+        return
+    draft_tokens_buf = getattr(rs_buf, "draft_tokens", None)
+    if has_drafts:
+        if not isinstance(draft_tokens_buf, torch.Tensor):
+            return
+        draft_t = draft_tokens_buf
+        draft_attr = "draft_tokens"
+    else:
+        draft_t = last_sampled
+        draft_attr = "last_sampled_tokens"
+
+    # Core static buffers verified directly via PEP-659 LOAD_ATTR (zero getattr/dict-hash overhead)
+    t_ids = getattr(ib_buf, "input_ids", None)
+    t_pos = getattr(ib_buf, "positions", None)
+    t_sl = getattr(ib_buf, "seq_lens", None)
+    t_qsl = getattr(ib_buf, "query_start_loc", None)
+    t_ip = getattr(ib_buf, "is_padding", None)
+    p_ids = int(t_ids.data_ptr()) if isinstance(t_ids, torch.Tensor) else 0
+    p_pos = int(t_pos.data_ptr()) if isinstance(t_pos, torch.Tensor) else 0
+    p_sl = int(t_sl.data_ptr()) if isinstance(t_sl, torch.Tensor) else 0
+    p_qsl = int(t_qsl.data_ptr()) if isinstance(t_qsl, torch.Tensor) else 0
+    p_ip = int(t_ip.data_ptr()) if isinstance(t_ip, torch.Tensor) else 0
+    p_ls = int(last_sampled.data_ptr())
+    p_dr = int(draft_t.data_ptr())
+    ncomp_obj = getattr(rs_buf, "num_computed_tokens", None)
+    ncomp_has_gpu = bool(ncomp_obj is not None and hasattr(ncomp_obj, "gpu"))
+    t_nc = getattr(ncomp_obj, "gpu", None) if ncomp_has_gpu else ncomp_obj
+    p_nc = int(t_nc.data_ptr()) if isinstance(t_nc, torch.Tensor) else 0
+    ie_buf = st.inputs_embeds_buf
+    p_ie = int(ie_buf.data_ptr()) if isinstance(ie_buf, torch.Tensor) else 0
+
+    # Optional model & sconv pointers using C-level operator.attrgetter (0 getattr string overhead)
+    extra_checks: list[tuple] = []
+    inner = None
+    exp_vw = False
+    model = getattr(runner, "model", None)
+    if model is not None:
+        lm = model.get_language_model() if hasattr(model, "get_language_model") else model
+        inner = getattr(lm, "model", lm)
+        exp_vw = bool(getattr(inner, "_vw", False))
+        vw_mask = getattr(inner, "_vw_mask", None)
+        if hasattr(inner, "_vw_mask"):
+            extra_checks.append((inner, operator.attrgetter("_vw_mask"), vw_mask, int(vw_mask.data_ptr()) if isinstance(vw_mask, torch.Tensor) else 0))
+        emb = getattr(inner, "embed_tokens", None)
+        if emb is not None:
+            emb_rw = getattr(emb, "_repl_weight", None)
+            if isinstance(emb_rw, torch.Tensor):
+                extra_checks.append((emb, operator.attrgetter("_repl_weight"), emb_rw, int(emb_rw.data_ptr())))
+            elif hasattr(emb, "weight"):
+                emb_w = getattr(emb, "weight", None)
+                extra_checks.append((emb, operator.attrgetter("weight"), emb_w, int(emb_w.data_ptr()) if isinstance(emb_w, torch.Tensor) else 0))
+        enorm = getattr(inner, "embed_norm", None)
+        if enorm is not None and hasattr(enorm, "weight"):
+            en_w = getattr(enorm, "weight", None)
+            extra_checks.append((enorm, operator.attrgetter("weight"), en_w, int(en_w.data_ptr()) if isinstance(en_w, torch.Tensor) else 0))
+
+    _ag_seq_idx = operator.attrgetter("seq_idx_buffer")
+    _ag_qstart = operator.attrgetter("query_start_buffer")
+    for b in sconv_builders:
+        t_si = getattr(b, "seq_idx_buffer", None)
+        t_qs = getattr(b, "query_start_buffer", None)
+        extra_checks.append((b, _ag_seq_idx, t_si, int(t_si.data_ptr()) if isinstance(t_si, torch.Tensor) else 0))
+        extra_checks.append((b, _ag_qstart, t_qs, int(t_qs.data_ptr()) if isinstance(t_qs, torch.Tensor) else 0))
+
+    # Prep buffer core tensors (unpacked directly, zero dict loop)
+    pb_idx = prep_bufs["idx"]
+    pb_cu = prep_bufs["cu"]
+    pb_eidx = prep_bufs["expanded_idx"]
+    pb_epos = prep_bufs["expanded_pos"]
+    pb_li = prep_bufs["logits_indices"]
+    prep_core = (
+        pb_idx, int(pb_idx.data_ptr()),
+        pb_cu, int(pb_cu.data_ptr()),
+        pb_eidx, int(pb_eidx.data_ptr()),
+        pb_epos, int(pb_epos.data_ptr()),
+        pb_li, int(pb_li.data_ptr()),
+    )
+
+    # Flattened block-table checks using C-level attrgetter + zero-branch inner loops!
+    bt = getattr(runner, "block_tables", None)
+    bt_seq_hdrs: list[tuple] = []      # (attrgetter, exp_seq, exp_len_or_neg1)
+    bt_flat_tensors: list[tuple] = []  # (seq, idx_i, exp_t, exp_ptr, exp_sh, exp_st)
+    bt_flat_gpu: list[tuple] = []      # (seq, idx_i, exp_item, exp_gpu, exp_ptr, exp_sh, exp_st)
+    bt_fallback: list[tuple] = []      # uncommon direct tensor / None / opaque entries
+    if bt is not None:
+        for attr in ("block_tables", "input_block_tables", "slot_mappings", "num_blocks"):
+            ag_bt = operator.attrgetter(attr)
+            if not hasattr(bt, attr):
+                bt_fallback.append((bt, attr, 0, None, ()))
+                continue
+            seq = ag_bt(bt)
+            if isinstance(seq, (list, tuple)):
+                all_plain = True
+                for idx_i, item in enumerate(seq):
+                    if isinstance(item, torch.Tensor):
+                        bt_flat_tensors.append((seq, idx_i, item, int(item.data_ptr()), item.shape, item.stride()))
+                    elif hasattr(item, "gpu") and isinstance(item.gpu, torch.Tensor):
+                        t = item.gpu
+                        bt_flat_gpu.append((seq, idx_i, item, t, int(t.data_ptr()), t.shape, t.stride()))
+                    else:
+                        all_plain = False
+                        break
+                if all_plain:
+                    bt_seq_hdrs.append((ag_bt, seq, len(seq)))
+                else:
+                    bt_fallback.append((bt, attr, 4, seq, ()))
+            elif seq is None:
+                bt_fallback.append((bt, attr, 0, None, ()))
+            elif isinstance(seq, torch.Tensor):
+                bt_fallback.append((bt, attr, 1, seq, (int(seq.data_ptr()), seq.shape, seq.stride())))
+            elif hasattr(seq, "gpu") and isinstance(seq.gpu, torch.Tensor):
+                t = seq.gpu
+                bt_fallback.append((bt, attr, 2, seq, (t, int(t.data_ptr()), t.shape, t.stride())))
+            else:
+                bt_fallback.append((bt, attr, 4, seq, ()))
+
+    # Exec bundle (pre-resolved owner + cudaGraphExec_t handle)
+    exec_bundle = None
+    if st.region is not None and hasattr(st.region.b, "get_static_exec_bundle"):
+        exec_bundle = st.region.b.get_static_exec_bundle(exec_key)
+
+    bt_mode = _probe_dt_block_table_mode(runner, st)
+    bszs = tuple(int(bs) for bs in getattr(bt, "block_sizes", ()) or ()) if (bt is not None and bt_mode == "cpu_blocks") else ()
+    exec_owner = exec_bundle[0] if exec_bundle is not None else None
+    exec_handle = exec_bundle[1] if exec_bundle is not None else None
+    ie_view = ie_buf[:num_tokens] if (isinstance(ie_buf, torch.Tensor) and ie_buf.dim() == 2 and ie_buf.is_contiguous() and ie_buf.shape[0] >= num_tokens) else None
+    req_ids_t = tuple(req_ids)
+    bd_cg_name = getattr(batch_desc.cg_mode, "name", str(batch_desc.cg_mode))
+    bd_nt = int(batch_desc.num_tokens)
+    bd_nr = int(batch_desc.num_reqs or 0)
+    bd_uni = bool(getattr(batch_desc, "uniform", False))
+
+    # Flat positional tuple unpacked in 1 UNPACK_SEQUENCE instruction inside _dt_v14_validate!
+    cert["v14_dt_t"] = (
+        exec_owner,
+        bool(is_b1), num_reqs, num_tokens, num_tokens_after_padding, num_reqs_padded,
+        q_len, bool(has_drafts), bool(write_pad), int(imm_idx_ptr),
+        idx_tuple, idx_tuple[0] if num_reqs == 1 else -1,
+        req_ids_t, req_ids_t[0] if num_reqs == 1 else None,
+        bool(has_so), bool(dge),
+        batch_desc, bd_cg_name, bd_nt, bd_nr, bd_uni,
+        bt_mode == "cpu_blocks", bszs, cert["batch_sig"][-1],
+        ib_buf, rs_buf, bt, prep_bufs, inner, exp_vw,
+        t_ids, p_ids, t_pos, p_pos, t_sl, p_sl, t_qsl, p_qsl, t_ip, p_ip,
+        last_sampled, p_ls, draft_t, p_dr,
+        ncomp_obj, ncomp_has_gpu, t_nc, p_nc,
+        ie_buf, p_ie,
+        int(ib_buf.query_start_loc.shape[0]), int(ib_buf.seq_lens.shape[0]),
+        int(draft_t.stride(0)), int(last_sampled.stride(0)),
+        prep_core, tuple(extra_checks),
+        tuple(bt_seq_hdrs), tuple(bt_flat_tensors), tuple(bt_flat_gpu), tuple(bt_fallback),
+    )
+
+    cert["v14"] = {
+        "is_b1": bool(is_b1),
+        "num_reqs": num_reqs,
+        "num_tokens": num_tokens,
+        "nt_pad": num_tokens_after_padding,
+        "nr_pad": num_reqs_padded,
+        "q_len": q_len,
+        "has_drafts": bool(has_drafts),
+        "write_pad": bool(write_pad),
+        "exec_key": exec_key,
+        "exec_owner": exec_owner,
+        "exec_handle": exec_handle,
+        "exec_gen": cert["exec_gen"],
+        "ie_buf": ie_buf,
+        "ie_ptr": p_ie,
+        "ie_view": ie_view,
+    }
+
+
+def _dt_v14_validate(
+    cert: dict,
+    runner,
+    st: _RunnerState,
+    scheduler_output,
+    batch_req_state,
+    batch_desc,
+    *,
+    is_b1: bool,
+    req_ids,
+    eff_idx_np,
+    num_reqs: int,
+    nt_s: int,
+    nt_pad_s: int,
+    nr_pad_s: int,
+    ql_s: int,
+    has_d_s: bool,
+    w_pad_s: bool,
+    imm_ptr: int,
+) -> bool:
+    """Zero-alloc PEP-659 LOAD_ATTR fail-closed validator mathematically equivalent to _dt_static_fingerprint."""
+    vt = cert.get("v14_dt_t")
+    if vt is None:
+        return False
+    (
+        exec_owner,
+        exp_b1, exp_nr, exp_nt, exp_nt_pad, exp_nr_pad,
+        exp_ql, exp_has_d, exp_wpad, exp_imm,
+        exp_idx, exp_idx0, exp_rids, exp_rid0,
+        exp_so, exp_dge,
+        bd_ref, bd_cg_name, bd_nt, bd_nr, bd_uni,
+        bt_mode_cpu, bt_bszs, exp_mbs,
+        ib_buf, rs_buf, bt_ref, prep_bufs, inner, exp_vw,
+        t_ids, p_ids, t_pos, p_pos, t_sl, p_sl, t_qsl, p_qsl, t_ip, p_ip,
+        t_ls, p_ls, t_dr, p_dr,
+        ncomp_obj, ncomp_has_gpu, t_nc, p_nc,
+        ie_buf, p_ie,
+        qsl_len, sl_len, dr_stride, ls_stride,
+        prep_core, extra_checks,
+        bt_seq_hdrs, bt_flat_tensors, bt_flat_gpu, bt_fallback,
+    ) = vt
+    if (
+        exec_owner is None
+        or exp_nr != num_reqs
+        or exp_nt != nt_s
+        or exp_nt_pad != nt_pad_s
+        or exp_nr_pad != nr_pad_s
+        or exp_ql != ql_s
+        or exp_b1 != is_b1
+        or exp_has_d != has_d_s
+        or exp_wpad != w_pad_s
+        or exp_imm != imm_ptr
+    ):
+        return False
+    if num_reqs == 1:
+        if int(eff_idx_np[0]) != exp_idx0 or req_ids[0] != exp_rid0:
+            return False
+    else:
+        if len(eff_idx_np) != num_reqs or len(req_ids) != num_reqs:
+            return False
+        for i in range(num_reqs):
+            if int(eff_idx_np[i]) != exp_idx[i] or req_ids[i] != exp_rids[i]:
+                return False
+    try:
+        if bool(scheduler_output.has_structured_output_requests) != exp_so:
+            return False
+    except AttributeError:
+        if exp_so:
+            return False
+    try:
+        if bool(batch_req_state.decode_graph_eligible) != exp_dge:
+            return False
+    except AttributeError:
+        if not exp_dge:
+            return False
+    if batch_desc is not bd_ref:
+        if (
+            getattr(batch_desc.cg_mode, "name", str(batch_desc.cg_mode)) != bd_cg_name
+            or int(batch_desc.num_tokens) != bd_nt
+            or int(batch_desc.num_reqs or 0) != bd_nr
+            or bool(getattr(batch_desc, "uniform", False)) != bd_uni
+        ):
+            return False
+    if bt_mode_cpu:
+        nst_np = batch_req_state.num_scheduled_tokens
+        rc_np = runner.req_states.num_computed_tokens_np
+        max_sl = 0
+        for i in range(num_reqs):
+            sl_i = int(rc_np[int(eff_idx_np[i])]) + int(nst_np[i])
+            if sl_i > max_sl:
+                max_sl = sl_i
+        if bt_bszs:
+            for bi in range(len(bt_bszs)):
+                bs = bt_bszs[bi]
+                if ((max_sl + bs - 1) // bs) != exp_mbs[bi]:
+                    return False
+        elif (max_sl,) != exp_mbs:
+            return False
+    try:
+        if runner.input_buffers is not ib_buf or runner.req_states is not rs_buf or runner.block_tables is not bt_ref:
+            return False
+        if (st.b1_bufs if is_b1 else st.bn_bufs) is not prep_bufs:
+            return False
+        if inner is not None and bool(inner._vw) != exp_vw:
+            return False
+        # Core input_buffers & req_states direct LOAD_ATTR checks (0 getattr!)
+        if (
+            ib_buf.input_ids is not t_ids or (p_ids and t_ids.data_ptr() != p_ids)
+            or ib_buf.positions is not t_pos or (p_pos and t_pos.data_ptr() != p_pos)
+            or ib_buf.seq_lens is not t_sl or (p_sl and t_sl.data_ptr() != p_sl)
+            or ib_buf.query_start_loc is not t_qsl or (p_qsl and t_qsl.data_ptr() != p_qsl)
+            or ib_buf.is_padding is not t_ip or (p_ip and t_ip.data_ptr() != p_ip)
+            or rs_buf.last_sampled_tokens is not t_ls or t_ls.data_ptr() != p_ls
+            or (rs_buf.draft_tokens if has_d_s else rs_buf.last_sampled_tokens) is not t_dr or t_dr.data_ptr() != p_dr
+            or rs_buf.num_computed_tokens is not ncomp_obj
+            or (ncomp_obj.gpu if ncomp_has_gpu else ncomp_obj) is not t_nc or (p_nc and t_nc.data_ptr() != p_nc)
+            or st.inputs_embeds_buf is not ie_buf or (p_ie and ie_buf.data_ptr() != p_ie)
+        ):
+            return False
+        if t_qsl.shape[0] != qsl_len or t_sl.shape[0] != sl_len:
+            return False
+        if t_dr.stride(0) != dr_stride or t_ls.stride(0) != ls_stride:
+            return False
+        if has_d_s and (t_dr.dim() != 2 or t_dr.stride(1) != 1):
+            return False
+        # Prep buffer dict direct checks (unpacked once)
+        pb_idx, p_pidx, pb_cu, p_pcu, pb_eidx, p_peidx, pb_epos, p_pepos, pb_li, p_pli = prep_core
+        if (
+            prep_bufs["idx"] is not pb_idx or pb_idx.data_ptr() != p_pidx
+            or prep_bufs["cu"] is not pb_cu or pb_cu.data_ptr() != p_pcu
+            or prep_bufs["expanded_idx"] is not pb_eidx or pb_eidx.data_ptr() != p_peidx
+            or prep_bufs["expanded_pos"] is not pb_epos or pb_epos.data_ptr() != p_pepos
+            or prep_bufs["logits_indices"] is not pb_li or pb_li.data_ptr() != p_pli
+        ):
+            return False
+        # Optional model & sconv pointers via C attrgetter
+        for obj, ag, exp_t, exp_ptr in extra_checks:
+            cur = ag(obj)
+            if cur is not exp_t or (exp_ptr and cur.data_ptr() != exp_ptr):
+                return False
+        # Flattened block-table checks (0 branch per tensor!)
+        if bt_ref is not None:
+            for ag_bt, exp_seq, exp_len in bt_seq_hdrs:
+                cur_seq = ag_bt(bt_ref)
+                if cur_seq is not exp_seq or len(cur_seq) != exp_len:
+                    return False
+            for seq, idx_i, exp_t, exp_ptr, exp_sh, exp_st in bt_flat_tensors:
+                cur_it = seq[idx_i]
+                if cur_it is not exp_t or cur_it.data_ptr() != exp_ptr or cur_it.shape != exp_sh or cur_it.stride() != exp_st:
+                    return False
+            for seq, idx_i, exp_item, exp_gpu, exp_ptr, exp_sh, exp_st in bt_flat_gpu:
+                cur_it = seq[idx_i]
+                if cur_it is not exp_item:
+                    return False
+                t_g = cur_it.gpu
+                if t_g is not exp_gpu or t_g.data_ptr() != exp_ptr or t_g.shape != exp_sh or t_g.stride() != exp_st:
+                    return False
+            if bt_fallback:
+                for bt_obj, attr, kind, exp_seq, extra in bt_fallback:
+                    cur_seq = getattr(bt_obj, attr, None)
+                    if kind == 0:
+                        if cur_seq is not None:
+                            return False
+                    elif kind == 1:
+                        if cur_seq is not exp_seq or cur_seq.data_ptr() != extra[0] or cur_seq.shape != extra[1] or cur_seq.stride() != extra[2]:
+                            return False
+                    elif kind == 2:
+                        if cur_seq is not exp_seq:
+                            return False
+                        t = getattr(cur_seq, "gpu", None)
+                        if t is not extra[0] or t.data_ptr() != extra[1] or t.shape != extra[2] or t.stride() != extra[3]:
+                            return False
+                    else:
+                        if cur_seq is not exp_seq:
+                            return False
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return False
+    if ie_buf is None or ie_buf.shape[0] < nt_s:
+        return False
+    return True
+
+
+def _compile_td_v14_plan(cert: dict, spec, st: _RunnerState, drafts_t: torch.Tensor | None) -> None:
+    """Pre-resolve exec bundle, flat positional fingerprint, & cached draft slice views on a 'td' cert."""
+    b_sig = cert["batch_sig"]
+    p_sig = cert["ptr_sig"]
+    exec_key = cert["exec_key"]
+    exec_bundle = None
+    if st.region is not None and hasattr(st.region.b, "get_static_exec_bundle"):
+        exec_bundle = st.region.b.get_static_exec_bundle(exec_key)
+    nr = int(cert["num_reqs"])
+    dcols = int(cert["drafts_cols"])
+    draft_tok_t = getattr(spec, "draft_tokens", None) if spec is not None else None
+    draft_tok_ptr = int(draft_tok_t.data_ptr()) if isinstance(draft_tok_t, torch.Tensor) else 0
+    drafts_view = draft_tok_t[:nr, :dcols] if (isinstance(draft_tok_t, torch.Tensor) and drafts_t is not None) else None
+    full_drafts_view = draft_tok_t[:nr] if (isinstance(draft_tok_t, torch.Tensor) and drafts_t is not None) else None
+    req_ids_t = b_sig[0]
+    vw_sig = b_sig[6]
+    exec_owner = exec_bundle[0] if exec_bundle is not None else None
+    exec_handle = exec_bundle[1] if exec_bundle is not None else None
+    cert["v14_td_t"] = (
+        exec_owner,
+        req_ids_t, req_ids_t[0] if len(req_ids_t) == 1 else None,
+        int(b_sig[1]), int(b_sig[2]), int(b_sig[3]), int(b_sig[4]), int(b_sig[5]),
+        vw_sig,
+        p_sig[0], p_sig[1], p_sig[2], p_sig[3], p_sig[4], p_sig[5], p_sig[6], p_sig[7],
+        p_sig[8], p_sig[9], p_sig[10],
+    )
+    cert["v14"] = {
+        "exec_key": exec_key,
+        "exec_owner": exec_owner,
+        "exec_handle": exec_handle,
+        "exec_gen": cert.get("exec_gen"),
+        "draft_tok_t": draft_tok_t,
+        "draft_tok_ptr": draft_tok_ptr,
+        "drafts_view": drafts_view,
+        "full_drafts_view": full_drafts_view,
+    }
+
+
+def _td_v14_validate(
+    cert: dict,
+    ib,
+    num_spec_sched: int,
+    ring_state: tuple[int, int, int, int],
+    spec,
+    st: _RunnerState,
+) -> bool:
+    """Unified single-pass PEP-659 LOAD_ATTR validator replacing _td_static_fingerprint + _td_static_spec_ok."""
+    vt = cert.get("v14_td_t")
+    if vt is None or spec is None:
+        return False
+    (
+        exec_owner,
+        exp_rids, exp_rid0,
+        exp_nr, exp_nt, exp_nt_nospec, exp_nspec, exp_ndraft,
+        exp_vw,
+        p_idx, p_qsl, p_pos, p_ids, p_sl, p_li, p_cu, p_eidx,
+        p_s, p_ns, p_nr,
+    ) = vt
+    if exec_owner is None:
+        return False
+    nr = ib.num_reqs
+    if (
+        nr != exp_nr
+        or ib.num_tokens != exp_nt
+        or num_spec_sched != exp_nspec
+        or ring_state[1] != p_s
+        or ring_state[2] != p_ns
+        or ring_state[3] != p_nr
+    ):
+        return False
+    try:
+        if ib.num_tokens_no_spec != exp_nt_nospec or ib.num_draft_tokens != exp_ndraft:
+            return False
+    except AttributeError:
+        if getattr(ib, "num_tokens_no_spec", 0) != exp_nt_nospec or getattr(ib, "num_draft_tokens", 0) != exp_ndraft:
+            return False
+    req_ids = ib.req_ids
+    if nr == 1:
+        if not req_ids or req_ids[0] != exp_rid0:
+            return False
+    else:
+        if len(req_ids) != nr:
+            return False
+        for i in range(nr):
+            if req_ids[i] != exp_rids[i]:
+                return False
+    # Direct LOAD_ATTR pointer checks on InputBatch (0 getattr, 0 tuple alloc!)
+    try:
+        t = ib.idx_mapping
+        if (t.data_ptr() if t is not None else 0) != p_idx:
+            return False
+        t = ib.query_start_loc
+        if (t.data_ptr() if t is not None else 0) != p_qsl:
+            return False
+        t = ib.positions
+        if (t.data_ptr() if t is not None else 0) != p_pos:
+            return False
+        t = ib.input_ids
+        if (t.data_ptr() if t is not None else 0) != p_ids:
+            return False
+        t = ib.seq_lens
+        if (t.data_ptr() if t is not None else 0) != p_sl:
+            return False
+        t = ib.logits_indices
+        if (t.data_ptr() if t is not None else 0) != p_li:
+            return False
+        t = ib.cu_num_logits
+        if (t.data_ptr() if t is not None else 0) != p_cu:
+            return False
+        t = ib.expanded_idx_mapping
+        if (t.data_ptr() if t is not None else 0) != p_eidx:
+            return False
+    except AttributeError:
+        return False
+
+    # Single-pass spec validation via direct LOAD_ATTR (falls back on missing optional attrs)
+    try:
+        if (
+            spec._tree_spec_on
+            or spec._cl_on
+            or spec._vw_stats_on
+            or spec.context_kv_only
+            or spec.draft_logits is not None
+        ):
+            return False
+        hetero_on = bool(spec._hetero_budget_on)
+        ctx_tau_on = bool(spec._ctx_adaptive_tau_on)
+        sam_on = bool(spec._sam_hybrid_on)
+    except AttributeError:
+        if (
+            getattr(spec, "_tree_spec_on", False)
+            or getattr(spec, "_cl_on", False)
+            or getattr(spec, "_vw_stats_on", False)
+            or getattr(spec, "context_kv_only", False)
+            or getattr(spec, "draft_logits", None) is not None
+        ):
+            return False
+        hetero_on = bool(getattr(spec, "_hetero_budget_on", False))
+        ctx_tau_on = bool(getattr(spec, "_ctx_adaptive_tau_on", False))
+        sam_on = bool(getattr(spec, "_sam_hybrid_on", False))
+    sc = st._td_spec_cache
+    if sc is None or sc[0] is not spec:
+        sc = (
+            spec,
+            getattr(spec, "_next_draft_cap_g", None),
+            getattr(spec, "_effective_w_cap", None),
+            getattr(spec, "_effective_tau_override", None),
+            getattr(spec, "_hetero_is_active_for_b", None),
+            getattr(spec, "_sam_is_active_for_b", None),
+            getattr(spec, "_hetero_m_cap_for_b", None),
+        )
+        st._td_spec_cache = sc
+    _, fn_dg, fn_wc, fn_tau, fn_het, fn_sam, fn_mcap = sc
+    draft_g = fn_dg(nr) if fn_dg is not None else None
+    w_cap = int(fn_wc(nr, num_spec_sched)) if fn_wc is not None else int(num_spec_sched)
+    tau_ov = float(fn_tau(nr)) if fn_tau is not None else 0.0
+    if hetero_on or ctx_tau_on or sam_on:
+        hetero_active = bool(fn_het(nr)) if fn_het is not None else (hetero_on and nr >= 2)
+        sam_active = bool(fn_sam(nr)) if fn_sam is not None else sam_on
+        m_cap_b = (int(fn_mcap(nr)) if fn_mcap is not None else int(getattr(spec, "_hetero_budget_m_cap", 0))) if hetero_active else 0
+        if (
+            len(exp_vw) != 7
+            or exp_vw[0] != draft_g
+            or exp_vw[1] != w_cap
+            or exp_vw[2] != tau_ov
+            or exp_vw[3] != hetero_active
+            or exp_vw[4] != m_cap_b
+            or exp_vw[5] != ctx_tau_on
+            or exp_vw[6] != sam_active
+        ):
+            return False
+    else:
+        hetero_active = False
+        sam_active = False
+        if len(exp_vw) != 3 or exp_vw[0] != draft_g or exp_vw[1] != w_cap or exp_vw[2] != tau_ov:
+            return False
+
+    if sam_on:
+        if getattr(spec, "_sam_mode", "") == "cpu":
+            if nr <= int(getattr(spec, "_sam_max_b", 1)):
+                return False
+        elif sam_active:
+            if not getattr(spec, "_sam_gpu_ready", False):
+                return False
+            cap_sam = getattr(spec, "_sam_boost_in_graph_captured", ())
+            if fn_dg is not None:
+                if draft_g is None or draft_g not in cap_sam:
+                    return False
+            elif not any(g >= nr for g in cap_sam):
+                return False
+    try:
+        vw_mode = spec._vw_mode
+    except AttributeError:
+        vw_mode = "off"
+    if vw_mode != "off":
+        try:
+            if not spec._vw_is_conf:
+                return False
+            cap_vw = spec._graph_vw_conf_captured
+        except AttributeError:
+            return False
+        if not cap_vw:
+            return False
+        if fn_dg is not None:
+            if draft_g is None or draft_g not in cap_vw:
+                return False
+            cap_entry = cap_vw[draft_g]
+            if isinstance(cap_entry, tuple) and len(cap_entry) >= 2:
+                want_w = w_cap if fn_wc is not None else int(cap_entry[0])
+                want_tau = -2.0 if hetero_active else (tau_ov if fn_tau is not None else float(cap_entry[1]))
+                if int(cap_entry[0]) != want_w or float(cap_entry[1]) != want_tau:
+                    return False
+        elif not any(g >= nr for g in cap_vw):
+            return False
+    return True
+
+
+# ----------------------------------------------------------------------------------------------
+# Wave-V16 Sub-25us Zero-Alloc Static Replay: O(1) 2D LUT + Fused step_meta_stamp + SyncFree-Temp
+# ----------------------------------------------------------------------------------------------
+def _bind_sf_fns_v16(st: _RunnerState) -> bool:
+    """Bind sync_free static-ring functions directly on _RunnerState (0 module/attr lookup per step)."""
+    if st._sf_get_ring_fn is not None:
+        return True
+    sf_m = _get_sf_ring_mod_v14(st)
+    if sf_m is None:
+        return False
+    st._sf_clear_fn = getattr(sf_m, "clear_static_ring_state", None)
+    st._sf_get_ring_fn = getattr(sf_m, "get_static_ring_state", None)
+    st._sf_fence_fn = getattr(sf_m, "fence_static_ring_slot", None)
+    return st._sf_get_ring_fn is not None
+
+
+def _register_dt_v16_lut(st: _RunnerState, cert: dict, num_reqs: int, q_len: int) -> None:
+    """Register certified 'dt' entry in direct O(1) 2D tables `dt_exec_lut[B][K]` & `dt_fn_lut[B][K]` (B=1..32, K=0..15)."""
+    k_spec = q_len - 1
+    if 1 <= num_reqs <= _LUT_MAX_B and 0 <= k_spec <= _LUT_MAX_K:
+        st.dt_exec_lut[num_reqs][k_spec] = cert
+        st.dt_fn_lut[num_reqs][k_spec] = cert.get("v16_dt_step")
+
+
+def _evict_dt_v16_lut(st: _RunnerState, cert: dict) -> None:
+    """Evict `cert` from `dt_exec_lut` and `dt_fn_lut` if currently installed."""
+    nr = int(cert.get("num_reqs", 0) or 0)
+    v14_d = cert.get("v14")
+    ql = int(v14_d["q_len"]) if isinstance(v14_d, dict) and "q_len" in v14_d else 0
+    k_spec = ql - 1
+    if 1 <= nr <= _LUT_MAX_B and 0 <= k_spec <= _LUT_MAX_K:
+        if st.dt_exec_lut[nr][k_spec] is cert:
+            st.dt_exec_lut[nr][k_spec] = None
+            st.dt_fn_lut[nr][k_spec] = None
+
+
+def _register_td_v16_lut(st: _RunnerState, cert: dict, num_reqs: int, num_spec_sched: int, r_slot: int) -> None:
+    """Register certified 'td' entry in direct O(1) 2D+slot tables `td_exec_lut` & `td_fn_lut`."""
+    if 1 <= num_reqs <= _LUT_MAX_B and 0 <= num_spec_sched <= _LUT_MAX_K:
+        s_idx = r_slot & 3
+        st.td_exec_lut[num_reqs][num_spec_sched][s_idx] = cert
+        st.td_fn_lut[num_reqs][num_spec_sched][s_idx] = cert.get("v16_td_step")
+
+
+def _evict_td_v16_lut(st: _RunnerState, cert: dict) -> None:
+    """Evict `cert` from `td_exec_lut` and `td_fn_lut` if currently installed."""
+    nr = int(cert.get("num_reqs", 0) or 0)
+    b_sig = cert.get("batch_sig")
+    k_spec = int(b_sig[4]) if isinstance(b_sig, tuple) and len(b_sig) > 4 else -1
+    r_slot = int(cert.get("ring_slot", -1))
+    if 1 <= nr <= _LUT_MAX_B and 0 <= k_spec <= _LUT_MAX_K and r_slot >= 0:
+        s_idx = r_slot & 3
+        if st.td_exec_lut[nr][k_spec][s_idx] is cert:
+            st.td_exec_lut[nr][k_spec][s_idx] = None
+            st.td_fn_lut[nr][k_spec][s_idx] = None
+
+
+def dt_lut_lookup_v16(st: _RunnerState, num_reqs: int, k_spec: int):
+    """Direct O(1) integer-indexed 2D lookup into `dt_exec_lut[B][K]`."""
+    if 1 <= num_reqs <= _LUT_MAX_B and 0 <= k_spec <= _LUT_MAX_K:
+        return st.dt_exec_lut[num_reqs][k_spec]
+    return None
+
+
+def td_lut_lookup_v16(st: _RunnerState, num_reqs: int, k_spec: int, ring_slot: int):
+    """Direct O(1) integer-indexed 2D+slot lookup into `td_exec_lut[B][K][slot]`."""
+    if 1 <= num_reqs <= _LUT_MAX_B and 0 <= k_spec <= _LUT_MAX_K:
+        return st.td_exec_lut[num_reqs][k_spec][ring_slot & 3]
+    return None
+
+
+def _build_pa_slot_v16(template, sl_np: np.ndarray) -> tuple[object, tuple]:
+    """Pre-clone one AttentionMetadata ring slot with `seq_lens_cpu` permanently bound to `sl_np`.
+    Returns `(pa_out, flat_unique_msl_objs)` so per-step stamping only writes `max_seq_len`!"""
+    msl_seen: set[int] = set()
+    msl_objs: list = []
+
+    def _clone_dict(md_dict: dict) -> dict:
+        cloned: dict[int, object] = {}
+        out_d: dict = {}
+        for k, v in md_dict.items():
+            vid = id(v)
+            c = cloned.get(vid)
+            if c is None:
+                has_sl = hasattr(v, "seq_lens_cpu")
+                has_msl = hasattr(v, "max_seq_len")
+                if has_sl or has_msl:
+                    c = copy.copy(v)
+                    if has_sl:
+                        c.seq_lens_cpu = sl_np
+                    if has_msl:
+                        cid = id(c)
+                        if cid not in msl_seen:
+                            msl_seen.add(cid)
+                            msl_objs.append(c)
+                else:
+                    c = v
+                cloned[vid] = c
+            out_d[k] = c
+        return out_d
+
+    if isinstance(template, dict):
+        return _clone_dict(template), tuple(msl_objs)
+    if isinstance(template, tuple):
+        out_t = tuple(_clone_dict(item) if isinstance(item, dict) else item for item in template)
+        return out_t, tuple(msl_objs)
+    return template, ()
+
+
+def _compile_step_meta_stamp_v16(
+    cert: dict,
+    runner,
+    st: _RunnerState,
+    scheduler_output,
+    batch_req_state,
+    *,
+    is_b1: bool,
+    req_ids,
+    idx_tuple: tuple[int, ...],
+    num_reqs: int,
+    num_tokens: int,
+    num_tokens_after_padding: int,
+    num_reqs_padded: int,
+    q_len: int,
+    has_drafts: bool,
+    ie_view,
+    ie_meta,
+):
+    """Compile fused single-call `step_meta_stamp` updating pre-built 4-slot InputBatch +
+    AttentionMetadata ring slots in-place (0 InputBatch alloc, 0 AttentionMetadata copy,
+    0 intermediate Python wrapper frames, strict 4-slot non-aliasing)."""
+    bufs = st.b1_bufs if is_b1 else st.bn_bufs
+    ib_cls = st.b1_ib_cls
+    fields = st.b1_ib_fields
+    if bufs is None or ib_cls is None or fields is None:
+        return None
+    req_comp_all = getattr(runner.req_states, "num_computed_tokens_np", None)
+    if req_comp_all is None:
+        return None
+    if is_b1:
+        idx_mapping = bufs["idx"]
+        cu_num_logits = bufs["cu"]
+    else:
+        idx_mapping = bufs["idx"][:num_reqs]
+        cu_num_logits = bufs["cu"][: num_reqs + 1]
+    ib_b = runner.input_buffers
+    cu_num_logits_np, query_start_loc_np = _get_cached_qsl_np(st, num_reqs, q_len, num_reqs_padded)
+    raw_base = {
+        "num_reqs": num_reqs,
+        "num_reqs_after_padding": num_reqs_padded,
+        "idx_mapping": idx_mapping,
+        "expanded_idx_mapping": bufs["expanded_idx"][:num_tokens],
+        "expanded_local_pos": bufs["expanded_pos"][:num_tokens],
+        "num_tokens": num_tokens,
+        "num_tokens_after_padding": num_tokens_after_padding,
+        "num_draft_tokens": num_reqs * (q_len - 1) if has_drafts else 0,
+        "num_admitted_draft_tokens": None,
+        "query_start_loc": ib_b.query_start_loc[: num_reqs_padded + 1],
+        "query_start_loc_np": query_start_loc_np,
+        "seq_lens": ib_b.seq_lens[:num_reqs_padded],
+        "dcp_local_seq_lens": None,
+        "has_prefill": False,
+        "input_ids": ib_b.input_ids[:num_tokens_after_padding],
+        "positions": ib_b.positions[:num_tokens_after_padding],
+        "is_padding": ib_b.is_padding[:num_tokens_after_padding],
+        "logits_indices": bufs["logits_indices"][:num_tokens],
+        "cu_num_logits": cu_num_logits,
+        "cu_num_logits_np": cu_num_logits_np,
+        "prompt_lens": None,
+        "fast_prefill": None,
+        "max_query_len": None,
+    }
+    drop = set(st.b1_ib_drop) if st.b1_ib_drop else set()
+    base_kw = {k: v for k, v in raw_base.items() if k in fields and k not in drop}
+    dyn_all = (
+        "req_ids",
+        "idx_mapping_np",
+        "num_scheduled_tokens",
+        "num_draft_tokens_per_req",
+        "seq_lens_cpu_upper_bound",
+        "num_computed_tokens_np",
+        "prefill_len_np",
+        "num_computed_prefill_tokens_np",
+        "is_prefilling_np",
+        "prefill_runs_as_decode_np",
+        "decode_graph_eligible",
+        "max_seq_len_np",
+        "has_structured_output_reqs",
+    )
+    dyn_set = frozenset(k for k in dyn_all if k in fields and k not in drop)
+
+    pa_tmpl = cert.get("pa_template")
+    ring: list[tuple] = []
+    nc_dt = req_comp_all.dtype
+    nd_init = batch_req_state.num_draft_tokens_np if has_drafts else None
+    init_dyn = {
+        "req_ids": req_ids,
+        "idx_mapping_np": batch_req_state.idx_mapping_np,
+        "num_scheduled_tokens": batch_req_state.num_scheduled_tokens,
+        "num_draft_tokens_per_req": nd_init,
+        "prefill_len_np": batch_req_state.prefill_len_np,
+        "num_computed_prefill_tokens_np": batch_req_state.num_computed_prefill_tokens_np,
+        "is_prefilling_np": batch_req_state.is_prefilling_np,
+        "prefill_runs_as_decode_np": batch_req_state.prefill_runs_as_decode_np,
+        "decode_graph_eligible": bool(getattr(batch_req_state, "decode_graph_eligible", True)),
+        "max_seq_len_np": batch_req_state.max_seq_len_np,
+        "has_structured_output_reqs": bool(getattr(scheduler_output, "has_structured_output_requests", False)),
+    }
+    try:
+        for _ in range(NSLOT):
+            nc_arr = np.empty(num_reqs, dtype=nc_dt)
+            sl_arr = np.zeros(num_reqs_padded, dtype=np.int32)
+            sl_t = torch.from_numpy(sl_arr)
+            kw_s = dict(base_kw)
+            for dk in dyn_set:
+                if dk == "seq_lens_cpu_upper_bound":
+                    kw_s[dk] = sl_t
+                elif dk == "num_computed_tokens_np":
+                    kw_s[dk] = nc_arr
+                else:
+                    kw_s[dk] = init_dyn[dk]
+            ib_obj = ib_cls(**kw_s)
+            # Probe mutability (fail-closed if ib_cls is frozen)
+            if "req_ids" in dyn_set:
+                ib_obj.req_ids = req_ids
+            pa_out, pa_msl_objs = _build_pa_slot_v16(pa_tmpl, sl_arr)
+            ring.append((ib_obj, nc_arr, sl_arr, sl_arr[:num_reqs], pa_out, pa_msl_objs))
+    except Exception:  # noqa: BLE001
+        return None
+
+    ring_t = tuple(ring)
+    ring_idx = [0]
+    exp_idx_arr = np.array(idx_tuple, dtype=np.intp)
+    is_contig_idx = (idx_tuple == tuple(range(num_reqs)))
+    rc_orig_view = req_comp_all[:num_reqs] if is_contig_idx else None
+
+    # Build reusable inline body snippet for `step_meta_stamp` (closure-bound LOAD_DEREF -> 0 default-arg copy!)
+    field_assigns = (
+        ("req_ids", "req_ids"),
+        ("idx_mapping_np", "idx_np"),
+        ("num_scheduled_tokens", "nst_np"),
+        ("num_draft_tokens_per_req", "nd_pr"),
+        ("prefill_len_np", "pfl_np"),
+        ("num_computed_prefill_tokens_np", "ncpf_np"),
+        ("is_prefilling_np", "ipf_np"),
+        ("prefill_runs_as_decode_np", "prd_np"),
+        ("decode_graph_eligible", "dge"),
+        ("max_seq_len_np", "msl_np"),
+        ("has_structured_output_reqs", "has_so"),
+    )
+
+    def _emit_stamp_body(indent: str) -> list[str]:
+        b_lines = [
+            f"{indent}s = _ridx[0]",
+            f"{indent}_ridx[0] = (s + 1) & 3",
+            f"{indent}ib_obj, nc_arr, sl_arr, sl_slc, pa_out, pa_msl = _ring[s]",
+        ]
+        if num_reqs == 1:
+            i0 = int(idx_tuple[0])
+            b_lines.extend([
+                f"{indent}c0 = rc_np.item({i0})",
+                f"{indent}nc_arr[0] = c0",
+                f"{indent}max_sl = c0 + _ql",
+                f"{indent}sl_arr[0] = max_sl",
+            ])
+        elif num_reqs <= 8:
+            i0 = int(idx_tuple[0])
+            b_lines.extend([
+                f"{indent}c0 = rc_np.item({i0})",
+                f"{indent}nc_arr[0] = c0",
+                f"{indent}max_sl = c0 + _ql",
+                f"{indent}sl_arr[0] = max_sl",
+            ])
+            for j in range(1, num_reqs):
+                ij = int(idx_tuple[j])
+                b_lines.extend([
+                    f"{indent}c{j} = rc_np.item({ij})",
+                    f"{indent}nc_arr[{j}] = c{j}",
+                    f"{indent}s{j} = c{j} + _ql",
+                    f"{indent}sl_arr[{j}] = s{j}",
+                    f"{indent}if s{j} > max_sl: max_sl = s{j}",
+                ])
+        else:
+            if is_contig_idx:
+                b_lines.extend([
+                    f"{indent}nc_arr[:] = _rc_view if rc_np is _rc_orig else rc_np[:_nr]",
+                    f"{indent}_np_add(nc_arr, _ql, out=sl_slc)",
+                    f"{indent}max_sl = sl_slc.max().item()",
+                ])
+            else:
+                b_lines.extend([
+                    f"{indent}_np_take(rc_np, _idx_arr, out=nc_arr)",
+                    f"{indent}_np_add(nc_arr, _ql, out=sl_slc)",
+                    f"{indent}max_sl = sl_slc.max().item()",
+                ])
+        for fname, argn in field_assigns:
+            if fname in dyn_set:
+                b_lines.append(f"{indent}ib_obj.{fname} = {argn}")
+        if ring_t[0][5]:
+            b_lines.extend([
+                f"{indent}for md in pa_msl:",
+                f"{indent}    md.max_seq_len = max_sl",
+            ])
+        b_lines.extend([
+            f"{indent}_st._dt_v16_pa_ready = pa_out",
+            f"{indent}_st._dt_v16_ie_ready = _ie_view",
+            f"{indent}_st._dt_v16_ie_meta = _ie_meta",
+            f"{indent}return ib_obj",
+        ])
+        return b_lines
+
+    cdict: dict = {
+        "_ring": ring_t,
+        "_ridx": ring_idx,
+        "_st": st,
+        "_ie_view": ie_view,
+        "_ie_meta": ie_meta,
+        "_np_take": np.take,
+        "_np_add": np.add,
+        "_idx_arr": exp_idx_arr,
+        "_rc_orig": req_comp_all,
+        "_rc_view": rc_orig_view,
+        "_ql": int(q_len),
+        "_nr": int(num_reqs),
+    }
+    mk_lines = ["def _mk_stamp(_d):"]
+    for k in cdict:
+        mk_lines.append(f"    {k} = _d[{k!r}]")
+    mk_lines.append(
+        "    def step_meta_stamp(rc_np, req_ids, idx_np, nst_np, nd_pr, pfl_np, ncpf_np, ipf_np, prd_np, msl_np, dge, has_so):"
+    )
+    mk_lines.extend(_emit_stamp_body("        "))
+    mk_lines.append("    return step_meta_stamp")
+    ns: dict = {}
+    exec("\n".join(mk_lines), ns)
+    stamp_fn = ns["_mk_stamp"](cdict)
+    cert["step_meta_stamp"] = stamp_fn
+    cert["v16_ring"] = ring_t
+    cert["v16_stamp_meta"] = (cdict, _emit_stamp_body)
+    return stamp_fn
+
+
+def _compile_dt_v16_plan(
+    cert: dict,
+    runner,
+    st: _RunnerState,
+    scheduler_output,
+    batch_req_state,
+    batch_desc,
+    *,
+    is_b1: bool,
+    req_ids,
+    idx_tuple: tuple[int, ...],
+    num_reqs: int,
+    num_tokens: int,
+    num_tokens_after_padding: int,
+    num_reqs_padded: int,
+    q_len: int,
+    has_drafts: bool,
+    write_pad: bool,
+    imm_idx_ptr: int,
+    sconv_builders: list,
+    has_so: bool,
+    dge: bool,
+    exec_key: tuple,
+) -> None:
+    """Compile Wave-V16 zero-loop validator + direct launch + fused `step_meta_stamp` and
+    register into O(1) `st.dt_exec_lut[B][K]`."""
+    if "v14_dt_t" not in cert or "v14" not in cert:
+        _compile_dt_v14_plan(
+            cert,
+            runner,
+            st,
+            batch_desc,
+            is_b1=is_b1,
+            req_ids=req_ids,
+            idx_tuple=idx_tuple,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            num_tokens_after_padding=num_tokens_after_padding,
+            num_reqs_padded=num_reqs_padded,
+            q_len=q_len,
+            has_drafts=has_drafts,
+            write_pad=write_pad,
+            imm_idx_ptr=imm_idx_ptr,
+            sconv_builders=sconv_builders,
+            has_so=has_so,
+            dge=dge,
+            exec_key=exec_key,
+        )
+    vt = cert.get("v14_dt_t")
+    v14_d = cert.get("v14")
+    if vt is None or v14_d is None or st.region is None:
+        return
+    (
+        exec_owner,
+        _exp_b1, _exp_nr, _exp_nt, _exp_nt_pad, _exp_nr_pad,
+        _exp_ql, _exp_has_d, _exp_wpad, _exp_imm,
+        _exp_idx, _exp_idx0, _exp_rids, _exp_rid0,
+        _exp_so, _exp_dge,
+        bd_ref, bd_cg_name, bd_nt, bd_nr, bd_uni,
+        bt_mode_cpu, bt_bszs, exp_mbs,
+        ib_buf, rs_buf, bt_ref, prep_bufs, inner, exp_vw,
+        t_ids, p_ids, t_pos, p_pos, t_sl, p_sl, t_qsl, p_qsl, t_ip, p_ip,
+        t_ls, p_ls, t_dr, p_dr,
+        ncomp_obj, ncomp_has_gpu, t_nc, p_nc,
+        ie_buf, p_ie,
+        qsl_len, sl_len, dr_stride, ls_stride,
+        prep_core, extra_checks,
+        bt_seq_hdrs, bt_flat_tensors, bt_flat_gpu, bt_fallback,
+    ) = vt
+    if exec_owner is None or ie_buf is None:
+        return
+    # If bt_fallback or bt_mode_cpu is non-empty, delegate cleanly to V14 validator path (still 100% safe!)
+    if bt_fallback or bt_mode_cpu:
+        return
+
+    ie_view = v14_d.get("ie_view")
+    ie_meta = (ie_buf, p_ie, num_tokens) if ie_view is not None else None
+    stamp_fn = _compile_step_meta_stamp_v16(
+        cert,
+        runner,
+        st,
+        scheduler_output,
+        batch_req_state,
+        is_b1=is_b1,
+        req_ids=req_ids,
+        idx_tuple=idx_tuple,
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        num_tokens_after_padding=num_tokens_after_padding,
+        num_reqs_padded=num_reqs_padded,
+        q_len=q_len,
+        has_drafts=has_drafts,
+        ie_view=ie_view,
+        ie_meta=ie_meta,
+    )
+    if stamp_fn is None:
+        return
+
+    region = st.region
+    backend = region.b
+    exec_handle = v14_d.get("exec_handle")
+    exp_gen = v14_d.get("exec_gen")
+    imm_t = st._v16_imm_idx_by_ptr.get(imm_idx_ptr) if imm_idx_ptr else None
+    if imm_idx_ptr and imm_t is None:
+        return
+
+    pb_idx, p_pidx, pb_cu, p_pcu, pb_eidx, p_peidx, pb_epos, p_pepos, pb_li, p_pli = prep_core
+    idx_np_init = batch_req_state.idx_mapping_np
+    nst_np_init = batch_req_state.num_scheduled_tokens
+    nd_np_init = batch_req_state.num_draft_tokens_np
+    ncpf_np_init = batch_req_state.num_computed_prefill_tokens_np
+    pfl_np_init = batch_req_state.prefill_len_np
+    exp_idx_b = idx_np_init.tobytes()
+    exp_nst_b = nst_np_init.tobytes()
+    exp_nd_b = nd_np_init.tobytes() if (has_drafts and nd_np_init is not None) else b""
+    # Snapshot initial valid prefill-completed byte patterns (verified >= at compile time)
+    prefill_done_init = all(int(ncpf_np_init[i]) >= int(pfl_np_init[i]) for i in range(num_reqs))
+    exp_ncpf_b = ncpf_np_init.tobytes() if prefill_done_init else b""
+    exp_pfl_b = pfl_np_init.tobytes() if prefill_done_init else b""
+
+    stamp_cdict, emit_stamp_body = cert["v16_stamp_meta"]
+    rt_launch = backend._rt_launch if backend._rt_launch is not None else (backend.cudart.cudaGraphLaunch if backend.cudart is not None else None)
+    cuda_ok = backend._cuda_ok if backend._cuda_ok is not None else (backend.cudart.cudaError_t.cudaSuccess if backend.cudart is not None else 0)
+    use_direct_rt = (rt_launch is not None and exec_handle is not None)
+    spec_ref = getattr(runner, "speculator", None)
+    has_so_dummy = hasattr(scheduler_output, "is_dummy")
+    has_so_prof = hasattr(scheduler_output, "is_profile")
+    has_runner_dummy = hasattr(runner, "_in_dummy_run")
+
+    cdict: dict = dict(stamp_cdict)
+    cdict.update({
+        "_cert": cert,
+        "_cfg": CFG,
+        "_region": region,
+        "_backend": backend,
+        "_execs": backend.execs,
+        "_execs_get": backend.execs.get,
+        "_exec_gen_get": backend.exec_gen.get,
+        "_exec_key": exec_key,
+        "_exec_owner": exec_owner,
+        "_exec_handle": exec_handle,
+        "_exp_gen": exp_gen,
+        "_rt_launch": rt_launch,
+        "_cuda_ok": cuda_ok,
+        "_cur_stream_fn": torch.cuda.current_stream,
+        "_stats": region.stats,
+        "_stat_key": _STAT_STATIC_REPLAY_DT,
+        "_exp_nr": int(num_reqs),
+        "_exp_nt": int(num_tokens),
+        "_exp_nt_pad": int(num_tokens_after_padding),
+        "_exp_nr_pad": int(num_reqs_padded),
+        "_exp_has_d": bool(has_drafts),
+        "_exp_so": bool(has_so),
+        "_exp_dge": bool(dge),
+        "_exp_rids": list(req_ids),
+        "_exp_rid0": req_ids[0],
+        "_exp_idx_b": exp_idx_b,
+        "_exp_nst_b": exp_nst_b,
+        "_exp_nd_b": exp_nd_b,
+        "_exp_ncpf_b": exp_ncpf_b,
+        "_exp_pfl_b": exp_pfl_b,
+        "_bd_ref": bd_ref,
+        "_bd_cg_name": bd_cg_name,
+        "_bd_nt": bd_nt,
+        "_bd_nr": bd_nr,
+        "_bd_uni": bd_uni,
+        "_ib_buf": ib_buf,
+        "_rs_buf": rs_buf,
+        "_bt_ref": bt_ref,
+        "_prep_bufs": prep_bufs,
+        "_inner": inner,
+        "_exp_vw": bool(exp_vw),
+        "_spec_ref": spec_ref,
+        "_sys_mods_get": sys.modules.get,
+        "_t_ids": t_ids, "_p_ids": p_ids,
+        "_t_pos": t_pos, "_p_pos": p_pos,
+        "_t_sl": t_sl, "_p_sl": p_sl,
+        "_t_qsl": t_qsl, "_p_qsl": p_qsl,
+        "_t_ip": t_ip, "_p_ip": p_ip,
+        "_t_ls": t_ls, "_p_ls": p_ls,
+        "_t_dr": t_dr, "_p_dr": p_dr,
+        "_ncomp_obj": ncomp_obj, "_t_nc": t_nc, "_p_nc": p_nc,
+        "_ie_buf": ie_buf, "_p_ie": p_ie,
+        "_qsl_len": qsl_len, "_sl_len": sl_len,
+        "_dr_stride": dr_stride, "_ls_stride": ls_stride,
+        "_pb_idx": pb_idx, "_p_pidx": p_pidx,
+        "_pb_cu": pb_cu, "_p_pcu": p_pcu,
+        "_pb_eidx": pb_eidx, "_p_peidx": p_peidx,
+        "_pb_epos": pb_epos, "_p_pepos": p_pepos,
+        "_pb_li": pb_li, "_p_pli": p_pli,
+        "_imm_t": imm_t, "_imm_ptr": imm_idx_ptr,
+        "_sconv_shared": st._dt_sconv_shared,
+        "_is_tree_fn": _is_tree_spec_active,
+        "_type": type,
+        "_tuple": tuple,
+        "_len": len,
+        "_int": int,
+        "_bool": bool,
+        "_getattr": getattr,
+    })
+
+    # Build unrolled checks for extra_checks (model + sconv tensors) and block tables
+    extra_lines: list[str] = []
+    model_obj = getattr(runner, "model", None)
+    if model_obj is not None:
+        lm_o = model_obj.get_language_model() if hasattr(model_obj, "get_language_model") else model_obj
+        in_o = getattr(lm_o, "model", lm_o)
+        if hasattr(in_o, "_vw_mask"):
+            t_v = getattr(in_o, "_vw_mask", None)
+            p_v = int(t_v.data_ptr()) if isinstance(t_v, torch.Tensor) else 0
+            cdict["_ex_vwm_o"] = in_o; cdict["_ex_vwm_t"] = t_v; cdict["_ex_vwm_p"] = p_v
+            if p_v:
+                extra_lines.append("        if _ex_vwm_o._vw_mask is not _ex_vwm_t or _ex_vwm_t.data_ptr() != _ex_vwm_p: return None")
+            else:
+                extra_lines.append("        if _ex_vwm_o._vw_mask is not _ex_vwm_t: return None")
+        emb_o = getattr(in_o, "embed_tokens", None)
+        if emb_o is not None:
+            rw_v = getattr(emb_o, "_repl_weight", None)
+            if isinstance(rw_v, torch.Tensor):
+                cdict["_ex_emb_o"] = emb_o; cdict["_ex_emb_t"] = rw_v; cdict["_ex_emb_p"] = int(rw_v.data_ptr())
+                extra_lines.append("        if _ex_emb_o._repl_weight is not _ex_emb_t or _ex_emb_t.data_ptr() != _ex_emb_p: return None")
+            elif hasattr(emb_o, "weight"):
+                w_v = getattr(emb_o, "weight", None)
+                p_v = int(w_v.data_ptr()) if isinstance(w_v, torch.Tensor) else 0
+                cdict["_ex_emb_o"] = emb_o; cdict["_ex_emb_t"] = w_v; cdict["_ex_emb_p"] = p_v
+                if p_v:
+                    extra_lines.append("        if _ex_emb_o.weight is not _ex_emb_t or _ex_emb_t.data_ptr() != _ex_emb_p: return None")
+                else:
+                    extra_lines.append("        if _ex_emb_o.weight is not _ex_emb_t: return None")
+        en_o = getattr(in_o, "embed_norm", None)
+        if en_o is not None and hasattr(en_o, "weight"):
+            w_v = getattr(en_o, "weight", None)
+            p_v = int(w_v.data_ptr()) if isinstance(w_v, torch.Tensor) else 0
+            cdict["_ex_en_o"] = en_o; cdict["_ex_en_t"] = w_v; cdict["_ex_en_p"] = p_v
+            if p_v:
+                extra_lines.append("        if _ex_en_o.weight is not _ex_en_t or _ex_en_t.data_ptr() != _ex_en_p: return None")
+            else:
+                extra_lines.append("        if _ex_en_o.weight is not _ex_en_t: return None")
+
+    for si, sb in enumerate(sconv_builders):
+        t_si = getattr(sb, "seq_idx_buffer", None)
+        t_qs = getattr(sb, "query_start_buffer", None)
+        p_si = int(t_si.data_ptr()) if isinstance(t_si, torch.Tensor) else 0
+        p_qs = int(t_qs.data_ptr()) if isinstance(t_qs, torch.Tensor) else 0
+        cdict[f"_sc_o{si}"] = sb
+        cdict[f"_sc_si{si}"] = t_si; cdict[f"_sc_psi{si}"] = p_si
+        cdict[f"_sc_qs{si}"] = t_qs; cdict[f"_sc_pqs{si}"] = p_qs
+        c_si = f"_sc_o{si}.seq_idx_buffer is not _sc_si{si}" + (f" or _sc_si{si}.data_ptr() != _sc_psi{si}" if p_si else "")
+        c_qs = f"_sc_o{si}.query_start_buffer is not _sc_qs{si}" + (f" or _sc_qs{si}.data_ptr() != _sc_pqs{si}" if p_qs else "")
+        extra_lines.append(f"        if {c_si} or {c_qs}: return None")
+
+    bt_lines: list[str] = []
+    if bt_ref is not None:
+        for attr in ("block_tables", "input_block_tables", "slot_mappings", "num_blocks"):
+            seq = getattr(bt_ref, attr, None)
+            if isinstance(seq, (list, tuple)):
+                cdict[f"_bts_{attr}"] = seq
+                bt_lines.append(f"        if _bt_ref.{attr} is not _bts_{attr} or _len(_bts_{attr}) != {len(seq)}: return None")
+        for bi, (seq, idx_i, exp_t, exp_ptr, exp_sh, exp_st) in enumerate(bt_flat_tensors):
+            cdict[f"_btq{bi}"] = seq
+            cdict[f"_btt{bi}"] = exp_t
+            cdict[f"_btp{bi}"] = exp_ptr
+            cdict[f"_btsh{bi}"] = exp_sh
+            cdict[f"_btst{bi}"] = exp_st
+            bt_lines.append(
+                f"        if _btq{bi}[{idx_i}] is not _btt{bi} or _btt{bi}.data_ptr() != _btp{bi}"
+                f" or _btt{bi}.shape != _btsh{bi} or _btt{bi}.stride() != _btst{bi}: return None"
+            )
+        for bi, (seq, idx_i, exp_item, exp_gpu, exp_ptr, exp_sh, exp_st) in enumerate(bt_flat_gpu):
+            cdict[f"_bgq{bi}"] = seq
+            cdict[f"_bgi{bi}"] = exp_item
+            cdict[f"_bgt{bi}"] = exp_gpu
+            cdict[f"_bgp{bi}"] = exp_ptr
+            cdict[f"_bgsh{bi}"] = exp_sh
+            cdict[f"_bgst{bi}"] = exp_st
+            bt_lines.append(
+                f"        if _bgq{bi}[{idx_i}] is not _bgi{bi} or _bgi{bi}.gpu is not _bgt{bi}"
+                f" or _bgt{bi}.data_ptr() != _bgp{bi} or _bgt{bi}.shape != _bgsh{bi}"
+                f" or _bgt{bi}.stride() != _bgst{bi}: return None"
+            )
+
+    # Closure factory (LOAD_DEREF) -> ONLY 6 positional args on hot path, 0 default-arg copying!
+    fn_lines = ["def _mk_v16_dt(_d):"]
+    for k in cdict:
+        fn_lines.append(f"    {k} = _d[{k!r}]")
+    fn_lines.extend([
+        "    def v16_dt_step(runner, scheduler_output, batch_req_state, batch_desc, req_ids, nt_s):",
+        "        if nt_s != _exp_nt or _st.disabled or _st.b1_failed or _st.b1_dtypes is None or 'dt' not in _cfg['regions']: return None",
+        "        max_r = _cfg['max_reqs']",
+        "        if max_r and _exp_nr > max_r: return None",
+        "        if batch_desc.cg_mode.name != _bd_cg_name or (batch_desc.num_ubatches or 1) > 1 or batch_desc.num_tokens != _bd_nt or (batch_desc.num_reqs or _exp_nr) != _exp_nr_pad: return None",
+        "        if batch_desc is not _bd_ref and _bool(_getattr(batch_desc, 'uniform', False)) != _bd_uni: return None",
+        "        if scheduler_output.scheduled_encoder_inputs: return None",
+    ])
+    if has_so_dummy and has_so_prof:
+        fn_lines.append("        if scheduler_output.is_dummy or scheduler_output.is_profile: return None")
+    else:
+        fn_lines.append("        if _getattr(scheduler_output, 'is_dummy', False) or _getattr(scheduler_output, 'is_profile', False): return None")
+    if has_runner_dummy:
+        fn_lines.append("        if runner._in_dummy_run: return None")
+    else:
+        fn_lines.append("        if _getattr(runner, '_in_dummy_run', False): return None")
+    fn_lines.extend([
+        "        if runner.pcp_manager is not None or (runner.dcp_size or 1) > 1 or runner.is_encoder_decoder or not runner.is_first_pp_rank or not runner.is_last_pp_rank or runner.model_state.num_new_sampled_tokens_per_step != 1 or runner.adaptive_verification is not None or runner.fast_prefill is not None or runner.model_config.rswa_window is not None: return None",
+        "        if _bool(scheduler_output.scheduled_spec_decode_tokens) != _exp_has_d: return None",
+    ])
+    if num_reqs == 1:
+        fn_lines.append("        eff_idx_np = batch_req_state.idx_mapping_np")
+        fn_lines.append("        if req_ids[0] != _exp_rid0 or eff_idx_np.tobytes() != _exp_idx_b: return None")
+    else:
+        fn_lines.append("        eff_idx_np = batch_req_state.idx_mapping_np")
+        fn_lines.append("        if req_ids != _exp_rids or eff_idx_np.tobytes() != _exp_idx_b: return None")
+    fn_lines.extend([
+        "        nst_np = batch_req_state.num_scheduled_tokens",
+        "        if nst_np.tobytes() != _exp_nst_b: return None",
+    ])
+    if has_drafts:
+        fn_lines.extend([
+            "        nd_np = batch_req_state.num_draft_tokens_np",
+            "        if nd_np is None or nd_np.tobytes() != _exp_nd_b: return None",
+        ])
+    else:
+        fn_lines.append("        nd_np = None")
+    fn_lines.extend([
+        "        ncpf_np = batch_req_state.num_computed_prefill_tokens_np",
+        "        pfl_np = batch_req_state.prefill_len_np",
+        "        if ncpf_np.tobytes() != _exp_ncpf_b or pfl_np.tobytes() != _exp_pfl_b:",
+        f"            for _pi in range({num_reqs}):",
+        "                if ncpf_np[_pi] < pfl_np[_pi]: return None",
+        "        has_so_now = _bool(scheduler_output.has_structured_output_requests)",
+        "        if has_so_now != _exp_so: return None",
+        "        dge_now = _bool(batch_req_state.decode_graph_eligible)",
+        "        if dge_now != _exp_dge: return None",
+        "        if runner.input_buffers is not _ib_buf or runner.req_states is not _rs_buf or runner.block_tables is not _bt_ref: return None",
+    ])
+    if is_b1:
+        fn_lines.append("        if _st.b1_bufs is not _prep_bufs: return None")
+        if spec_ref is not None and hasattr(spec_ref, "_tree_spec_on"):
+            fn_lines.extend([
+                "        if runner.speculator is not _spec_ref or _spec_ref._tree_spec_on: return None",
+                "        if _sys_mods_get('tree_spec_runtime') is not None or _sys_mods_get('vllm.models.inkling2.ops.tree_spec_runtime') is not None:",
+                "            if _is_tree_fn(runner, 1, _st): return None",
+            ])
+        else:
+            fn_lines.append("        if _is_tree_fn(runner, 1, _st): return None")
+        for si in range(len(st._dt_sconv_shared)):
+            fn_lines.append(f"        if _sconv_shared[{si}].get('dirty', False): return None")
+    else:
+        fn_lines.append("        if _st.bn_bufs is not _prep_bufs: return None")
+    if inner is not None:
+        fn_lines.append("        if _bool(_inner._vw) != _exp_vw: return None")
+
+    # Core buffer identity + data_ptr + shape/stride checks (straight-line LOAD_DEREF!)
+    dr_expr = "_rs_buf.draft_tokens" if has_drafts else "_rs_buf.last_sampled_tokens"
+    nc_expr = "_ncomp_obj.gpu" if ncomp_has_gpu else "_ncomp_obj"
+    fn_lines.extend([
+        "        if (",
+        "            _ib_buf.input_ids is not _t_ids or (_p_ids and _t_ids.data_ptr() != _p_ids)",
+        "            or _ib_buf.positions is not _t_pos or (_p_pos and _t_pos.data_ptr() != _p_pos)",
+        "            or _ib_buf.seq_lens is not _t_sl or (_p_sl and _t_sl.data_ptr() != _p_sl)",
+        "            or _ib_buf.query_start_loc is not _t_qsl or (_p_qsl and _t_qsl.data_ptr() != _p_qsl)",
+        "            or _ib_buf.is_padding is not _t_ip or (_p_ip and _t_ip.data_ptr() != _p_ip)",
+        "            or _rs_buf.last_sampled_tokens is not _t_ls or _t_ls.data_ptr() != _p_ls",
+        f"            or {dr_expr} is not _t_dr or _t_dr.data_ptr() != _p_dr",
+        "            or _rs_buf.num_computed_tokens is not _ncomp_obj",
+        f"            or {nc_expr} is not _t_nc or (_p_nc and _t_nc.data_ptr() != _p_nc)",
+        "            or _st.inputs_embeds_buf is not _ie_buf or (_p_ie and _ie_buf.data_ptr() != _p_ie)",
+        "            or _t_qsl.shape[0] != _qsl_len or _t_sl.shape[0] != _sl_len",
+        "            or _t_dr.stride(0) != _dr_stride or _t_ls.stride(0) != _ls_stride",
+        "            or _ie_buf.shape[0] < _exp_nt",
+        "        ): return None",
+    ])
+    if has_drafts:
+        fn_lines.append("        if _t_dr.dim() != 2 or _t_dr.stride(1) != 1: return None")
+    fn_lines.extend([
+        "        if (",
+        "            _prep_bufs['idx'] is not _pb_idx or _pb_idx.data_ptr() != _p_pidx",
+        "            or _prep_bufs['cu'] is not _pb_cu or _pb_cu.data_ptr() != _p_pcu",
+        "            or _prep_bufs['expanded_idx'] is not _pb_eidx or _pb_eidx.data_ptr() != _p_peidx",
+        "            or _prep_bufs['expanded_pos'] is not _pb_epos or _pb_epos.data_ptr() != _p_pepos",
+        "            or _prep_bufs['logits_indices'] is not _pb_li or _pb_li.data_ptr() != _p_pli",
+        "        ): return None",
+    ])
+    if imm_idx_ptr:
+        fn_lines.append("        if _imm_t.data_ptr() != _imm_ptr: return None")
+    fn_lines.extend(extra_lines)
+    fn_lines.extend(bt_lines)
+
+    # Direct inline cudaGraphLaunch (100% fail-closed on exec_owner, exec_gen, active, default stream)
+    fn_lines.extend([
+        "        if _region.active or _execs_get(_exec_key) is not _exec_owner or _exec_gen_get(_exec_key) != _exp_gen: return None",
+        "        cur_s = _cur_stream_fn()",
+        "        cs = cur_s.cuda_stream",
+        "        if cs == _backend._last_cs:",
+        "            st_h = _backend._last_st_h",
+        "        else:",
+        "            if _backend.is_default(cur_s): return None",
+        "            _st._last_nondef_cs = cs",
+        "            st_h = _backend._stream_handles.get(cs)",
+        "            if st_h is None and _backend.cudart is not None:",
+        "                st_h = _backend.cudart.cudaStream_t(init_value=cs)",
+        "                if _len(_backend._stream_handles) < 64: _backend._stream_handles[cs] = st_h",
+        "            _backend._last_cs = cs",
+        "            _backend._last_st_h = st_h",
+    ])
+    if use_direct_rt:
+        fn_lines.extend([
+            "        res = _rt_launch(_exec_handle, st_h)",
+            "        if (res[0] if _type(res) is _tuple else res) != _cuda_ok: return None",
+        ])
+    else:
+        fn_lines.append("        if not _backend.replay_static_v14(_exec_key, _exec_owner, _exec_handle, _exp_gen, cur_s): return None")
+    fn_lines.extend([
+        "        if _backend.max_execs > 0 and _len(_execs) >= _backend.max_execs and _backend._last_mru_key is not _exec_key:",
+        "            _execs.move_to_end(_exec_key)",
+        "            _backend._last_mru_key = _exec_key",
+        "        _backend.static_replay_hits += 1",
+        "        _stats[_stat_key] += 1",
+        "        _region.n += 1",
+    ])
+    if (not is_b1) and st._dt_sconv_shared:
+        for si in range(len(st._dt_sconv_shared)):
+            fn_lines.extend([
+                f"        _sconv_shared[{si}]['dirty'] = True",
+                f"        if _exp_nt_pad > (_sconv_shared[{si}].get('dirty_len') or 0): _sconv_shared[{si}]['dirty_len'] = _exp_nt_pad",
+            ])
+    # Inline fused `step_meta_stamp` (0 extra Python frame, 0 InputBatch alloc, 0 AttentionMetadata copy!)
+    fn_lines.extend([
+        "        _st.dt_static_armed = _cert",
+        "        rc_np = _rs_buf.num_computed_tokens_np",
+        "        idx_np = eff_idx_np",
+        "        nd_pr = nd_np",
+        "        ipf_np = batch_req_state.is_prefilling_np",
+        "        prd_np = batch_req_state.prefill_runs_as_decode_np",
+        "        msl_np = batch_req_state.max_seq_len_np",
+        "        dge = dge_now",
+        "        has_so = has_so_now",
+    ])
+    fn_lines.extend(emit_stamp_body("        "))
+    fn_lines.append("    return v16_dt_step")
+    ns: dict = {}
+    try:
+        exec("\n".join(fn_lines), ns)
+        fn_compiled = ns["_mk_v16_dt"](cdict)
+    except Exception:  # noqa: BLE001
+        return
+    cert["v16_dt_step"] = fn_compiled
+    _register_dt_v16_lut(st, cert, num_reqs, q_len)
+
+
+def _compile_td_v16_plan(cert: dict, spec, st: _RunnerState, drafts_t: torch.Tensor | None, qcgm=None) -> None:
+    """Compile Wave-V16 zero-loop 'td' validator + direct launch (supporting BOTH temp==0 SyncFree
+    and temp>0 SyncFree-Temp, incl. pinned static GPU draft_logits) and register in `td_exec_lut[B][K][slot]`."""
+    if "v14_td_t" not in cert or "v14" not in cert:
+        _compile_td_v14_plan(cert, spec, st, drafts_t)
+    vt = cert.get("v14_td_t")
+    v14_d = cert.get("v14")
+    if vt is None or v14_d is None or spec is None or st.region is None:
+        return
+    (
+        exec_owner,
+        exp_rids, exp_rid0,
+        exp_nr, exp_nt, exp_nt_nospec, exp_nspec, exp_ndraft,
+        exp_vw,
+        p_idx, p_qsl, p_pos, p_ids, p_sl, p_li, p_cu, p_eidx,
+        p_s, p_ns, p_nr,
+    ) = vt
+    if exec_owner is None:
+        return
+
+    region = st.region
+    backend = region.b
+    exec_key = v14_d["exec_key"]
+    exec_handle = v14_d.get("exec_handle")
+    exp_gen = v14_d.get("exec_gen")
+    r_slot = int(cert["ring_slot"])
+    dl_t = getattr(spec, "draft_logits", None)
+    if dl_t is not None and not (STATIC_TEMP_REPLAY_V16 and isinstance(dl_t, torch.Tensor)):
+        return
+    exp_dl_ptr = int(dl_t.data_ptr()) if isinstance(dl_t, torch.Tensor) else 0
+    exp_dl_sh = tuple(dl_t.shape) if isinstance(dl_t, torch.Tensor) else None
+
+    if qcgm is None:
+        qcgm = getattr(spec, "query_cudagraph_manager", None)
+    orig_qrfg = st._orig_qrfg
+    if orig_qrfg is None and qcgm is not None:
+        orig_qrfg = getattr(qcgm, "_inkling_dtg_orig_qrfg", getattr(qcgm, "run_fullgraph", None))
+    draft_tok_t = v14_d.get("draft_tok_t")
+    draft_tok_ptr = v14_d.get("draft_tok_ptr", 0)
+    drafts_view = v14_d.get("drafts_view")
+    full_drafts_view = v14_d.get("full_drafts_view")
+    prop_bundle = (
+        orig_qrfg,
+        cert.get("draft_batch_desc"),
+        r_slot,
+        exp_nr,
+        draft_tok_t,
+        draft_tok_ptr,
+        drafts_view,
+        full_drafts_view,
+        bool(cert.get("write_req_ok", False)),
+        cert.get("idx_mapping"),
+        int(cert.get("drafts_cols", exp_nspec)),
+    )
+
+    hetero_on_0 = bool(getattr(spec, "_hetero_budget_on", False))
+    ctx_tau_on_0 = bool(getattr(spec, "_ctx_adaptive_tau_on", False))
+    sam_on_0 = bool(getattr(spec, "_sam_hybrid_on", False))
+    has_ext_vw = (len(exp_vw) == 7)
+    has_dg = hasattr(spec, "_next_draft_cap_g")
+    has_wc = hasattr(spec, "_effective_w_cap")
+    has_tau = hasattr(spec, "_effective_tau_override")
+    has_het = hasattr(spec, "_hetero_is_active_for_b")
+    has_sam = hasattr(spec, "_sam_is_active_for_b")
+    has_mcap = hasattr(spec, "_hetero_m_cap_for_b")
+
+    rt_launch = backend._rt_launch if backend._rt_launch is not None else (backend.cudart.cudaGraphLaunch if backend.cudart is not None else None)
+    cuda_ok = backend._cuda_ok if backend._cuda_ok is not None else (backend.cudart.cudaError_t.cudaSuccess if backend.cudart is not None else 0)
+    use_direct_rt = (rt_launch is not None and exec_handle is not None)
+
+    cdict: dict = {
+        "_cert": cert,
+        "_st": st,
+        "_cfg": CFG,
+        "_region": region,
+        "_backend": backend,
+        "_execs": backend.execs,
+        "_execs_get": backend.execs.get,
+        "_exec_gen_get": backend.exec_gen.get,
+        "_exec_key": exec_key,
+        "_exec_owner": exec_owner,
+        "_exec_handle": exec_handle,
+        "_exp_gen": exp_gen,
+        "_r_slot": r_slot,
+        "_rt_launch": rt_launch,
+        "_cuda_ok": cuda_ok,
+        "_cur_stream_fn": torch.cuda.current_stream,
+        "_stats": region.stats,
+        "_stat_key": _STAT_STATIC_REPLAY_TD,
+        "_prop_bundle": prop_bundle,
+        "_exp_rids": list(exp_rids),
+        "_exp_rid0": exp_rid0,
+        "_exp_nr": int(exp_nr),
+        "_exp_nt": int(exp_nt),
+        "_exp_nt_nospec": int(exp_nt_nospec),
+        "_exp_nspec": int(exp_nspec),
+        "_exp_ndraft": int(exp_ndraft),
+        "_p_idx": p_idx, "_p_qsl": p_qsl, "_p_pos": p_pos, "_p_ids": p_ids,
+        "_p_sl": p_sl, "_p_li": p_li, "_p_cu": p_cu, "_p_eidx": p_eidx,
+        "_p_s": p_s, "_p_ns": p_ns, "_p_nr": p_nr,
+        "_exp_dl_t": dl_t, "_exp_dl_ptr": exp_dl_ptr, "_exp_dl_sh": exp_dl_sh,
+        "_exp_vw0": exp_vw[0] if len(exp_vw) >= 1 else None,
+        "_exp_vw1": exp_vw[1] if len(exp_vw) >= 2 else 0,
+        "_exp_vw2": exp_vw[2] if len(exp_vw) >= 3 else 0.0,
+        "_exp_vw3": exp_vw[3] if len(exp_vw) >= 4 else False,
+        "_exp_vw4": exp_vw[4] if len(exp_vw) >= 5 else 0,
+        "_exp_vw5": exp_vw[5] if len(exp_vw) >= 6 else False,
+        "_exp_vw6": exp_vw[6] if len(exp_vw) >= 7 else False,
+        "_exp_ext_vw": has_ext_vw,
+        "_type": type,
+        "_tuple": tuple,
+        "_len": len,
+        "_int": int,
+        "_float": float,
+        "_bool": bool,
+        "_getattr": getattr,
+    }
+    fn_lines = ["def _mk_v16_td(_d):"]
+    for k in cdict:
+        fn_lines.append(f"    {k} = _d[{k!r}]")
+    fn_lines.extend([
+        "    def v16_td_step(runner, ib, num_spec_sched, p_s, p_ns, p_nr):",
+        "        if _st.disabled or 'td' not in _cfg['regions'] or ib.num_reqs != _exp_nr or ib.num_tokens != _exp_nt or num_spec_sched != _exp_nspec or p_s != _p_s or p_ns != _p_ns or p_nr != _p_nr: return False",
+        "        max_r = _cfg['max_reqs']",
+        "        if max_r and _exp_nr > max_r: return False",
+        "        spec = runner.speculator",
+        "        if spec is None or spec.query_cudagraph_manager is None or ib.has_prefill or runner.pcp_manager is not None or (runner.dcp_size or 1) > 1 or (spec.supports_mm_inputs and runner.model_state.supports_mm_inputs): return False",
+        "        if ib.num_tokens_no_spec != _exp_nt_nospec or ib.num_draft_tokens != _exp_ndraft: return False",
+    ])
+    if exp_nr == 1:
+        fn_lines.append("        rids = ib.req_ids")
+        fn_lines.append("        if not rids or rids[0] != _exp_rid0: return False")
+    else:
+        fn_lines.append("        if ib.req_ids != _exp_rids: return False")
+    fn_lines.extend([
+        "        t = ib.idx_mapping",
+        "        if (t.data_ptr() if t is not None else 0) != _p_idx: return False",
+        "        t = ib.query_start_loc",
+        "        if (t.data_ptr() if t is not None else 0) != _p_qsl: return False",
+        "        t = ib.positions",
+        "        if (t.data_ptr() if t is not None else 0) != _p_pos: return False",
+        "        t = ib.input_ids",
+        "        if (t.data_ptr() if t is not None else 0) != _p_ids: return False",
+        "        t = ib.seq_lens",
+        "        if (t.data_ptr() if t is not None else 0) != _p_sl: return False",
+        "        t = ib.logits_indices",
+        "        if (t.data_ptr() if t is not None else 0) != _p_li: return False",
+        "        t = ib.cu_num_logits",
+        "        if (t.data_ptr() if t is not None else 0) != _p_cu: return False",
+        "        t = ib.expanded_idx_mapping",
+        "        if (t.data_ptr() if t is not None else 0) != _p_eidx: return False",
+        "        if spec._tree_spec_on or spec._cl_on or spec._vw_stats_on or spec.context_kv_only: return False",
+    ])
+    if exp_dl_ptr == 0:
+        fn_lines.append("        if spec.draft_logits is not None: return False")
+    else:
+        fn_lines.append(
+            "        if spec.draft_logits is not _exp_dl_t or _exp_dl_t.data_ptr() != _exp_dl_ptr or _exp_dl_t.shape != _exp_dl_sh: return False"
+        )
+    fn_lines.extend([
+        "        hetero_on = _bool(spec._hetero_budget_on)",
+        "        ctx_tau_on = _bool(spec._ctx_adaptive_tau_on)",
+        "        sam_on = _bool(spec._sam_hybrid_on)",
+        "        if (hetero_on or ctx_tau_on or sam_on) != _exp_ext_vw: return False",
+    ])
+    if has_dg:
+        fn_lines.append("        draft_g = spec._next_draft_cap_g(_exp_nr)")
+    else:
+        fn_lines.append("        draft_g = None")
+    if has_wc:
+        fn_lines.append("        w_cap = _int(spec._effective_w_cap(_exp_nr, num_spec_sched))")
+    else:
+        fn_lines.append("        w_cap = num_spec_sched")
+    if has_tau:
+        fn_lines.append("        tau_ov = _float(spec._effective_tau_override(_exp_nr))")
+    else:
+        fn_lines.append("        tau_ov = 0.0")
+    fn_lines.append("        if draft_g != _exp_vw0 or w_cap != _exp_vw1 or tau_ov != _exp_vw2: return False")
+    if has_ext_vw:
+        het_expr = "_bool(spec._hetero_is_active_for_b(_exp_nr))" if has_het else "(hetero_on and _exp_nr >= 2)"
+        sam_expr = "_bool(spec._sam_is_active_for_b(_exp_nr))" if has_sam else "sam_on"
+        mcap_expr = "_int(spec._hetero_m_cap_for_b(_exp_nr))" if has_mcap else "_int(_getattr(spec, '_hetero_budget_m_cap', 0))"
+        fn_lines.extend([
+            f"        hetero_active = {het_expr}",
+            f"        sam_active = {sam_expr}",
+            f"        m_cap_b = ({mcap_expr}) if hetero_active else 0",
+            "        if hetero_active != _exp_vw3 or m_cap_b != _exp_vw4 or ctx_tau_on != _exp_vw5 or sam_active != _exp_vw6: return False",
+            "        if sam_on:",
+            "            if _getattr(spec, '_sam_mode', '') == 'cpu':",
+            "                if _exp_nr <= _int(_getattr(spec, '_sam_max_b', 1)): return False",
+            "            elif sam_active:",
+            "                if not _getattr(spec, '_sam_gpu_ready', False): return False",
+            "                cap_sam = _getattr(spec, '_sam_boost_in_graph_captured', ())",
+            "                if draft_g is None or draft_g not in cap_sam: return False",
+        ])
+    else:
+        fn_lines.append("        hetero_active = False")
+    fn_lines.extend([
+        "        if spec._vw_mode != 'off':",
+        "            if not spec._vw_is_conf: return False",
+        "            cap_vw = spec._graph_vw_conf_captured",
+        "            if not cap_vw: return False",
+    ])
+    if has_dg:
+        fn_lines.extend([
+            "            if draft_g is None or draft_g not in cap_vw: return False",
+            "            ce = cap_vw[draft_g]",
+            "            if _type(ce) is _tuple and _len(ce) >= 2:",
+            "                want_tau = -2.0 if hetero_active else tau_ov",
+            "                if _int(ce[0]) != w_cap or _float(ce[1]) != want_tau: return False",
+        ])
+    else:
+        fn_lines.append("            if not any(g >= _exp_nr for g in cap_vw): return False")
+
+    # Direct inline cudaGraphLaunch
+    fn_lines.extend([
+        "        if _region.active or _execs_get(_exec_key) is not _exec_owner or _exec_gen_get(_exec_key) != _exp_gen: return False",
+        "        cur_s = _cur_stream_fn()",
+        "        cs = cur_s.cuda_stream",
+        "        if cs == _backend._last_cs:",
+        "            st_h = _backend._last_st_h",
+        "        else:",
+        "            if _backend.is_default(cur_s): return False",
+        "            _st._last_nondef_cs = cs",
+        "            st_h = _backend._stream_handles.get(cs)",
+        "            if st_h is None and _backend.cudart is not None:",
+        "                st_h = _backend.cudart.cudaStream_t(init_value=cs)",
+        "                if _len(_backend._stream_handles) < 64: _backend._stream_handles[cs] = st_h",
+        "            _backend._last_cs = cs",
+        "            _backend._last_st_h = st_h",
+    ])
+    if use_direct_rt:
+        fn_lines.extend([
+            "        res = _rt_launch(_exec_handle, st_h)",
+            "        if (res[0] if _type(res) is _tuple else res) != _cuda_ok: return False",
+        ])
+    else:
+        fn_lines.append("        if not _backend.replay_static_v14(_exec_key, _exec_owner, _exec_handle, _exp_gen, cur_s): return False")
+    fn_lines.extend([
+        "        if _backend.max_execs > 0 and _len(_execs) >= _backend.max_execs and _backend._last_mru_key is not _exec_key:",
+        "            _execs.move_to_end(_exec_key)",
+        "            _backend._last_mru_key = _exec_key",
+        "        _backend.static_replay_hits += 1",
+        "        _stats[_stat_key] += 1",
+        "        _region.n += 1",
+        "        _st.cur_ring_slot = _r_slot",
+        "        _st.cur_ring_fenced = False",
+        "        _st.td_static_stream = cur_s",
+        "        _st.td_static_armed = _cert",
+        "        _st._td_v16_armed = _prop_bundle",
+        "        return True",
+        "    return v16_td_step",
+    ])
+    ns: dict = {}
+    try:
+        exec("\n".join(fn_lines), ns)
+        fn_compiled = ns["_mk_v16_td"](cdict)
+    except Exception:  # noqa: BLE001
+        return
+    cert["v16_td_step"] = fn_compiled
+    cert["v16_td_prop_bundle"] = prop_bundle
+    cert["v16_temp_compat"] = bool(STATIC_TEMP_REPLAY_V16)
+    _register_td_v16_lut(st, cert, exp_nr, exp_nspec, r_slot)
+
+
 def _build_dt_static_input_batch(
     runner,
     st: _RunnerState,
@@ -3271,6 +5305,174 @@ def _build_dt_static_input_batch(
     bufs = st.b1_bufs if is_b1 else st.bn_bufs
     assert bufs is not None and st.b1_ib_cls is not None and st.b1_ib_fields is not None
     num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
+    num_draft_tokens_per_req = batch_req_state.num_draft_tokens_np if has_drafts else None
+
+    if FAST_REPLAY_V14 and cert is not None:
+        ib_v14 = cert.get("ib_v14")
+        req_comp_all = runner.req_states.num_computed_tokens_np
+        if ib_v14 is None:
+            if is_b1:
+                idx_mapping = bufs["idx"]
+                cu_num_logits = bufs["cu"]
+            else:
+                idx_mapping = bufs["idx"][:num_reqs]
+                cu_num_logits = bufs["cu"][: num_reqs + 1]
+            expanded_idx_mapping = bufs["expanded_idx"][:num_tokens]
+            expanded_local_pos = bufs["expanded_pos"][:num_tokens]
+            logits_indices = bufs["logits_indices"][:num_tokens]
+            ib_b = runner.input_buffers
+            cu_num_logits_np, query_start_loc_np = _get_cached_qsl_np(
+                st, num_reqs, q_len, num_reqs_padded
+            )
+            raw_base = {
+                "num_reqs": num_reqs,
+                "num_reqs_after_padding": num_reqs_padded,
+                "idx_mapping": idx_mapping,
+                "expanded_idx_mapping": expanded_idx_mapping,
+                "expanded_local_pos": expanded_local_pos,
+                "num_tokens": num_tokens,
+                "num_tokens_after_padding": num_tokens_after_padding,
+                "num_draft_tokens": num_reqs * (q_len - 1) if has_drafts else 0,
+                "num_admitted_draft_tokens": None,
+                "query_start_loc": ib_b.query_start_loc[: num_reqs_padded + 1],
+                "query_start_loc_np": query_start_loc_np,
+                "seq_lens": ib_b.seq_lens[:num_reqs_padded],
+                "dcp_local_seq_lens": None,
+                "has_prefill": False,
+                "input_ids": ib_b.input_ids[:num_tokens_after_padding],
+                "positions": ib_b.positions[:num_tokens_after_padding],
+                "is_padding": ib_b.is_padding[:num_tokens_after_padding],
+                "logits_indices": logits_indices,
+                "cu_num_logits": cu_num_logits,
+                "cu_num_logits_np": cu_num_logits_np,
+                "prompt_lens": None,
+                "fast_prefill": None,
+                "max_query_len": None,
+            }
+            drop = set(st.b1_ib_drop) if st.b1_ib_drop else set()
+            fields = st.b1_ib_fields
+            base_kw = {k: v for k, v in raw_base.items() if k in fields and k not in drop}
+            dyn_names = (
+                "req_ids",
+                "idx_mapping_np",
+                "num_scheduled_tokens",
+                "num_draft_tokens_per_req",
+                "seq_lens_cpu_upper_bound",
+                "num_computed_tokens_np",
+                "prefill_len_np",
+                "num_computed_prefill_tokens_np",
+                "is_prefilling_np",
+                "prefill_runs_as_decode_np",
+                "decode_graph_eligible",
+                "max_seq_len_np",
+                "has_structured_output_reqs",
+            )
+            dyn_set = frozenset(k for k in dyn_names if k in fields and k not in drop)
+            # Compile positional constructor plan when all __init__ params are positional-compatible
+            pos_template = None
+            dyn_pos = None
+            try:
+                import inspect  # noqa: PLC0415
+
+                sig = inspect.signature(st.b1_ib_cls.__init__)
+                params = list(sig.parameters.values())[1:]  # skip self
+                ok_pos = True
+                tmpl: list = []
+                dmap: list[int] = [-1] * len(dyn_names)
+                dyn_index = {n: i for i, n in enumerate(dyn_names)}
+                for p_idx, p in enumerate(params):
+                    if p.kind not in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    ):
+                        ok_pos = False
+                        break
+                    pname = p.name
+                    if pname in dyn_set:
+                        dmap[dyn_index[pname]] = p_idx
+                        tmpl.append(None)
+                    elif pname in base_kw:
+                        tmpl.append(base_kw[pname])
+                    elif p.default is not inspect.Parameter.empty:
+                        tmpl.append(p.default)
+                    else:
+                        ok_pos = False
+                        break
+                if ok_pos:
+                    pos_template = tmpl
+                    dyn_pos = tuple(dmap)
+            except Exception:  # noqa: BLE001
+                pos_template = None
+                dyn_pos = None
+            # 4-slot pre-allocated (ncomp_np, sl_np, sl_t) ring (zero per-step NumPy/Tensor alloc!)
+            ring = []
+            nc_dt = req_comp_all.dtype
+            for _ in range(NSLOT):
+                nc_arr = np.empty(num_reqs, dtype=nc_dt)
+                sl_arr = np.zeros(num_reqs_padded, dtype=np.int32)
+                ring.append((nc_arr, sl_arr, torch.from_numpy(sl_arr)))
+            ib_v14 = [0, tuple(ring), st.b1_ib_cls, pos_template, dyn_pos, base_kw, dyn_set]
+            cert["ib_v14"] = ib_v14
+
+        r_cur = ib_v14[0]
+        ib_v14[0] = (r_cur + 1) & 3
+        ncomp_np, sl_np, sl_t = ib_v14[1][r_cur]
+        if num_reqs == 1:
+            c0 = int(req_comp_all[int(idx_mapping_np[0])])
+            ncomp_np[0] = c0
+            s0 = c0 + int(num_scheduled_tokens_np[0])
+            sl_np[0] = s0
+            max_sl = s0
+        elif num_reqs <= 8:
+            max_sl = 0
+            for _i in range(num_reqs):
+                ci = int(req_comp_all[int(idx_mapping_np[_i])])
+                ncomp_np[_i] = ci
+                si = ci + int(num_scheduled_tokens_np[_i])
+                sl_np[_i] = si
+                if si > max_sl:
+                    max_sl = si
+        else:
+            np.take(req_comp_all, idx_mapping_np, out=ncomp_np)
+            np.add(ncomp_np, num_scheduled_tokens_np, out=sl_np[:num_reqs])
+            max_sl = int(np.max(sl_np[:num_reqs]))
+        st.dt_last_sl = (sl_np, max_sl)
+        ib_cls = ib_v14[2]
+        pos_template = ib_v14[3]
+        if pos_template is not None:
+            args_list = pos_template.copy()
+            dp = ib_v14[4]
+            if dp[0] >= 0: args_list[dp[0]] = req_ids
+            if dp[1] >= 0: args_list[dp[1]] = idx_mapping_np
+            if dp[2] >= 0: args_list[dp[2]] = num_scheduled_tokens_np
+            if dp[3] >= 0: args_list[dp[3]] = num_draft_tokens_per_req
+            if dp[4] >= 0: args_list[dp[4]] = sl_t
+            if dp[5] >= 0: args_list[dp[5]] = ncomp_np
+            if dp[6] >= 0: args_list[dp[6]] = prefill_len_np
+            if dp[7] >= 0: args_list[dp[7]] = num_computed_prefill_tokens_np
+            if dp[8] >= 0: args_list[dp[8]] = is_prefilling_np
+            if dp[9] >= 0: args_list[dp[9]] = prefill_runs_as_decode_np
+            if dp[10] >= 0: args_list[dp[10]] = batch_req_state.decode_graph_eligible
+            if dp[11] >= 0: args_list[dp[11]] = max_seq_len_np
+            if dp[12] >= 0: args_list[dp[12]] = scheduler_output.has_structured_output_requests
+            return ib_cls(*args_list)
+        kw = ib_v14[5].copy()
+        dk = ib_v14[6]
+        if "req_ids" in dk: kw["req_ids"] = req_ids
+        if "idx_mapping_np" in dk: kw["idx_mapping_np"] = idx_mapping_np
+        if "num_scheduled_tokens" in dk: kw["num_scheduled_tokens"] = num_scheduled_tokens_np
+        if "num_draft_tokens_per_req" in dk: kw["num_draft_tokens_per_req"] = num_draft_tokens_per_req
+        if "seq_lens_cpu_upper_bound" in dk: kw["seq_lens_cpu_upper_bound"] = sl_t
+        if "num_computed_tokens_np" in dk: kw["num_computed_tokens_np"] = ncomp_np
+        if "prefill_len_np" in dk: kw["prefill_len_np"] = prefill_len_np
+        if "num_computed_prefill_tokens_np" in dk: kw["num_computed_prefill_tokens_np"] = num_computed_prefill_tokens_np
+        if "is_prefilling_np" in dk: kw["is_prefilling_np"] = is_prefilling_np
+        if "prefill_runs_as_decode_np" in dk: kw["prefill_runs_as_decode_np"] = prefill_runs_as_decode_np
+        if "decode_graph_eligible" in dk: kw["decode_graph_eligible"] = batch_req_state.decode_graph_eligible
+        if "max_seq_len_np" in dk: kw["max_seq_len_np"] = max_seq_len_np
+        if "has_structured_output_reqs" in dk: kw["has_structured_output_reqs"] = scheduler_output.has_structured_output_requests
+        return ib_cls(**kw)
+
     num_computed_tokens_np = runner.req_states.num_computed_tokens_np[idx_mapping_np]
     seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
     np.add(
@@ -3279,7 +5481,6 @@ def _build_dt_static_input_batch(
         out=seq_lens_cpu_upper_bound_np[:num_reqs],
     )
     seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
-    num_draft_tokens_per_req = batch_req_state.num_draft_tokens_np if has_drafts else None
 
     if FAST_REPLAY_V11 and cert is not None:
         base_kw = cert.get("ib_base_kwargs")
@@ -3499,16 +5700,73 @@ def _run_pa_dict_plan(dplan: tuple, sl_np: np.ndarray | None, max_sl: int | None
     return {k: vals[idx] for k, idx in key_idx}
 
 
-def _refresh_cached_attn_metadata(template, input_batch, plan=None):
-    sl_t = getattr(input_batch, "seq_lens_cpu_upper_bound", None) if input_batch is not None else None
-    sl_np = sl_t.numpy() if isinstance(sl_t, torch.Tensor) else None
-    nr = int(getattr(input_batch, "num_reqs", 0) or 0) if input_batch is not None else 0
-    if sl_np is not None and nr > 0:
-        max_sl = int(sl_np[0]) if nr == 1 else int(np.max(sl_np[:nr]))
+def _compile_pa_dict_ring_v14(md_dict: dict) -> list:
+    """Pre-clone 4-slot ring of unique mutable AttentionMetadata objects & 4 pre-built layer dicts.
+    Eliminates per-step copy.copy() and 48-key dict construction on steady-state static 'dt' replay."""
+    dplan = _compile_pa_dict_plan(md_dict)
+    uniqs, key_idx = dplan
+    slots = []
+    for _ in range(NSLOT):
+        vals = []
+        muts = []
+        for v, has_sl, has_msl in uniqs:
+            if has_sl or has_msl:
+                c = copy.copy(v)
+                vals.append(c)
+                muts.append((c, has_sl, has_msl))
+            else:
+                vals.append(v)
+        out_d = {k: vals[idx] for k, idx in key_idx}
+        slots.append((tuple(muts), out_d))
+    return [0, tuple(slots)]
+
+
+def _compile_pa_refresh_plan_v14(template):
+    if isinstance(template, dict):
+        return ("dict_ring", _compile_pa_dict_ring_v14(template))
+    if isinstance(template, tuple):
+        return (
+            "tuple_ring",
+            tuple(
+                ("dict_ring", _compile_pa_dict_ring_v14(item)) if isinstance(item, dict) else ("raw", item)
+                for item in template
+            ),
+        )
+    return ("raw", template)
+
+
+def _run_pa_dict_ring_v14(ring: list, sl_np: np.ndarray | None, max_sl: int | None) -> dict:
+    s = ring[0]
+    ring[0] = (s + 1) & 3
+    muts, out_d = ring[1][s]
+    for c, has_sl, has_msl in muts:
+        if has_sl and sl_np is not None:
+            c.seq_lens_cpu = sl_np
+        if has_msl and max_sl is not None:
+            c.max_seq_len = max_sl
+    return out_d
+
+
+def _refresh_cached_attn_metadata(template, input_batch, plan=None, precomputed_sl=None):
+    if precomputed_sl is not None:
+        sl_np, max_sl = precomputed_sl
     else:
-        max_sl = None
+        sl_t = getattr(input_batch, "seq_lens_cpu_upper_bound", None) if input_batch is not None else None
+        sl_np = sl_t.numpy() if isinstance(sl_t, torch.Tensor) else None
+        nr = int(getattr(input_batch, "num_reqs", 0) or 0) if input_batch is not None else 0
+        if sl_np is not None and nr > 0:
+            max_sl = int(sl_np[0]) if nr == 1 else int(np.max(sl_np[:nr]))
+        else:
+            max_sl = None
     if plan is not None:
         kind, body = plan
+        if kind == "dict_ring":
+            return _run_pa_dict_ring_v14(body, sl_np, max_sl)
+        if kind == "tuple_ring":
+            return tuple(
+                _run_pa_dict_ring_v14(sub_b, sl_np, max_sl) if sub_k == "dict_ring" else sub_b
+                for sub_k, sub_b in body
+            )
         if kind == "dict":
             return _run_pa_dict_plan(body, sl_np, max_sl)
         if kind == "tuple":
@@ -3656,9 +5914,49 @@ def install() -> bool:
             return False
 
         def wrapped_execute_model(self, *args, **kwargs):
+            if FAST_REPLAY_V16 and DTGRAPH_FASTPATH and not PF_SCRATCH_RELEASE_IDLE:
+                try:
+                    st = self._inkling_dtg
+                except AttributeError:
+                    st = _get_state(self)
+                if st.exec_hooks_done:
+                    st._dt_v16_hit = False
+                    if st.dt_static_armed is not None:
+                        st.dt_static_armed = None
+                    if st.dt_cap_ctx is not None:
+                        st.dt_cap_ctx = None
+                    try:
+                        out = orig_exec(self, *args, **kwargs)
+                    except BaseException:
+                        st.dt_static_armed = None
+                        st.dt_cap_ctx = None
+                        st._dt_v16_pa_ready = None
+                        st._dt_v16_ie_ready = None
+                        if st.region is not None:
+                            st.region.dt_track_unhooked = False
+                            st.region.dt_hook_depth = 0
+                        abort_region(self)
+                        raise
+                    if st._dt_v16_hit:
+                        st._dt_v16_hit = False
+                        return out
+                    if st.region is not None and (st.region.active or st.mode is not None):
+                        close_region(self, expected_name="dt")
+                    st.dt_static_armed = None
+                    st.dt_cap_ctx = None
+                    st._dt_v16_pa_ready = None
+                    st._dt_v16_ie_ready = None
+                    if st.region is not None:
+                        st.region.dt_track_unhooked = False
+                        st.region.dt_hook_depth = 0
+                    return out
             st = _get_state(self)
             st.dt_static_armed = None
             st.dt_cap_ctx = None
+            if FAST_REPLAY_V16:
+                st._dt_v16_pa_ready = None
+                st._dt_v16_ie_ready = None
+                st._dt_v16_hit = False
             if not (DTGRAPH_FASTPATH and st.exec_hooks_done):
                 # Ensure target cudagraph_manager.run_fullgraph closes DT right before replay.
                 cgm = getattr(self, "cudagraph_manager", None)
@@ -3668,6 +5966,8 @@ def install() -> bool:
                     def _rfg(batch_desc, _orig=orig_rfg, _runner=self, _st=st):
                         if _st.dt_static_armed is not None:
                             _st.dt_static_armed = None
+                            if FAST_REPLAY_V16:
+                                _st._dt_v16_hit = True
                             return _orig(batch_desc)
                         cap = _st.dt_cap_ctx
                         _st.dt_cap_ctx = None
@@ -3739,7 +6039,7 @@ def install() -> bool:
                                 ):
                                     fin_batch_sig, fin_ptr_sig = fp_fin
                                     if fin_batch_sig == cap["batch_sig"]:
-                                        _st.dt_static_cert[cap["cert_key"]] = {
+                                        _dt_cert_entry = {
                                             "exec_shape_key": cap["exec_shape_key"],
                                             "dt_slot": cap["dt_slot"],
                                             "exec_gen": exec_gen,
@@ -3753,14 +6053,71 @@ def install() -> bool:
                                             "pa_template": cap["pa_template"],
                                             "pa_refresh_plan": (
                                                 _compile_pa_refresh_plan(cap["pa_template"])
-                                                if FAST_REPLAY_V11
+                                                if (FAST_REPLAY_V11 or FAST_REPLAY_V14 or FAST_REPLAY_V16)
+                                                else None
+                                            ),
+                                            "pa_refresh_plan_v14": (
+                                                _compile_pa_refresh_plan_v14(cap["pa_template"])
+                                                if (FAST_REPLAY_V14 or FAST_REPLAY_V16)
                                                 else None
                                             ),
                                             "imm_idx_ptr": cap["imm_idx_ptr"],
                                         }
+                                        if FAST_REPLAY_V14 or FAST_REPLAY_V16:
+                                            _compile_dt_v14_plan(
+                                                _dt_cert_entry,
+                                                _runner,
+                                                _st,
+                                                bd_cap,
+                                                is_b1=cap["is_b1"],
+                                                req_ids=cap["req_ids"],
+                                                idx_tuple=cap["exec_shape_key"][6],
+                                                num_reqs=cap["num_reqs"],
+                                                num_tokens=cap["num_tokens"],
+                                                num_tokens_after_padding=cap["num_tokens_after_padding"],
+                                                num_reqs_padded=cap["num_reqs_padded"],
+                                                q_len=cap["q_len"],
+                                                has_drafts=cap["has_drafts"],
+                                                write_pad=cap["write_pad"],
+                                                imm_idx_ptr=cap["imm_idx_ptr"],
+                                                sconv_builders=cap["sconv_builders"],
+                                                has_so=bool(getattr(cap["scheduler_output"], "has_structured_output_requests", False)),
+                                                dge=bool(getattr(cap["batch_req_state"], "decode_graph_eligible", True)),
+                                                exec_key=exec_key,
+                                            )
+                                            if FAST_REPLAY_V16:
+                                                _compile_dt_v16_plan(
+                                                    _dt_cert_entry,
+                                                    _runner,
+                                                    _st,
+                                                    cap["scheduler_output"],
+                                                    cap["batch_req_state"],
+                                                    bd_cap,
+                                                    is_b1=cap["is_b1"],
+                                                    req_ids=cap["req_ids"],
+                                                    idx_tuple=cap["exec_shape_key"][6],
+                                                    num_reqs=cap["num_reqs"],
+                                                    num_tokens=cap["num_tokens"],
+                                                    num_tokens_after_padding=cap["num_tokens_after_padding"],
+                                                    num_reqs_padded=cap["num_reqs_padded"],
+                                                    q_len=cap["q_len"],
+                                                    has_drafts=cap["has_drafts"],
+                                                    write_pad=cap["write_pad"],
+                                                    imm_idx_ptr=cap["imm_idx_ptr"],
+                                                    sconv_builders=cap["sconv_builders"],
+                                                    has_so=bool(getattr(cap["scheduler_output"], "has_structured_output_requests", False)),
+                                                    dge=bool(getattr(cap["batch_req_state"], "decode_graph_eligible", True)),
+                                                    exec_key=exec_key,
+                                                )
+                                            _st.dt_last_cert = _dt_cert_entry
+                                        _st.dt_static_cert[cap["cert_key"]] = _dt_cert_entry
                                         _st.dt_static_cert.move_to_end(cap["cert_key"])
                                         while len(_st.dt_static_cert) > STATIC_DT_MAX_CERTS:
-                                            _st.dt_static_cert.popitem(last=False)
+                                            _, _ev_c = _st.dt_static_cert.popitem(last=False)
+                                            if _st.dt_last_cert is _ev_c:
+                                                _st.dt_last_cert = None
+                                            if FAST_REPLAY_V16:
+                                                _evict_dt_v16_lut(_st, _ev_c)
                                         r_pre.stats["dt_static_certified"] += 1
                         return _orig(batch_desc)
 
@@ -3813,8 +6170,25 @@ def install() -> bool:
                         _st=st,
                         _set_out=set_direct_embed,
                     ):
+                        if FAST_REPLAY_V16 and not scheduled_encoder_inputs:
+                            ie_r = _st._dt_v16_ie_ready
+                            if ie_r is not None:
+                                _st._dt_v16_ie_ready = None
+                                ie_m = _st._dt_v16_ie_meta
+                                if ie_m is not None and _st.inputs_embeds_buf is ie_m[0] and input_batch.num_tokens == ie_m[2]:
+                                    return ie_r
                         armed = _st.dt_static_armed
                         if armed is not None:
+                            if FAST_REPLAY_V14 and not scheduled_encoder_inputs:
+                                v14_a = armed.get("v14")
+                                if (
+                                    v14_a is not None
+                                    and v14_a["ie_view"] is not None
+                                    and _st.inputs_embeds_buf is v14_a["ie_buf"]
+                                    and _st.inputs_embeds_buf.data_ptr() == v14_a["ie_ptr"]
+                                    and input_batch.num_tokens == v14_a["num_tokens"]
+                                ):
+                                    return v14_a["ie_view"]
                             nt_a = int(getattr(input_batch, "num_tokens", 0) or 0)
                             buf_a = _st.inputs_embeds_buf
                             if (
@@ -3867,7 +6241,9 @@ def install() -> bool:
                             if direct_set:
                                 _set_out(None)
                         if (
-                            isinstance(res, torch.Tensor)
+                            not scheduled_encoder_inputs
+                            and not getattr(input_batch, "has_prefill", False)
+                            and isinstance(res, torch.Tensor)
                             and res.dim() == 2
                             and res.is_contiguous()
                             and (
@@ -3911,7 +6287,30 @@ def install() -> bool:
                         st.exec_hooks_done = True
             try:
                 out = orig_exec(self, *args, **kwargs)
-                close_region(self, expected_name="dt")
+                if not (FAST_REPLAY_V14 or FAST_REPLAY_V16) or (st.region is not None and (st.region.active or st.mode is not None)):
+                    close_region(self, expected_name="dt")
+                if PF_SCRATCH_RELEASE_IDLE:
+                    _sched = args[0] if args else kwargs.get("scheduler_output")
+                    _ntok = int(getattr(_sched, "total_num_scheduled_tokens", 0) or 0)
+                    if _ntok >= 512:
+                        st._pf_scratch_dirty = True
+                        st._pf_idle_decode_steps = 0
+                    elif getattr(st, "_pf_scratch_dirty", False) and _ntok > 0:
+                        _cnt = int(getattr(st, "_pf_idle_decode_steps", 0)) + 1
+                        st._pf_idle_decode_steps = _cnt
+                        if _cnt >= 4 and not torch.cuda.is_current_stream_capturing():
+                            st._pf_scratch_dirty = False
+                            st._pf_idle_decode_steps = 0
+                            try:
+                                from . import host_pin as _hp_uma
+
+                                _hp_uma.release_all_prefill_scratch(
+                                    include_shadow_k=PF_RELEASE_SHADOW_K_IDLE,
+                                    empty_cuda=True,
+                                    logger=_logger(),
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
                 return out
             except BaseException:
                 abort_region(self)
@@ -3931,10 +6330,30 @@ def install() -> bool:
 
         if STATIC_DT_REPLAY and orig_prep_attn is not None:
             def wrapped_prepare_attn(self, *pa_args, **pa_kwargs):
-                st = _get_state(self)
+                if FAST_REPLAY_V16:
+                    try:
+                        st = self._inkling_dtg
+                    except AttributeError:
+                        st = _get_state(self)
+                    pa_r = st._dt_v16_pa_ready
+                    if pa_r is not None:
+                        st._dt_v16_pa_ready = None
+                        return pa_r
+                else:
+                    st = _get_state(self)
                 armed = st.dt_static_armed
                 if armed is not None:
                     ib_arg = pa_args[0] if pa_args else pa_kwargs.get("input_batch")
+                    if FAST_REPLAY_V14:
+                        sl_pre = st.dt_last_sl
+                        st.dt_last_sl = None
+                        p14 = armed.get("pa_refresh_plan_v14")
+                        if p14 is None:
+                            p14 = _compile_pa_refresh_plan_v14(armed["pa_template"])
+                            armed["pa_refresh_plan_v14"] = p14
+                        return _refresh_cached_attn_metadata(
+                            armed["pa_template"], ib_arg, plan=p14, precomputed_sl=sl_pre
+                        )
                     return _refresh_cached_attn_metadata(
                         armed["pa_template"], ib_arg, plan=armed.get("pa_refresh_plan")
                     )
@@ -3959,9 +6378,210 @@ def install() -> bool:
         def wrapped_prepare_inputs(
             self, scheduler_output, batch_req_state, batch_desc, num_active_loras
         ):
-            st = _get_state(self)
+            # Wave-V16 O(1) 2D LUT `dt_fn_lut[B][K]` + zero-loop validator + inlined step_meta_stamp!
+            if (
+                FAST_REPLAY_V16
+                and STATIC_DT_REPLAY
+                and FUSED_DT_PREP
+                and not ROWAR_DESC_W_ORDER
+                and orig_prep_attn is not None
+                and num_active_loras == 0
+            ):
+                try:
+                    st = self._inkling_dtg
+                except AttributeError:
+                    st = _get_state(self)
+                if not batch_req_state.has_prefill:
+                    eff_req_ids = batch_req_state.req_ids
+                    nr_f = len(eff_req_ids)
+                    if 0 < nr_f <= _LUT_MAX_B:
+                        nt_f = batch_req_state.num_tokens
+                        ql_f = nt_f if nr_f == 1 else (nt_f // nr_f)
+                        if 0 < ql_f <= (_LUT_MAX_K + 1) and (nr_f == 1 or ql_f * nr_f == nt_f):
+                            fn_v16 = st.dt_fn_lut[nr_f][ql_f - 1]
+                            if fn_v16 is not None:
+                                try:
+                                    ib_v16 = fn_v16(
+                                        self, scheduler_output, batch_req_state, batch_desc, eff_req_ids, nt_f
+                                    )
+                                    if ib_v16 is not None:
+                                        return ib_v16
+                                except Exception:  # noqa: BLE001
+                                    pass
+            else:
+                st = _get_state(self)
             st.dt_static_armed = None
             st.dt_cap_ctx = None
+            if FAST_REPLAY_V16:
+                st._dt_v16_pa_ready = None
+                st._dt_v16_ie_ready = None
+            # Wave-V14 zero-alloc MRU fast-entry (avoids ~25 getattr + dt_ineligible kwdict on steady hits!)
+            if (
+                FAST_REPLAY_V14
+                and STATIC_DT_REPLAY
+                and FUSED_DT_PREP
+                and not ROWAR_DESC_W_ORDER
+                and orig_prep_attn is not None
+                and st.dt_last_cert is not None
+                and st.region is not None
+                and not st.disabled
+                and not st.b1_failed
+                and st.b1_dtypes is not None
+                and "dt" in CFG["regions"]
+                and num_active_loras == 0
+            ):
+                try:
+                    if (
+                        not batch_req_state.has_prefill
+                        and batch_desc.cg_mode.name == "FULL"
+                        and (batch_desc.num_ubatches or 1) <= 1
+                        and not scheduler_output.scheduled_encoder_inputs
+                        and not getattr(self, "_in_dummy_run", False)
+                        and not getattr(scheduler_output, "is_dummy", False)
+                        and not getattr(scheduler_output, "is_profile", False)
+                        and self.pcp_manager is None
+                        and (self.dcp_size or 1) <= 1
+                        and not self.is_encoder_decoder
+                        and self.is_first_pp_rank
+                        and self.is_last_pp_rank
+                        and self.model_state.num_new_sampled_tokens_per_step == 1
+                        and self.adaptive_verification is None
+                        and self.fast_prefill is None
+                        and self.model_config.rswa_window is None
+                    ):
+                        eff_req_ids = batch_req_state.req_ids
+                        nr_f = len(eff_req_ids)
+                        max_r_cfg = CFG["max_reqs"]
+                        if (
+                            0 < nr_f <= 8
+                            and (nr_f == 1 or (FUSED_DT_PREP_MAX_B >= nr_f and FUSED_DT_PREP_INLINE_B8))
+                            and (max_r_cfg == 0 or nr_f <= max_r_cfg)
+                        ):
+                            nt_f = batch_req_state.num_tokens
+                            bd_nt_f = batch_desc.num_tokens
+                            nt_pad_f = nt_f if nt_f >= bd_nt_f else bd_nt_f
+                            nr_pad_f = batch_desc.num_reqs or nr_f
+                            is_b1_f = (nr_f == 1)
+                            has_d_f = bool(scheduler_output.scheduled_spec_decode_tokens)
+                            if 0 < nt_f and nt_pad_f <= 256 and (not is_b1_f or has_d_f):
+                                elig_ok = False
+                                ql_f = nt_f if is_b1_f else (nt_f // nr_f)
+                                nst_f = batch_req_state.num_scheduled_tokens
+                                ncpf_f = batch_req_state.num_computed_prefill_tokens_np
+                                pfl_f = batch_req_state.prefill_len_np
+                                nd_f = batch_req_state.num_draft_tokens_np
+                                if is_b1_f:
+                                    if (
+                                        nst_f[0] == nt_f
+                                        and nd_f is not None
+                                        and nd_f[0] + 1 == nt_f
+                                        and ncpf_f[0] >= pfl_f[0]
+                                        and not _is_tree_spec_active(self, 1, st)
+                                    ):
+                                        elig_ok = True
+                                elif nt_f % nr_f == 0:
+                                    elig_ok = True
+                                    if has_d_f:
+                                        if nd_f is None:
+                                            elig_ok = False
+                                        else:
+                                            for _fi in range(nr_f):
+                                                if nst_f[_fi] != ql_f or nd_f[_fi] + 1 != ql_f or ncpf_f[_fi] < pfl_f[_fi]:
+                                                    elig_ok = False
+                                                    break
+                                    else:
+                                        if ql_f != 1:
+                                            elig_ok = False
+                                        else:
+                                            for _fi in range(nr_f):
+                                                if nst_f[_fi] != 1 or ncpf_f[_fi] < pfl_f[_fi]:
+                                                    elig_ok = False
+                                                    break
+                                if elig_ok:
+                                    sconv_f = st.dt_sconv_builders if st.dt_sconv_builders is not None else _discover_sconv_builders(self, st)
+                                    if not (is_b1_f and _sconv_any_dirty(sconv_f, st)):
+                                        w_pad_f = st.write_pad if (DTGRAPH_FASTPATH and st.write_pad is not None) else _get_write_pad(st)
+                                        last_c = st.dt_last_cert
+                                        eff_idx_f = batch_req_state.idx_mapping_np
+                                        if last_c is not None and _dt_v14_validate(
+                                            last_c,
+                                            self,
+                                            st,
+                                            scheduler_output,
+                                            batch_req_state,
+                                            batch_desc,
+                                            is_b1=is_b1_f,
+                                            req_ids=eff_req_ids,
+                                            eff_idx_np=eff_idx_f,
+                                            num_reqs=nr_f,
+                                            nt_s=nt_f,
+                                            nt_pad_s=nt_pad_f,
+                                            nr_pad_s=nr_pad_f,
+                                            ql_s=ql_f,
+                                            has_d_s=has_d_f,
+                                            w_pad_s=w_pad_f,
+                                            imm_ptr=0,
+                                        ):
+                                            v14_c = last_c["v14"]
+                                            stream = _ensure_region(st)
+                                            if st.region.replay_static_region_v14(
+                                                stream,
+                                                _STAT_STATIC_REPLAY_DT,
+                                                v14_c["exec_key"],
+                                                v14_c["exec_owner"],
+                                                v14_c["exec_handle"],
+                                                v14_c["exec_gen"],
+                                            ):
+                                                if FAST_REPLAY_V16 and "v16_dt_step" not in last_c:
+                                                    _compile_dt_v16_plan(
+                                                        last_c,
+                                                        self,
+                                                        st,
+                                                        scheduler_output,
+                                                        batch_req_state,
+                                                        batch_desc,
+                                                        is_b1=is_b1_f,
+                                                        req_ids=eff_req_ids,
+                                                        idx_tuple=last_c["exec_shape_key"][6],
+                                                        num_reqs=nr_f,
+                                                        num_tokens=nt_f,
+                                                        num_tokens_after_padding=nt_pad_f,
+                                                        num_reqs_padded=nr_pad_f,
+                                                        q_len=ql_f,
+                                                        has_drafts=has_d_f,
+                                                        write_pad=w_pad_f,
+                                                        imm_idx_ptr=0,
+                                                        sconv_builders=sconv_f,
+                                                        has_so=bool(getattr(scheduler_output, "has_structured_output_requests", False)),
+                                                        dge=bool(getattr(batch_req_state, "decode_graph_eligible", True)),
+                                                        exec_key=v14_c["exec_key"],
+                                                    )
+                                                if not is_b1_f and sconv_f:
+                                                    _sconv_mark_dirty(sconv_f, nt_pad_f, st)
+                                                st.dt_static_armed = last_c
+                                                return _build_dt_static_input_batch(
+                                                    self,
+                                                    st,
+                                                    scheduler_output,
+                                                    batch_req_state,
+                                                    is_b1=is_b1_f,
+                                                    req_ids=eff_req_ids,
+                                                    idx_mapping_np=eff_idx_f,
+                                                    prefill_len_np=pfl_f,
+                                                    num_computed_prefill_tokens_np=ncpf_f,
+                                                    is_prefilling_np=batch_req_state.is_prefilling_np,
+                                                    prefill_runs_as_decode_np=batch_req_state.prefill_runs_as_decode_np,
+                                                    max_seq_len_np=batch_req_state.max_seq_len_np,
+                                                    num_reqs=nr_f,
+                                                    num_tokens=nt_f,
+                                                    num_tokens_after_padding=nt_pad_f,
+                                                    num_reqs_padded=nr_pad_f,
+                                                    q_len=ql_f,
+                                                    has_drafts=has_d_f,
+                                                    cert=last_c,
+                                                )
+                except Exception:  # noqa: BLE001
+                    pass
             b1_elig = (
                 FUSED_DT_PREP
                 and not st.b1_failed
@@ -4003,7 +6623,7 @@ def install() -> bool:
                         else st.bn_compiled
                     )
                     _defer_bn_warm = bool(
-                        FAST_REPLAY_V11 and STATIC_DT_REPLAY and st.dt_static_cert and cset
+                        (FAST_REPLAY_V11 or FAST_REPLAY_V14) and STATIC_DT_REPLAY and st.dt_static_cert and cset
                     )
                     if not _defer_bn_warm:
                         ib_b = self.input_buffers
@@ -4052,7 +6672,7 @@ def install() -> bool:
                         and (b1_elig or bn_elig)
                         and orig_prep_attn is not None
                         and not is_dummy
-                        and not _is_tree_spec_active(self, num_reqs)
+                        and not _is_tree_spec_active(self, num_reqs, st)
                     )
                     if can_static_dt:
                         nt_s = int(batch_req_state.num_tokens)
@@ -4074,26 +6694,183 @@ def install() -> bool:
                             eff_prd_np = batch_req_state.prefill_runs_as_decode_np
                             eff_msl_np = batch_req_state.max_seq_len_np
                         else:
-                            precomputed_rowar = _compute_rowar_swap(
-                                self, st, scheduler_output, batch_req_state, ql_s, has_d_s
-                            )
-                            (
-                                eff_req_ids,
-                                eff_idx_np,
-                                eff_pfl_np,
-                                eff_ncpf_np,
-                                eff_ipf_np,
-                                eff_prd_np,
-                                eff_msl_np,
-                            ) = precomputed_rowar
+                            if FAST_REPLAY_V14 and not ROWAR_DESC_W_ORDER:
+                                eff_req_ids = batch_req_state.req_ids
+                                eff_idx_np = batch_req_state.idx_mapping_np
+                                eff_pfl_np = batch_req_state.prefill_len_np
+                                eff_ncpf_np = batch_req_state.num_computed_prefill_tokens_np
+                                eff_ipf_np = batch_req_state.is_prefilling_np
+                                eff_prd_np = batch_req_state.prefill_runs_as_decode_np
+                                eff_msl_np = batch_req_state.max_seq_len_np
+                                precomputed_rowar = (
+                                    eff_req_ids,
+                                    eff_idx_np,
+                                    eff_pfl_np,
+                                    eff_ncpf_np,
+                                    eff_ipf_np,
+                                    eff_prd_np,
+                                    eff_msl_np,
+                                )
+                            else:
+                                precomputed_rowar = _compute_rowar_swap(
+                                    self, st, scheduler_output, batch_req_state, ql_s, has_d_s
+                                )
+                                (
+                                    eff_req_ids,
+                                    eff_idx_np,
+                                    eff_pfl_np,
+                                    eff_ncpf_np,
+                                    eff_ipf_np,
+                                    eff_prd_np,
+                                    eff_msl_np,
+                                ) = precomputed_rowar
                             if not (FUSED_DT_PREP_INLINE_B8 and num_reqs <= 8):
                                 imm_idx_cpu = _get_dt_immutable_idx_cpu(
                                     st, st.bn_bufs["idx"].dtype, eff_idx_np
                                 )
                         sconv_builders = _discover_sconv_builders(self, st)
-                        sconv_b1_dirty = (num_reqs == 1) and _sconv_any_dirty(sconv_builders)
+                        sconv_b1_dirty = (num_reqs == 1) and _sconv_any_dirty(sconv_builders, st)
                         imm_ptr = int(imm_idx_cpu.data_ptr()) if imm_idx_cpu is not None else 0
-                        idx_tuple = tuple(int(x) for x in eff_idx_np)
+                        # Wave-V14 zero-alloc MRU static "dt" replay fast path (0 tuple/dict/fingerprint allocs!)
+                        if FAST_REPLAY_V14 and not sconv_b1_dirty and st.region is not None:
+                            last_c = st.dt_last_cert
+                            if last_c is not None and _dt_v14_validate(
+                                last_c,
+                                self,
+                                st,
+                                scheduler_output,
+                                batch_req_state,
+                                batch_desc,
+                                is_b1=b1_elig,
+                                req_ids=eff_req_ids,
+                                eff_idx_np=eff_idx_np,
+                                num_reqs=num_reqs,
+                                nt_s=nt_s,
+                                nt_pad_s=nt_pad_s,
+                                nr_pad_s=nr_pad_s,
+                                ql_s=ql_s,
+                                has_d_s=has_d_s,
+                                w_pad_s=w_pad_s,
+                                imm_ptr=imm_ptr,
+                            ):
+                                try:
+                                    v14_c = last_c["v14"]
+                                    stream = _ensure_region(st)
+                                    if st.region.replay_static_region_v14(
+                                        stream,
+                                        _STAT_STATIC_REPLAY_DT,
+                                        v14_c["exec_key"],
+                                        v14_c["exec_owner"],
+                                        v14_c["exec_handle"],
+                                        v14_c["exec_gen"],
+                                    ):
+                                        if num_reqs >= 2 and sconv_builders:
+                                            _sconv_mark_dirty(sconv_builders, nt_pad_s, st)
+                                        st.dt_static_armed = last_c
+                                        return _build_dt_static_input_batch(
+                                            self,
+                                            st,
+                                            scheduler_output,
+                                            batch_req_state,
+                                            is_b1=b1_elig,
+                                            req_ids=eff_req_ids,
+                                            idx_mapping_np=eff_idx_np,
+                                            prefill_len_np=eff_pfl_np,
+                                            num_computed_prefill_tokens_np=eff_ncpf_np,
+                                            is_prefilling_np=eff_ipf_np,
+                                            prefill_runs_as_decode_np=eff_prd_np,
+                                            max_seq_len_np=eff_msl_np,
+                                            num_reqs=num_reqs,
+                                            num_tokens=nt_s,
+                                            num_tokens_after_padding=nt_pad_s,
+                                            num_reqs_padded=nr_pad_s,
+                                            q_len=ql_s,
+                                            has_drafts=has_d_s,
+                                            cert=last_c,
+                                        )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                st.dt_last_cert = None
+                        idx_tuple = (
+                            ((int(eff_idx_np[0]),) if num_reqs == 1 else tuple(eff_idx_np.tolist()))
+                            if FAST_REPLAY_V14
+                            else tuple(int(x) for x in eff_idx_np)
+                        )
+                        exec_shape_key = (
+                            "dt_s",
+                            num_reqs,
+                            nt_s,
+                            nt_pad_s,
+                            ql_s,
+                            bool(has_d_s),
+                            idx_tuple,
+                        )
+                        cert_key = exec_shape_key
+                        # Wave-V14 non-MRU cert lookup (switched batch size, still skips _dt_static_fingerprint!)
+                        if FAST_REPLAY_V14 and not sconv_b1_dirty and st.region is not None:
+                            cert_lu = st.dt_static_cert.get(cert_key)
+                            if (
+                                cert_lu is not None
+                                and cert_lu is not st.dt_last_cert
+                                and _dt_v14_validate(
+                                    cert_lu,
+                                    self,
+                                    st,
+                                    scheduler_output,
+                                    batch_req_state,
+                                    batch_desc,
+                                    is_b1=b1_elig,
+                                    req_ids=eff_req_ids,
+                                    eff_idx_np=eff_idx_np,
+                                    num_reqs=num_reqs,
+                                    nt_s=nt_s,
+                                    nt_pad_s=nt_pad_s,
+                                    nr_pad_s=nr_pad_s,
+                                    ql_s=ql_s,
+                                    has_d_s=has_d_s,
+                                    w_pad_s=w_pad_s,
+                                    imm_ptr=imm_ptr,
+                                )
+                            ):
+                                try:
+                                    v14_lu = cert_lu["v14"]
+                                    stream = _ensure_region(st)
+                                    if st.region.replay_static_region_v14(
+                                        stream,
+                                        _STAT_STATIC_REPLAY_DT,
+                                        v14_lu["exec_key"],
+                                        v14_lu["exec_owner"],
+                                        v14_lu["exec_handle"],
+                                        v14_lu["exec_gen"],
+                                    ):
+                                        if num_reqs >= 2 and sconv_builders:
+                                            _sconv_mark_dirty(sconv_builders, nt_pad_s, st)
+                                        st.dt_static_cert.move_to_end(cert_key)
+                                        st.dt_last_cert = cert_lu
+                                        st.dt_static_armed = cert_lu
+                                        return _build_dt_static_input_batch(
+                                            self,
+                                            st,
+                                            scheduler_output,
+                                            batch_req_state,
+                                            is_b1=b1_elig,
+                                            req_ids=eff_req_ids,
+                                            idx_mapping_np=eff_idx_np,
+                                            prefill_len_np=eff_pfl_np,
+                                            num_computed_prefill_tokens_np=eff_ncpf_np,
+                                            is_prefilling_np=eff_ipf_np,
+                                            prefill_runs_as_decode_np=eff_prd_np,
+                                            max_seq_len_np=eff_msl_np,
+                                            num_reqs=num_reqs,
+                                            num_tokens=nt_s,
+                                            num_tokens_after_padding=nt_pad_s,
+                                            num_reqs_padded=nr_pad_s,
+                                            q_len=ql_s,
+                                            has_drafts=has_d_s,
+                                            cert=cert_lu,
+                                        )
+                                except Exception:  # noqa: BLE001
+                                    pass
                         fp = _dt_static_fingerprint(
                             self,
                             st,
@@ -4114,16 +6891,6 @@ def install() -> bool:
                             sconv_builders=sconv_builders,
                             idx_tuple=idx_tuple,
                         )
-                        exec_shape_key = (
-                            "dt_s",
-                            num_reqs,
-                            nt_s,
-                            nt_pad_s,
-                            ql_s,
-                            bool(has_d_s),
-                            idx_tuple,
-                        )
-                        cert_key = exec_shape_key
                         if fp is not None and not sconv_b1_dirty:
                             batch_sig, ptr_sig = fp
                             cert = st.dt_static_cert.get(cert_key)
@@ -4145,8 +6912,59 @@ def install() -> bool:
                                         wait_slot=False,
                                         expected_exec_gen=cert["exec_gen"],
                                     ):
+                                        if (FAST_REPLAY_V14 or FAST_REPLAY_V16) and "v14" not in cert:
+                                            _compile_dt_v14_plan(
+                                                cert,
+                                                self,
+                                                st,
+                                                batch_desc,
+                                                is_b1=b1_elig,
+                                                req_ids=eff_req_ids,
+                                                idx_tuple=idx_tuple,
+                                                num_reqs=num_reqs,
+                                                num_tokens=nt_s,
+                                                num_tokens_after_padding=nt_pad_s,
+                                                num_reqs_padded=nr_pad_s,
+                                                q_len=ql_s,
+                                                has_drafts=has_d_s,
+                                                write_pad=w_pad_s,
+                                                imm_idx_ptr=imm_ptr,
+                                                sconv_builders=sconv_builders,
+                                                has_so=bool(getattr(scheduler_output, "has_structured_output_requests", False)),
+                                                dge=bool(getattr(batch_req_state, "decode_graph_eligible", True)),
+                                                exec_key=("dt", cert["exec_shape_key"], 0, cert["dt_slot"]),
+                                            )
+                                            cert["pa_refresh_plan_v14"] = _compile_pa_refresh_plan_v14(cert["pa_template"])
+                                        if FAST_REPLAY_V16 and "v16_dt_step" not in cert:
+                                            _compile_dt_v16_plan(
+                                                cert,
+                                                self,
+                                                st,
+                                                scheduler_output,
+                                                batch_req_state,
+                                                batch_desc,
+                                                is_b1=b1_elig,
+                                                req_ids=eff_req_ids,
+                                                idx_tuple=idx_tuple,
+                                                num_reqs=num_reqs,
+                                                num_tokens=nt_s,
+                                                num_tokens_after_padding=nt_pad_s,
+                                                num_reqs_padded=nr_pad_s,
+                                                q_len=ql_s,
+                                                has_drafts=has_d_s,
+                                                write_pad=w_pad_s,
+                                                imm_idx_ptr=imm_ptr,
+                                                sconv_builders=sconv_builders,
+                                                has_so=bool(getattr(scheduler_output, "has_structured_output_requests", False)),
+                                                dge=bool(getattr(batch_req_state, "decode_graph_eligible", True)),
+                                                exec_key=("dt", cert["exec_shape_key"], 0, cert["dt_slot"]),
+                                            )
+                                        elif FAST_REPLAY_V16:
+                                            _register_dt_v16_lut(st, cert, num_reqs, ql_s)
+                                        if FAST_REPLAY_V14 or FAST_REPLAY_V16:
+                                            st.dt_last_cert = cert
                                         if num_reqs >= 2 and sconv_builders:
-                                            _sconv_mark_dirty(sconv_builders, nt_pad_s)
+                                            _sconv_mark_dirty(sconv_builders, nt_pad_s, st)
                                         st.dt_static_cert.move_to_end(cert_key)
                                         st.dt_static_armed = cert
                                         return _build_dt_static_input_batch(
@@ -4172,8 +6990,13 @@ def install() -> bool:
                                         )
                                 except Exception:  # noqa: BLE001
                                     pass
-                                st.dt_static_cert.pop(cert_key, None)
-                        if FAST_REPLAY_V11 and bn_elig and st.bn_bufs is not None:
+                                _popped = st.dt_static_cert.pop(cert_key, None)
+                                if _popped is not None:
+                                    if st.dt_last_cert is _popped:
+                                        st.dt_last_cert = None
+                                    if FAST_REPLAY_V16:
+                                        _evict_dt_v16_lut(st, _popped)
+                        if (FAST_REPLAY_V11 or FAST_REPLAY_V14) and bn_elig and st.bn_bufs is not None:
                             _bq_m = max(16, 1 << max(0, ql_s - 1).bit_length())
                             _cset_m = (
                                 st.bn_inline_compiled
@@ -4241,7 +7064,7 @@ def install() -> bool:
                                     "pie_static_ok": False,
                                 }
                     else:
-                        if FAST_REPLAY_V11 and bn_elig and st.bn_bufs is not None:
+                        if (FAST_REPLAY_V11 or FAST_REPLAY_V14) and bn_elig and st.bn_bufs is not None:
                             _ql_e = int(batch_req_state.num_tokens) // num_reqs
                             _has_d_e = bool(getattr(scheduler_output, "scheduled_spec_decode_tokens", None))
                             _w_pad_e = _get_write_pad(st)
@@ -4335,6 +7158,55 @@ def install() -> bool:
         orig_postprocess = cls.postprocess_sampled
 
         def wrapped_sample_tokens(self, grammar_output):
+            if FAST_REPLAY_V16 and DTGRAPH_FASTPATH and draft_store_tls is None and STATIC_RING:
+                try:
+                    st = self._inkling_dtg
+                except AttributeError:
+                    st = _get_state(self)
+                if st.sample_hooks_done and (st._sf_get_ring_fn is not None or _bind_sf_fns_v16(st)):
+                    ems = self.execute_model_state
+                    if ems is not None and not st.disabled and "td" in CFG["regions"]:
+                        st.cur_ib = ems.input_batch
+                        st.cur_num_spec = ems.num_spec_tokens_to_schedule or 0
+                    else:
+                        st.cur_ib = None
+                        st.cur_num_spec = 0
+                    st._td_v16_hit = False
+                    if st._td_v16_armed is not None:
+                        st._td_v16_armed = None
+                    clear_fn = st._sf_clear_fn
+                    if clear_fn is not None:
+                        clear_fn()
+                    try:
+                        out = orig_sample_tokens(self, grammar_output)
+                    except BaseException:
+                        st.td_static_armed = None
+                        st._td_v16_armed = None
+                        st.td_cap_ctx = None
+                        st.cur_ring_slot = None
+                        st.cur_ring_fenced = True
+                        st.cur_ib = None
+                        st.cur_num_spec = 0
+                        abort_region(self)
+                        raise
+                    if st._td_v16_hit:
+                        st._td_v16_hit = False
+                        st.cur_ring_slot = None
+                        st.cur_ib = None
+                        st.cur_num_spec = 0
+                        return out
+                    if st.region is not None and (st.region.active or st.mode is not None):
+                        close_region(self, expected_name="td")
+                    if st.cur_ring_slot is not None and not st.cur_ring_fenced and st._sf_fence_fn is not None:
+                        st._sf_fence_fn(self.device, st.cur_ring_slot)
+                    st.td_static_armed = None
+                    st._td_v16_armed = None
+                    st.td_cap_ctx = None
+                    st.cur_ring_slot = None
+                    st.cur_ring_fenced = True
+                    st.cur_ib = None
+                    st.cur_num_spec = 0
+                    return out
             st = _get_state(self)
             ems = getattr(self, "execute_model_state", None)
             spec = getattr(self, "speculator", None)
@@ -4408,17 +7280,69 @@ def install() -> bool:
                     orig_prop = spec.propose
 
                     def _prop(*a, _orig=orig_prop, _runner=self, _st=st, _tls=draft_store_tls, _sp=spec, _qcgm=qcgm, **kw):
-                        _is_dummy_call = bool(
-                            kw.get("dummy_run", False)
-                            or kw.get("skip_attn_for_dummy_run", False)
-                            or kw.get("is_dummy", False)
-                            or kw.get("is_profile", False)
-                        )
-                        _skip_draft_call = (
-                            (kw.get("num_speculative_tokens") == 0)
-                            or bool(kw.get("skip_draft", False))
-                            or bool(getattr(_sp, "context_kv_only", False))
-                        )
+                        if FAST_REPLAY_V16 and not kw:
+                            td_b = _st._td_v16_armed
+                            if td_b is not None and not _sp.context_kv_only:
+                                _st._td_v16_armed = None
+                                _st.td_static_armed = None
+                                (
+                                    _q_fn, _d_bd, _rs_c, _nr_c,
+                                    _dtok_t, _dtok_p, _d_view, _fd_view,
+                                    _w_ok, _idx_m, _d_cols,
+                                ) = td_b
+                                if _q_fn is not None:
+                                    _q_fn(_d_bd)
+                                elif _qcgm is not None:
+                                    _q_fn = getattr(_qcgm, "_inkling_dtg_orig_qrfg", _qcgm.run_fullgraph)
+                                    _q_fn(_d_bd)
+                                _l2pf_s = getattr(_sp, "_l2pf", None)
+                                if (
+                                    _l2pf_s is not None
+                                    and _nr_c <= getattr(_sp, "_l2pf_target_l0_max_reqs", 2)
+                                    and hasattr(_l2pf_s, "fork_cross_boundary")
+                                ):
+                                    _l2pf_s.fork_cross_boundary("target_l0")
+                                _fence_fn = _st._sf_fence_fn
+                                if _fence_fn is not None:
+                                    _fence_fn(_runner.device, _rs_c, stream=_st.td_static_stream)
+                                    _st.cur_ring_fenced = True
+                                _st._td_v16_hit = True
+                                if _d_view is not None and _sp.draft_tokens is _dtok_t and _dtok_t.data_ptr() == _dtok_p:
+                                    drafts = _d_view
+                                    _full_d_cached = _fd_view
+                                else:
+                                    drafts = _sp.draft_tokens[:_nr_c, :_d_cols]
+                                    _full_d_cached = None
+                                if _tls is not None and _w_ok and _st.draft_store_active and _st.draft_store_real is not None:
+                                    _full_d = _full_d_cached if _full_d_cached is not None else _sp.draft_tokens[:_nr_c]
+                                    _tls.written_drafts = drafts
+                                    _tls.written_full_drafts = _full_d
+                                    _tls.written_idx = _idx_m
+                                    stats = _st.region.stats if _st.region is not None else None
+                                    proxy = _st.draft_proxy
+                                    if proxy is None:
+                                        proxy = _st.draft_proxy = _DraftSkipProxy(
+                                            _st.draft_store_real, _idx_m, drafts, stats, _full_d
+                                        )
+                                    else:
+                                        proxy.reset(_st.draft_store_real, _idx_m, drafts, stats, _full_d)
+                                    _runner.req_states.draft_tokens = proxy
+                                return drafts
+                        if FAST_REPLAY_V14 and not kw:
+                            _is_dummy_call = False
+                            _skip_draft_call = bool(getattr(_sp, "context_kv_only", False))
+                        else:
+                            _is_dummy_call = bool(
+                                kw.get("dummy_run", False)
+                                or kw.get("skip_attn_for_dummy_run", False)
+                                or kw.get("is_dummy", False)
+                                or kw.get("is_profile", False)
+                            )
+                            _skip_draft_call = (
+                                (kw.get("num_speculative_tokens") == 0)
+                                or bool(kw.get("skip_draft", False))
+                                or bool(getattr(_sp, "context_kv_only", False))
+                            )
                         if _st.td_static_armed is not None and (_is_dummy_call or _skip_draft_call or _qcgm is None):
                             _st.td_static_armed = None
                         if (
@@ -4429,7 +7353,13 @@ def install() -> bool:
                         ):
                             cert = _st.td_static_armed
                             _st.td_static_armed = None
-                            _orig_qrfg = getattr(_qcgm, "_inkling_dtg_orig_qrfg", _qcgm.run_fullgraph)
+                            if FAST_REPLAY_V14:
+                                _orig_qrfg = _st._orig_qrfg
+                                if _orig_qrfg is None:
+                                    _orig_qrfg = getattr(_qcgm, "_inkling_dtg_orig_qrfg", _qcgm.run_fullgraph)
+                                    _st._orig_qrfg = _orig_qrfg
+                            else:
+                                _orig_qrfg = getattr(_qcgm, "_inkling_dtg_orig_qrfg", _qcgm.run_fullgraph)
                             _orig_qrfg(cert["draft_batch_desc"])
                             _nr_c = cert["num_reqs"]
                             _l2pf_s = getattr(_sp, "_l2pf", None)
@@ -4439,26 +7369,37 @@ def install() -> bool:
                                 and hasattr(_l2pf_s, "fork_cross_boundary")
                             ):
                                 _l2pf_s.fork_cross_boundary("target_l0")
-                            stream_c = _st.td_static_stream if FAST_REPLAY_V11 else cert["stream"]
-                            if (not FAST_REPLAY_V11) and _st.region is not None:
+                            stream_c = _st.td_static_stream if (FAST_REPLAY_V11 or FAST_REPLAY_V14 or FAST_REPLAY_V16) else cert["stream"]
+                            if (not (FAST_REPLAY_V11 or FAST_REPLAY_V14 or FAST_REPLAY_V16)) and _st.region is not None:
                                 _st.region.b.fence(cert["ring_slot"], stream_c)
-                            sf_m = _get_sync_free_ring_mod()
+                            sf_m = _get_sf_ring_mod_v14(_st) if (FAST_REPLAY_V14 or FAST_REPLAY_V16) else _get_sync_free_ring_mod()
                             if sf_m is not None:
                                 sf_m.fence_static_ring_slot(_runner.device, cert["ring_slot"], stream=stream_c)
                                 _st.cur_ring_fenced = True
-                            drafts = _sp.draft_tokens[:_nr_c, :cert["drafts_cols"]]
+                            v14_p = cert.get("v14") if FAST_REPLAY_V14 else None
+                            if (
+                                v14_p is not None
+                                and v14_p["drafts_view"] is not None
+                                and _sp.draft_tokens is v14_p["draft_tok_t"]
+                                and _sp.draft_tokens.data_ptr() == v14_p["draft_tok_ptr"]
+                            ):
+                                drafts = v14_p["drafts_view"]
+                                _full_d_cached = v14_p["full_drafts_view"]
+                            else:
+                                drafts = _sp.draft_tokens[:_nr_c, :cert["drafts_cols"]]
+                                _full_d_cached = None
                             if (
                                 _tls is not None
                                 and cert["write_req_ok"]
                                 and _st.draft_store_active
                                 and _st.draft_store_real is not None
                             ):
-                                _full_d = _sp.draft_tokens[:_nr_c]
+                                _full_d = _full_d_cached if _full_d_cached is not None else _sp.draft_tokens[:_nr_c]
                                 _tls.written_drafts = drafts
                                 _tls.written_full_drafts = _full_d
                                 _tls.written_idx = cert["idx_mapping"]
                                 stats = _st.region.stats if _st.region is not None else None
-                                if DTGRAPH_FASTPATH:
+                                if DTGRAPH_FASTPATH or FAST_REPLAY_V14:
                                     proxy = _st.draft_proxy
                                     if proxy is None:
                                         proxy = _st.draft_proxy = _DraftSkipProxy(
@@ -4486,7 +7427,7 @@ def install() -> bool:
                             and cap.get("draft_batch_desc") is not None
                             and not getattr(_sp, "_last_sample_seq_eager", True)
                             and not getattr(_sp, "_last_propose_post_graph_eager", True)
-                            and _td_static_spec_ok(_sp, cap["num_reqs"])
+                            and _td_static_spec_ok(_sp, cap["num_reqs"], num_spec_sched=cap.get("num_spec_sched"))
                             and isinstance(drafts, torch.Tensor)
                             and drafts.data_ptr() == _sp.draft_tokens.data_ptr()
                         ):
@@ -4501,7 +7442,7 @@ def install() -> bool:
                                 if _st.region is not None
                                 else None
                             )
-                            _st.td_static_cert[cap["cert_key"]] = {
+                            _td_cert_entry = {
                                 "exec_key": cap["exec_key"],
                                 "exec_gen": _td_exec_gen,
                                 "ring_slot": cap["ring_slot"],
@@ -4513,6 +7454,12 @@ def install() -> bool:
                                 "write_req_ok": _w_ok,
                                 "idx_mapping": _tls.written_idx if _w_ok else cap["idx_mapping"],
                             }
+                            if FAST_REPLAY_V14 or FAST_REPLAY_V16:
+                                _compile_td_v14_plan(_td_cert_entry, _sp, _st, drafts)
+                                if FAST_REPLAY_V16:
+                                    _compile_td_v16_plan(_td_cert_entry, _sp, _st, drafts, qcgm=_qcgm)
+                                _st._td_last_cert_by_slot[cap["ring_slot"] % NSLOT] = _td_cert_entry
+                            _st.td_static_cert[cap["cert_key"]] = _td_cert_entry
                         if (
                             _tls is not None
                             and _st.draft_store_active
@@ -4626,12 +7573,13 @@ def install() -> bool:
                 draft_store_tls.written_full_drafts = None
                 draft_store_tls.written_idx = None
             if STATIC_RING:
-                _sf_clear_m = _get_sync_free_ring_mod()
+                _sf_clear_m = _get_sf_ring_mod_v14(st) if (FAST_REPLAY_V14 or FAST_REPLAY_V16) else _get_sync_free_ring_mod()
                 if _sf_clear_m is not None and hasattr(_sf_clear_m, "clear_static_ring_state"):
                     _sf_clear_m.clear_static_ring_state()
             try:
                 out = orig_sample_tokens(self, grammar_output)
-                close_region(self, expected_name="td")
+                if not (FAST_REPLAY_V14 or FAST_REPLAY_V16) or (st.region is not None and (st.region.active or st.mode is not None)):
+                    close_region(self, expected_name="td")
                 return out
             except BaseException:
                 abort_region(self)
@@ -4649,7 +7597,7 @@ def install() -> bool:
                     draft_store_tls.written_full_drafts = None
                     draft_store_tls.written_idx = None
                 if STATIC_RING and st.cur_ring_slot is not None and not st.cur_ring_fenced:
-                    sf_m = _get_sync_free_ring_mod()
+                    sf_m = _get_sf_ring_mod_v14(st) if (FAST_REPLAY_V14 or FAST_REPLAY_V16) else _get_sync_free_ring_mod()
                     if sf_m is not None:
                         sf_m.fence_static_ring_slot(self.device, st.cur_ring_slot)
                 st.td_static_armed = None
@@ -4661,15 +7609,107 @@ def install() -> bool:
                 st.cur_sample_ctx = None
 
         def wrapped_postprocess(self, *args, **kwargs):
-            st = _get_state(self)
-            if DTGRAPH_FASTPATH:
+            # Wave-V16 O(1) 2D+slot LUT `td_fn_lut[B][K][slot]` + zero-loop validator + SyncFree-Temp compat!
+            if FAST_REPLAY_V16 and STATIC_RING and STATIC_RING_REPLAY and DTGRAPH_FASTPATH:
+                try:
+                    st = self._inkling_dtg
+                except AttributeError:
+                    st = _get_state(self)
                 ib = st.cur_ib
                 num_spec_sched = st.cur_num_spec
+                if ib is not None and 0 < num_spec_sched <= _LUT_MAX_K:
+                    get_ring = st._sf_get_ring_fn
+                    if get_ring is None and _bind_sf_fns_v16(st):
+                        get_ring = st._sf_get_ring_fn
+                    if get_ring is not None:
+                        _cand_ring = get_ring()
+                        if _cand_ring is not None:
+                            r_slot, p_s, p_ns, p_nr = _cand_ring
+                            if p_s and p_ns and p_nr and (
+                                (
+                                    len(args) == 3
+                                    and not kwargs
+                                    and args[0].data_ptr() == p_s
+                                    and args[1].data_ptr() == p_ns
+                                    and args[2].data_ptr() == p_nr
+                                )
+                                or _postprocess_args_match_ring(args, kwargs, _cand_ring)
+                            ):
+                                nr_td = ib.num_reqs
+                                if 0 < nr_td <= _LUT_MAX_B:
+                                    fn_td = st.td_fn_lut[nr_td][num_spec_sched][r_slot & 3]
+                                    if fn_td is not None:
+                                        try:
+                                            if fn_td(self, ib, num_spec_sched, p_s, p_ns, p_nr):
+                                                return None
+                                        except Exception:  # noqa: BLE001
+                                            pass
             else:
-                ctx = st.cur_sample_ctx
-                ib = ctx["ib"] if ctx is not None else None
-                num_spec_sched = ctx["num_spec"] if ctx is not None else 0
+                st = _get_state(self)
+                if DTGRAPH_FASTPATH:
+                    ib = st.cur_ib
+                    num_spec_sched = st.cur_num_spec
+                else:
+                    ctx = st.cur_sample_ctx
+                    ib = ctx["ib"] if ctx is not None else None
+                    num_spec_sched = ctx["num_spec"] if ctx is not None else 0
             if ib is not None and not st.disabled and "td" in CFG["regions"]:
+                # Wave-V14 zero-alloc fast-entry (avoids 12 getattr + td_ineligible kwdict on steady hits!)
+                if (
+                    FAST_REPLAY_V14
+                    and STATIC_RING
+                    and STATIC_RING_REPLAY
+                    and st.region is not None
+                    and num_spec_sched > 0
+                ):
+                    try:
+                        spec = self.speculator
+                        if (
+                            spec is not None
+                            and spec.query_cudagraph_manager is not None
+                            and not ib.has_prefill
+                            and self.pcp_manager is None
+                            and (self.dcp_size or 1) <= 1
+                            and not (spec.supports_mm_inputs and self.model_state.supports_mm_inputs)
+                            and not spec.context_kv_only
+                            and not spec._cl_on
+                            and not spec._vw_stats_on
+                            and (CFG["max_reqs"] == 0 or ib.num_reqs <= CFG["max_reqs"])
+                        ):
+                            sf_m = _get_sf_ring_mod_v14(st)
+                            if sf_m is not None:
+                                _cand_ring = sf_m.get_static_ring_state()
+                                if _cand_ring is not None and _postprocess_args_match_ring(args, kwargs, _cand_ring):
+                                    r_slot = _cand_ring[0]
+                                    st.cur_ring_slot = r_slot
+                                    st.cur_ring_fenced = False
+                                    _td_slot_idx = r_slot % NSLOT
+                                    _td_mru = st._td_last_cert_by_slot[_td_slot_idx]
+                                    if _td_mru is not None and _td_v14_validate(_td_mru, ib, num_spec_sched, _cand_ring, spec, st):
+                                        v14_td = _td_mru["v14"]
+                                        stream = _ensure_region(st)
+                                        if st.region.replay_static_region_v14(
+                                            stream,
+                                            _STAT_STATIC_REPLAY_TD,
+                                            v14_td["exec_key"],
+                                            v14_td["exec_owner"],
+                                            v14_td["exec_handle"],
+                                            v14_td["exec_gen"],
+                                        ):
+                                            if FAST_REPLAY_V16 and "v16_td_step" not in _td_mru:
+                                                _compile_td_v16_plan(
+                                                    _td_mru,
+                                                    spec,
+                                                    st,
+                                                    getattr(spec, "draft_tokens", None),
+                                                    qcgm=getattr(spec, "query_cudagraph_manager", None),
+                                                )
+                                            st.td_static_stream = stream
+                                            st.td_static_armed = _td_mru
+                                            return None
+                                        st._td_last_cert_by_slot[_td_slot_idx] = None
+                    except Exception:  # noqa: BLE001
+                        pass
                 spec = getattr(self, "speculator", None)
                 qcgm = getattr(spec, "query_cudagraph_manager", None) if spec is not None else None
                 why = td_ineligible(
@@ -4693,10 +7733,9 @@ def install() -> bool:
                 if why is not None:
                     st.skips[f"td:{why}"] += 1
                 else:
-                    shape_key = (int(ib.num_reqs), int(ib.num_tokens), int(num_spec_sched))
                     ring_state = None
                     if STATIC_RING:
-                        sf_m = _get_sync_free_ring_mod()
+                        sf_m = _get_sf_ring_mod_v14(st) if (FAST_REPLAY_V14 or FAST_REPLAY_V16) else _get_sync_free_ring_mod()
                         if sf_m is not None:
                             _cand_ring = sf_m.get_static_ring_state()
                             if _cand_ring is not None and _postprocess_args_match_ring(args, kwargs, _cand_ring):
@@ -4705,19 +7744,66 @@ def install() -> bool:
                         r_slot = ring_state[0]
                         st.cur_ring_slot = r_slot
                         st.cur_ring_fenced = False
-                        batch_sig, ptr_sig = _td_static_fingerprint(ib, num_spec_sched, ring_state, spec=spec)
+                        # Wave-V14 O(1) slot-indexed single-pass "td" static replay (0 tuple/fingerprint/dup-spec allocs!)
+                        if FAST_REPLAY_V14 and STATIC_RING_REPLAY and st.region is not None:
+                            _td_slot_idx = r_slot % NSLOT
+                            _td_mru = st._td_last_cert_by_slot[_td_slot_idx]
+                            if _td_mru is not None and _td_v14_validate(_td_mru, ib, num_spec_sched, ring_state, spec, st):
+                                try:
+                                    v14_td = _td_mru["v14"]
+                                    stream = _ensure_region(st)
+                                    if st.region.replay_static_region_v14(
+                                        stream,
+                                        _STAT_STATIC_REPLAY_TD,
+                                        v14_td["exec_key"],
+                                        v14_td["exec_owner"],
+                                        v14_td["exec_handle"],
+                                        v14_td["exec_gen"],
+                                    ):
+                                        st.td_static_stream = stream
+                                        st.td_static_armed = _td_mru
+                                        return None
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                st._td_last_cert_by_slot[_td_slot_idx] = None
+                        shape_key = (int(ib.num_reqs), int(ib.num_tokens), int(num_spec_sched))
                         cert_key = (shape_key, r_slot)
+                        if FAST_REPLAY_V14 and STATIC_RING_REPLAY and st.region is not None:
+                            _td_lu = st.td_static_cert.get(cert_key)
+                            if (
+                                _td_lu is not None
+                                and _td_lu is not st._td_last_cert_by_slot[r_slot % NSLOT]
+                                and _td_v14_validate(_td_lu, ib, num_spec_sched, ring_state, spec, st)
+                            ):
+                                try:
+                                    v14_lu = _td_lu["v14"]
+                                    stream = _ensure_region(st)
+                                    if st.region.replay_static_region_v14(
+                                        stream,
+                                        _STAT_STATIC_REPLAY_TD,
+                                        v14_lu["exec_key"],
+                                        v14_lu["exec_owner"],
+                                        v14_lu["exec_handle"],
+                                        v14_lu["exec_gen"],
+                                    ):
+                                        st._td_last_cert_by_slot[r_slot % NSLOT] = _td_lu
+                                        st.td_static_stream = stream
+                                        st.td_static_armed = _td_lu
+                                        return None
+                                except Exception:  # noqa: BLE001
+                                    pass
+                        batch_sig, ptr_sig = _td_static_fingerprint(ib, num_spec_sched, ring_state, spec=spec)
                         cert = st.td_static_cert.get(cert_key) if STATIC_RING_REPLAY else None
                         if (
                             cert is not None
                             and st.region is not None
                             and cert["batch_sig"] == batch_sig
                             and cert["ptr_sig"] == ptr_sig
-                            and _td_static_spec_ok(spec, int(ib.num_reqs))
+                            and _td_static_spec_ok(spec, int(ib.num_reqs), num_spec_sched=num_spec_sched)
                         ):
                             try:
                                 stream = _ensure_region(st)
-                                if FAST_REPLAY_V11:
+                                if FAST_REPLAY_V11 or FAST_REPLAY_V14:
                                     _td_ok = st.region.replay_static_region(
                                         stream,
                                         "td",
@@ -4727,6 +7813,14 @@ def install() -> bool:
                                         expected_exec_gen=cert.get("exec_gen"),
                                     )
                                     if _td_ok:
+                                        if (FAST_REPLAY_V14 or FAST_REPLAY_V16) and "v14" not in cert:
+                                            _compile_td_v14_plan(cert, spec, st, getattr(spec, "draft_tokens", None))
+                                        if FAST_REPLAY_V16 and "v16_td_step" not in cert:
+                                            _compile_td_v16_plan(cert, spec, st, getattr(spec, "draft_tokens", None), qcgm=qcgm)
+                                        elif FAST_REPLAY_V16:
+                                            _register_td_v16_lut(st, cert, int(ib.num_reqs), num_spec_sched, r_slot)
+                                        if FAST_REPLAY_V14 or FAST_REPLAY_V16:
+                                            st._td_last_cert_by_slot[r_slot % NSLOT] = cert
                                         st.td_static_stream = stream
                                         st.td_static_armed = cert
                                         return None
@@ -4736,7 +7830,12 @@ def install() -> bool:
                                     st.td_static_armed = cert_armed
                                     return None
                             except Exception:  # noqa: BLE001
-                                st.td_static_cert.pop(cert_key, None)
+                                _pop_td = st.td_static_cert.pop(cert_key, None)
+                                if _pop_td is not None:
+                                    if st._td_last_cert_by_slot[r_slot % NSLOT] is _pop_td:
+                                        st._td_last_cert_by_slot[r_slot % NSLOT] = None
+                                    if FAST_REPLAY_V16:
+                                        _evict_td_v16_lut(st, _pop_td)
                         opened = _open_region(st, "td", shape_key, force_slot=r_slot)
                         if opened and st.region is not None:
                             r = st.region
@@ -4747,6 +7846,7 @@ def install() -> bool:
                                 "batch_sig": batch_sig,
                                 "ptr_sig": ptr_sig,
                                 "num_reqs": int(ib.num_reqs),
+                                "num_spec_sched": int(num_spec_sched),
                                 "idx_mapping": ib.idx_mapping,
                                 "haz0": sum(v for k, v in r.stats.items() if k.startswith("haz:td:")),
                                 "staged0": r.stats["staged"],
@@ -4757,6 +7857,7 @@ def install() -> bool:
                                 "draft_batch_desc": None,
                             }
                     else:
+                        shape_key = (int(ib.num_reqs), int(ib.num_tokens), int(num_spec_sched))
                         _open_region(st, "td", shape_key)
             pp_res = orig_postprocess(self, *args, **kwargs)
             if st.td_cap_ctx is not None:

@@ -78,8 +78,10 @@ def _config(M, N, K):
 
 
 def supported(x: torch.Tensor, w8: torch.Tensor) -> bool:
-    return (x.dim() == 2 and 0 < x.shape[0] <= 64 and x.dtype == torch.bfloat16
-            and w8.dtype == torch.float8_e4m3fn and x.stride(1) == 1 and w8.stride(1) == 1
+    return (x.is_cuda and w8.is_cuda and x.dim() == 2 and w8.dim() == 2
+            and 0 < x.shape[0] <= 64 and w8.shape[0] > 0
+            and x.dtype == torch.bfloat16 and w8.dtype == torch.float8_e4m3fn
+            and x.stride(1) == 1 and w8.stride(1) == 1
             and x.shape[1] == w8.shape[1] and x.shape[1] >= 256)
 
 
@@ -99,10 +101,17 @@ def skinny_fp8_linear(x: torch.Tensor, w8: torch.Tensor, scale: torch.Tensor,
     """``x @ dequant(w8).T``: x bf16 ``[M, K]`` (M <= 64), w8 e4m3 ``[N, K]``, scale fp32 ``[N]``."""
     M, K = x.shape
     N = w8.shape[0]
+    if M > 64:
+        raise ValueError(f"skinny_fp8_linear supports M <= 64, got M={M}")
     if out is None:
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    if M == 0:
+    else:
+        if out.dim() != 2 or out.shape != (M, N) or out.stride(1) != 1:
+            raise ValueError(f"skinny_fp8_linear invalid out shape/stride: {tuple(out.shape)} stride={out.stride()}")
+    if M == 0 or N == 0:
         return out
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
     bm, bn, bk, split, nw, ns = _OV if _OV is not None else _config(M, N, K)
     ks = triton.cdiv(triton.cdiv(K, split), bk) * bk
     split = triton.cdiv(K, ks)

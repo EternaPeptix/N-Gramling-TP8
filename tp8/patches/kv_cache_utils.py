@@ -237,7 +237,11 @@ def null_head_len(blocks: Sequence[KVCacheBlock]) -> int:
         else:
             hi = mid
     # All null entries are one shared object, so count() checks the run at C speed.
-    if blocks[:lo].count(blocks[0]) == lo:
+    # Avoid copying a full-length slice when the entire sequence is null.
+    if lo == len(blocks):
+        if blocks.count(blocks[0]) == lo:
+            return lo
+    elif blocks[:lo].count(blocks[0]) == lo:
         return lo
     return next(i for i, b in enumerate(blocks) if not b.is_null)
 
@@ -357,24 +361,44 @@ class FreeKVCacheBlockQueue:
         """
         if n == 0:
             return []
-        assert self.num_free_blocks >= n
-        self.num_free_blocks -= n
+        if n < 0:
+            raise ValueError(f"Cannot pop negative number of blocks: {n}")
+        if self.num_free_blocks < n:
+            raise ValueError(
+                f"Not enough free blocks: requested {n}, available {self.num_free_blocks}"
+            )
 
+        tail = self.fake_free_list_tail
         curr_block = self.fake_free_list_head.next_free_block
         if n == 1:
-            assert curr_block is not None
+            if curr_block is None or curr_block is tail:
+                raise RuntimeError(
+                    f"num_free_blocks ({self.num_free_blocks}) is out of sync "
+                    "with the free list in popleft_n(1)."
+                )
             next_block = curr_block.next_free_block
+            if next_block is None:
+                raise RuntimeError(
+                    "Invalid block found in popleft_n(1) without next_free_block"
+                )
             curr_block.prev_free_block = None
             curr_block.next_free_block = None
-            if next_block is not None:
-                self.fake_free_list_head.next_free_block = next_block
-                next_block.prev_free_block = self.fake_free_list_head
+            self.fake_free_list_head.next_free_block = next_block
+            next_block.prev_free_block = self.fake_free_list_head
+            self.num_free_blocks -= 1
             return [curr_block]
 
         # Pop n blocks from the head of the list
-        ret = []
+        ret: list[KVCacheBlock] = []
         for _ in range(n):
-            assert curr_block is not None
+            if curr_block is None or curr_block is tail:
+                # Re-link head to tail before raising so the queue remains valid.
+                self.fake_free_list_head.next_free_block = tail
+                tail.prev_free_block = self.fake_free_list_head
+                self.num_free_blocks = 0
+                raise RuntimeError(
+                    f"Free list exhausted early in popleft_n({n}) after {len(ret)} blocks"
+                )
             ret.append(curr_block)
             last_block = curr_block
             curr_block = curr_block.next_free_block
@@ -382,11 +406,13 @@ class FreeKVCacheBlockQueue:
             last_block.prev_free_block = None
             last_block.next_free_block = None
 
-        if curr_block is not None:
-            # The queue is not empty, connect the fake head to
-            # the new first block.
-            self.fake_free_list_head.next_free_block = curr_block
-            curr_block.prev_free_block = self.fake_free_list_head
+        if curr_block is None:
+            raise RuntimeError(
+                "Invalid block found in popleft_n() without next_free_block"
+            )
+        self.fake_free_list_head.next_free_block = curr_block
+        curr_block.prev_free_block = self.fake_free_list_head
+        self.num_free_blocks -= n
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
@@ -420,6 +446,12 @@ class FreeKVCacheBlockQueue:
             block: The block to append.
 
         """
+        if block.is_null:
+            raise RuntimeError("Cannot append null_block to FreeKVCacheBlockQueue")
+        if block.prev_free_block is not None or block.next_free_block is not None:
+            raise RuntimeError(
+                f"append() called on a block already in the free list: {block}"
+            )
         tail = self.fake_free_list_tail
         last_block = tail.prev_free_block
         if last_block is None:
@@ -440,6 +472,14 @@ class FreeKVCacheBlockQueue:
         """Put a list of blocks at the front of the free list."""
         if len(blocks) == 0:
             return
+
+        for block in blocks:
+            if block.is_null:
+                raise RuntimeError("Cannot prepend null_block to FreeKVCacheBlockQueue")
+            if block.prev_free_block is not None or block.next_free_block is not None:
+                raise RuntimeError(
+                    f"prepend_n() called on a block already in the free list: {block}"
+                )
 
         first_block = self.fake_free_list_head.next_free_block
         assert first_block is not None, (
@@ -466,6 +506,14 @@ class FreeKVCacheBlockQueue:
         """
         if not blocks:
             return
+
+        for block in blocks:
+            if block.is_null:
+                raise RuntimeError("Cannot append null_block to FreeKVCacheBlockQueue")
+            if block.prev_free_block is not None or block.next_free_block is not None:
+                raise RuntimeError(
+                    f"append_n() called on a block already in the free list: {block}"
+                )
 
         tail = self.fake_free_list_tail
         last_block = tail.prev_free_block
@@ -955,6 +1003,15 @@ _FAST_PREFIX_HASH = os.environ.get("INKLING_FAST_PREFIX_HASH", "0").strip().lowe
     "1", "on", "true", "yes",
 )
 _EMPTY_BLOCK_HASH = BlockHash(b"")
+# Intra-segment 4-token block indices hashed in each 256-token (64-block) segment:
+# covers block_size in {64, 128, 256} (incl. KV-BF12 Local/Draft SWA bs=128 -> r=31,63)
+# and SConv bs=4 at alignment in {64, 128, 256} for both non-EAGLE and EAGLE peek.
+_FAST_HASH_SEG_OFFSETS: tuple[int, ...] = (0, 15, 16, 31, 32, 47, 48, 62, 63)
+
+
+def is_empty_block_hash(block_hash: BlockHash | None) -> bool:
+    """True when a block hash slot is an unhashed placeholder (`b""` or None)."""
+    return not block_hash
 
 
 def get_request_block_hasher(
@@ -1004,65 +1061,105 @@ def get_request_block_hasher(
             seg_tok_start = first_seg * 256
             tok_end = total_blks * 4 + la_toks
             raw_slice = token_slice(request._all_token_ids, seg_tok_start, tok_end)
-            mv = memoryview(array.array("i", raw_slice)).cast("B")
-            sha256 = hashlib.sha256
-            base_seed = NONE_HASH if isinstance(NONE_HASH, bytes) else b"\x55" * 32
-            if request.cache_salt:
-                seed_p0 = sha256(base_seed + request.cache_salt.encode("utf-8")).digest()
-            else:
-                seed_p0 = sha256(base_seed).digest()
+            try:
+                mv = memoryview(array.array("i", raw_slice)).cast("B")
+            except OverflowError:
+                mv = None
+            if mv is not None:
+                sha256 = hashlib.sha256
+                none_hash_val = globals().get("NONE_HASH")
+                base_seed = (
+                    none_hash_val if isinstance(none_hash_val, bytes) else b"\x55" * 32
+                )
+                if request.cache_salt:
+                    seed_p0 = sha256(
+                        base_seed + request.cache_salt.encode("utf-8")
+                    ).digest()
+                else:
+                    seed_p0 = sha256(base_seed).digest()
 
-            out_hashes: list[BlockHash] = [_EMPTY_BLOCK_HASH] * n_new
-            full_segs = total_blks // 64
+                out_hashes: list[BlockHash] = [_EMPTY_BLOCK_HASH] * n_new
+                full_segs = total_blks // 64
+                seg_offsets = _FAST_HASH_SEG_OFFSETS
 
-            def _seg_parent(seg_k: int) -> bytes:
-                if seg_k <= 0:
-                    return seed_p0
-                p_idx = seg_k * 64 - 1
-                if p_idx < existing_blks:
-                    return bytes(request.block_hashes[p_idx])
-                return bytes(out_hashes[p_idx - existing_blks])
+                def _seg_parent(seg_k: int) -> bytes:
+                    if seg_k <= 0:
+                        return seed_p0
+                    p_idx = seg_k * 64 - 1
+                    if p_idx < existing_blks:
+                        return bytes(request.block_hashes[p_idx])
+                    return bytes(out_hashes[p_idx - existing_blks])
 
-            # 1. Any partial remainder of `first_seg` when resuming mid-segment (e.g. incremental decode)
-            cur_seg = first_seg
-            if existing_blks % 64 != 0 and cur_seg < full_segs:
-                p_bytes = _seg_parent(cur_seg)
-                seg_mv_off = (cur_seg - first_seg) * 1024
-                for r in range(existing_blks % 64, 64):
-                    if r in (0, 62, 63):
-                        h = sha256(p_bytes)
-                        h.update(mv[seg_mv_off : seg_mv_off + (r + 1) * 16 + la_bytes])
-                        out_hashes[cur_seg * 64 + r - existing_blks] = BlockHash(h.digest())
-                cur_seg += 1
+                # 1. Any partial remainder of `first_seg` when resuming mid-segment (e.g. incremental decode)
+                cur_seg = first_seg
+                if existing_blks % 64 != 0 and cur_seg < full_segs:
+                    p_bytes = _seg_parent(cur_seg)
+                    seg_mv_off = (cur_seg - first_seg) * 1024
+                    min_r = existing_blks % 64
+                    base_out = cur_seg * 64 - existing_blks
+                    h = sha256(p_bytes)
+                    prev = seg_mv_off
+                    for r in seg_offsets:
+                        if r < min_r:
+                            continue
+                        end = seg_mv_off + (r + 1) * 16
+                        h.update(mv[prev:end])
+                        prev = end
+                        if la_bytes == 0:
+                            digest = h.digest() if r == 63 else h.copy().digest()
+                        else:
+                            hc = h.copy()
+                            hc.update(mv[end : end + la_bytes])
+                            digest = hc.digest()
+                        out_hashes[base_out + r] = BlockHash(digest)
+                    cur_seg += 1
 
-            # 2. Full 256-token (64-block) aligned segments: ~38x faster than 64x CBOR+SHA256!
-            while cur_seg < full_segs:
-                p_bytes = _seg_parent(cur_seg)
-                seg_mv_off = (cur_seg - first_seg) * 1024
-                base_out = cur_seg * 64 - existing_blks
-                h0 = sha256(p_bytes)
-                h0.update(mv[seg_mv_off : seg_mv_off + 16 + la_bytes])
-                out_hashes[base_out] = BlockHash(h0.digest())
-                h62 = sha256(p_bytes)
-                h62.update(mv[seg_mv_off : seg_mv_off + 1008 + la_bytes])
-                out_hashes[base_out + 62] = BlockHash(h62.digest())
-                h63 = sha256(p_bytes)
-                h63.update(mv[seg_mv_off : seg_mv_off + 1024 + la_bytes])
-                out_hashes[base_out + 63] = BlockHash(h63.digest())
-                cur_seg += 1
+                # 2. Full 256-token (64-block) aligned segments using incremental SHA-256 copy():
+                # hashes 1,024 B once per segment while emitting all bs={64,128,256}+SConv offsets!
+                while cur_seg < full_segs:
+                    p_bytes = _seg_parent(cur_seg)
+                    seg_mv_off = (cur_seg - first_seg) * 1024
+                    base_out = cur_seg * 64 - existing_blks
+                    h = sha256(p_bytes)
+                    prev = seg_mv_off
+                    for r in seg_offsets:
+                        end = seg_mv_off + (r + 1) * 16
+                        h.update(mv[prev:end])
+                        prev = end
+                        if la_bytes == 0:
+                            digest = h.digest() if r == 63 else h.copy().digest()
+                        else:
+                            hc = h.copy()
+                            hc.update(mv[end : end + la_bytes])
+                            digest = hc.digest()
+                        out_hashes[base_out + r] = BlockHash(digest)
+                    cur_seg += 1
 
-            # 3. Trailing incomplete segment (< 64 blocks): hash every 4-token block for exact replay/decode!
-            tail_start_blk = max(existing_blks, full_segs * 64)
-            if tail_start_blk < total_blks:
-                p_bytes = _seg_parent(full_segs)
-                seg_mv_off = (full_segs - first_seg) * 1024
-                for b_idx in range(tail_start_blk, total_blks):
-                    r = b_idx - full_segs * 64
-                    ht = sha256(p_bytes)
-                    ht.update(mv[seg_mv_off : seg_mv_off + (r + 1) * 16 + la_bytes])
-                    out_hashes[b_idx - existing_blks] = BlockHash(ht.digest())
+                # 3. Trailing incomplete segment (< 64 blocks): incremental hash of every 4-token block!
+                tail_start_blk = max(existing_blks, full_segs * 64)
+                if tail_start_blk < total_blks:
+                    p_bytes = _seg_parent(full_segs)
+                    seg_mv_off = (full_segs - first_seg) * 1024
+                    h = sha256(p_bytes)
+                    prev = seg_mv_off
+                    for b_idx in range(tail_start_blk, total_blks):
+                        r = b_idx - full_segs * 64
+                        end = seg_mv_off + (r + 1) * 16
+                        h.update(mv[prev:end])
+                        prev = end
+                        if la_bytes == 0:
+                            digest = (
+                                h.digest()
+                                if b_idx == total_blks - 1
+                                else h.copy().digest()
+                            )
+                        else:
+                            hc = h.copy()
+                            hc.update(mv[end : end + la_bytes])
+                            digest = hc.digest()
+                        out_hashes[b_idx - existing_blks] = BlockHash(digest)
 
-            return out_hashes
+                return out_hashes
 
         curr_mm_idx = 0
         mm_features = request.mm_features

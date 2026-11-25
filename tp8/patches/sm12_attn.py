@@ -84,6 +84,19 @@ _FUSE_GS_S1 = os.environ.get("INKLING_SM12_FUSE_GS_S1", "0").strip().lower() not
 _C48_SPLIT_POLICY = os.environ.get("INKLING_ATTN_C48_SPLIT_POLICY", "0").strip().lower() in (
     "1", "true", "on", "yes"
 )
+# Wave-V15 Drafter-Only 48-SM Attention Split Policy (opt-in, default OFF):
+#   - Lifts B=2..8 drafter attention from 33-67% SM util / 1.33-wave tails to 42..48 CTAs
+#     (100% 48-SM saturation at B=2G,3,4,6G,8) while leaving target attention (draft=False)
+#     and B=1 100% untouched (0-ULP 1dcfb306 invariant!).
+_DRAFT_ATTN_C48_SPLIT_POLICY = os.environ.get(
+    "INKLING_DRAFT_ATTN_C48_SPLIT_POLICY", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+# Wave-V15 Decode Edge Guard (opt-in, default OFF):
+#   - Enables GPU-only (0 host sync, CUDA-graph-safe) sequence-length clamping to
+#     `block_table.shape[1] * BS` before external fixed-ABI CUDA kernels.
+_DECODE_EDGE_GUARD_V15 = os.environ.get(
+    "INKLING_DECODE_EDGE_GUARD_V15", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 _C48_LOCAL_SPLITS = max(1, min(16, int(os.environ.get("INKLING_ATTN_C48_LOCAL_SPLITS", "1") or "1")))
 _C48_LOCAL_SPLITS_B2 = max(1, min(16, int(os.environ.get("INKLING_ATTN_C48_LOCAL_SPLITS_B2", "8") or "8")))
 _C48_GLOBAL_TARGET_CTAS = max(
@@ -117,9 +130,18 @@ def _plan_target_splits(
     draft: bool = False,
 ) -> int:
     """CUDA-graph-safe static split planner (depends ONLY on static capture args).
-    Guarantees 0 behavior change when INKLING_ATTN_C48_SPLIT_POLICY=0, and 0 change
-    at B == 1 (exact_ink 0-ULP invariant) and B >= 9 even when enabled."""
+    Guarantees 0 behavior change when INKLING_ATTN_C48_SPLIT_POLICY=0 (and when
+    INKLING_DRAFT_ATTN_C48_SPLIT_POLICY=1, target draft=False remains 100% untouched),
+    and 0 change at B == 1 (exact_ink 0-ULP invariant) and B >= 9 even when enabled."""
     if not _C48_SPLIT_POLICY:
+        if (
+            _DRAFT_ATTN_C48_SPLIT_POLICY
+            and draft
+            and rows <= split_row_cap
+            and 2 <= num_reqs <= 8
+        ):
+            base = max(1, mtiles * num_reqs)
+            return max(1, min(16, 48 // base))
         if rows <= split_row_cap and num_reqs <= 4:
             return 8 if window >= 0 else 16
         if _DRAFT_SPLIT_CONC and draft and rows <= split_row_cap and num_reqs > 4:
@@ -223,6 +245,7 @@ def _attn_kernel(
     ssk_t=0,
     sy_t=0,
     FUSE_GS: tl.constexpr = False,
+    max_bt_cols=0,
 ):
     if PDL:
         if DRAFT:
@@ -255,7 +278,7 @@ def _attn_kernel(
     split = tl.program_id(2) % NUM_SPLITS
 
     q0 = tl.load(CUQ + r)
-    qlen = tl.load(CUQ + r + 1) - q0
+    qlen = tl.maximum(tl.load(CUQ + r + 1) - q0, 0)
     seqlen = tl.load(SEQ + r)
     past = seqlen - qlen
     if HAS_NLIVE:
@@ -350,16 +373,19 @@ def _attn_kernel(
             k_beg = tl.maximum(past + mt * BLOCK_M // G - WINDOW, 0)
         else:
             k_beg = 0
+    max_keys = tl.where(max_bt_cols > 0, max_bt_cols * BS, k_end)
+    k_end = tl.maximum(tl.minimum(k_end, max_keys), 0)
+    k_beg = tl.minimum(tl.maximum(k_beg, 0), k_end)
     span = k_end - k_beg
     per = tl.cdiv(tl.cdiv(span, NUM_SPLITS), BLOCK_N) * BLOCK_N
     s_beg = k_beg + split * per
     s_end = tl.minimum(s_beg + per, k_end)
     if HAS_TREE_2B:
-        s_end_live = tl.minimum(s_end, tl.where(is_sec_tile, past + 1 + tree_ws, past + 1 + tree_wp))
+        s_end_live = tl.maximum(tl.minimum(s_end, tl.where(is_sec_tile, past + 1 + tree_ws, past + 1 + tree_wp)), s_beg)
     elif HAS_NLIVE and not DRAFT:
-        s_end_live = tl.minimum(s_end, past + r_live)
+        s_end_live = tl.maximum(tl.minimum(s_end, past + r_live), s_beg)
     else:
-        s_end_live = s_end
+        s_end_live = tl.maximum(s_end, s_beg)
 
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
@@ -367,10 +393,12 @@ def _attn_kernel(
     nn = tl.arange(0, BLOCK_N)
     for n0 in range(s_beg, s_end_live, BLOCK_N):
         kpos = n0 + nn
-        k_ok = kpos < s_end_live
+        k_ok = (kpos >= 0) & (kpos < s_end_live)
         if HAS_TREE_2B:
             phys_kpos = tl.where(is_sec_tile & (kpos > past), kpos + tree_wp, kpos)
-            blk = tl.load(BT + r * sbt_r + phys_kpos // BS, mask=k_ok, other=0).to(tl.int64)
+            phys_blk = phys_kpos // BS
+            k_ok = k_ok & (phys_kpos >= 0) & ((max_bt_cols <= 0) | (phys_blk < max_bt_cols))
+            blk = tl.load(BT + r * sbt_r + phys_blk, mask=k_ok, other=0).to(tl.int64)
             slot = phys_kpos % BS
         elif HAS_TREE:
             is_tree_k = kpos >= past
@@ -382,11 +410,14 @@ def _attn_kernel(
                 other=0,
             )
             phys_kpos = tl.where(is_tree_k, past + anc_idx, kpos)
-            k_ok = k_ok & ((~is_tree_k) | in_anc)
-            blk = tl.load(BT + r * sbt_r + phys_kpos // BS, mask=k_ok, other=0).to(tl.int64)
+            phys_blk = phys_kpos // BS
+            k_ok = k_ok & ((~is_tree_k) | in_anc) & (phys_kpos >= 0) & ((max_bt_cols <= 0) | (phys_blk < max_bt_cols))
+            blk = tl.load(BT + r * sbt_r + phys_blk, mask=k_ok, other=0).to(tl.int64)
             slot = phys_kpos % BS
         else:
-            blk = tl.load(BT + r * sbt_r + kpos // BS, mask=k_ok, other=0).to(tl.int64)
+            lblk = kpos // BS
+            k_ok = k_ok & ((max_bt_cols <= 0) | (lblk < max_bt_cols))
+            blk = tl.load(BT + r * sbt_r + lblk, mask=k_ok, other=0).to(tl.int64)
             slot = kpos % BS
         k = tl.load(K + blk[None, :] * sk_b + slot[None, :] * sk_s + kvh * sk_h + dd[:, None],
                     mask=k_ok[None, :], other=0.0)
@@ -540,6 +571,7 @@ def _attn_prefill_local_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     ALIGN_KBEG_M64: tl.constexpr = True,
     FUSE_GS: tl.constexpr = True,
+    max_bt_cols=0,
 ):
     """0-ULP prefill sliding-window attention (BLOCK_M=32, BLOCK_N=64, 4 warps).
     Eliminates the 218-register spill of the stock (64,64,4w) kernel while keeping
@@ -549,7 +581,7 @@ def _attn_prefill_local_kernel(
     kvh = tl.program_id(2)
 
     q0 = tl.load(CUQ + r)
-    qlen = tl.load(CUQ + r + 1) - q0
+    qlen = tl.maximum(tl.load(CUQ + r + 1) - q0, 0)
     seqlen = tl.load(SEQ + r)
     past = seqlen - qlen
 
@@ -573,11 +605,14 @@ def _attn_prefill_local_kernel(
     qpos = past + i_loc
 
     k_end = past + i_hi + 1
+    max_keys = tl.where(max_bt_cols > 0, max_bt_cols * BS, k_end)
+    k_end = tl.maximum(tl.minimum(k_end, max_keys), 0)
     if ALIGN_KBEG_M64:
         mt64 = (mt * BLOCK_M) // 64
         k_beg = tl.maximum(past + (mt64 * 64) // G - WINDOW, 0)
     else:
         k_beg = tl.maximum(past + i_lo - WINDOW, 0)
+    k_beg = tl.minimum(k_beg, k_end)
 
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
@@ -655,6 +690,7 @@ def _attn_prefill_full_kernel(
     G: tl.constexpr, BS: tl.constexpr, D: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     FUSE_GS: tl.constexpr = True,
+    max_bt_cols=0,
 ):
     """0-ULP prefill full-attention kernel (unpacked 1 head/CTA, BM=64 or 128, BN=64).
     Since k_beg == 0 always in full attention, n0 = 0, 64, 128, ... is identical to
@@ -666,7 +702,7 @@ def _attn_prefill_full_kernel(
     kvh = h // G
 
     q0 = tl.load(CUQ + r)
-    qlen = tl.load(CUQ + r + 1) - q0
+    qlen = tl.maximum(tl.load(CUQ + r + 1) - q0, 0)
     seqlen = tl.load(SEQ + r)
     past = seqlen - qlen
 
@@ -687,6 +723,8 @@ def _attn_prefill_full_kernel(
                 mask=row_ok[:, None], other=0.0)
 
     k_end = past + i_hi + 1
+    max_keys = tl.where(max_bt_cols > 0, max_bt_cols * BS, k_end)
+    k_end = tl.maximum(tl.minimum(k_end, max_keys), 0)
     q_min = past + i_lo
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
@@ -784,6 +822,21 @@ _PF_GLOBAL_ZERO_SYNC = os.environ.get("INKLING_PF_GLOBAL_ZERO_SYNC", "0").strip(
     "1", "on", "true", "yes",
 )
 _PF_SHADOW_K_CACHE: dict[int, dict] = {}
+
+
+def release_shadow_k_cache() -> int:
+    """Opt-in release of prefill FP8 shadow-K cache (1.02 GiB across 8 global layers; capture-guarded)."""
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return 0
+    freed = 0
+    for st in _PF_SHADOW_K_CACHE.values():
+        if isinstance(st, dict):
+            for k in ("k_fp8", "k_scale", "k_mid", "k_rad", "gpu_bt_state"):
+                t_buf = st.get(k)
+                if isinstance(t_buf, torch.Tensor):
+                    freed += int(t_buf.numel() * t_buf.element_size())
+    _PF_SHADOW_K_CACHE.clear()
+    return freed
 _PF_SHADOW_K_WARNED = False
 _PF_COMPACT_ARANGE_BT: dict[tuple, torch.Tensor] = {}
 _PREFILL_CPU_LENS: tuple = (None, None)
@@ -1011,7 +1064,8 @@ def _prepare_fp8_shadow_k_ex(
         else:
             qlen = int((cu_seqlens_q[1] - cu_seqlens_q[0]).item())
         past = seqlen - qlen
-        nblks = (seqlen + bs - 1) // bs
+        max_bt_cols = int(block_table.shape[1])
+        nblks = min(max_bt_cols, (seqlen + bs - 1) // bs) if seqlen > 0 else 0
         if compact and nblks > cap_blks:
             st["last_bt0"] = -1
             st["last_seqlen"] = -1
@@ -1131,7 +1185,11 @@ def _prepare_fp8_shadow_k_ex(
         seqlens_list = [int(seq_lens_cpu[r]) for r in range(num_reqs)]
     else:
         seqlens_list = cache_seqlens[:num_reqs].tolist()
-    req_nblks = [(int(sl) + bs - 1) // bs if int(sl) > 0 else 0 for sl in seqlens_list]
+    max_bt_cols = int(block_table.shape[1])
+    req_nblks = [
+        min(max_bt_cols, (int(sl) + bs - 1) // bs) if int(sl) > 0 else 0
+        for sl in seqlens_list
+    ]
     total_blks = sum(req_nblks)
     st["last_bt0"] = -1
     st["last_seqlen"] = -1
@@ -1139,7 +1197,7 @@ def _prepare_fp8_shadow_k_ex(
     if compact:
         if total_blks > cap_blks:
             return None, None, None, None, None, 0
-        max_nb = max(req_nblks) if req_nblks else 1
+        max_nb = max(1, max(req_nblks)) if req_nblks else 1
         k_bt_rows = []
         off = 0
         for nb in req_nblks:
@@ -1202,6 +1260,7 @@ def _launch_prefill_opt(args, gate=None, sinks=None, result=None, seq_lens_cpu=N
             sg_t, ssk_t, softmax_scale * LOG2E,
             WINDOW=window, E=E, EW=EW, G=G, BS=BS, D=D,
             BLOCK_M=bm, BLOCK_N=bn, ALIGN_KBEG_M64=True, FUSE_GS=fuse,
+            max_bt_cols=block_table.shape[1],
             num_warps=warps, num_stages=stages,
         )
     else:
@@ -1280,6 +1339,7 @@ def _launch_prefill_opt(args, gate=None, sinks=None, result=None, seq_lens_cpu=N
             sg_t, ssk_t, softmax_scale * LOG2E,
             E=E, EW=EW, G=G, BS=BS, D=D,
             BLOCK_M=bm, BLOCK_N=bn, FUSE_GS=fuse,
+            max_bt_cols=block_table.shape[1],
             num_warps=warps, num_stages=stages,
         )
 
@@ -1357,6 +1417,7 @@ def consume_pending(output, gate, lse_t, sinks, result) -> bool:
                 ssk_t=sk_sub.stride(0),
                 sy_t=y_sub.stride(0),
                 FUSE_GS=True,
+                max_bt_cols=bt_s.shape[1],
                 num_warps=warps_s, num_stages=stages_s, launch_pdl=_PDL,
             )
             if nt < T:
@@ -1388,6 +1449,7 @@ def consume_pending(output, gate, lse_t, sinks, result) -> bool:
             HAS_TREE_2B=False,
             TREE_FAST_EXIT=False,
             TREE_MAX_M=8,
+            max_bt_cols=bt_s.shape[1],
             num_warps=warps_s, num_stages=stages_s, launch_pdl=_PDL,
         )
         return False
@@ -1478,6 +1540,8 @@ def rel_attention(q, key_cache, value_cache, *, block_table, cache_seqlens,
     _WO_ARMED = False
     T, H, D = q.shape
     num_reqs = cu_seqlens_q.shape[0] - 1
+    if T <= 0 or num_reqs <= 0:
+        return
     Hkv = key_cache.shape[-2]
     G = H // Hkv
     BS = key_cache.shape[1]
@@ -1594,6 +1658,7 @@ def rel_attention(q, key_cache, value_cache, *, block_table, cache_seqlens,
         HAS_TREE_2B=has_tree_2b,
         TREE_FAST_EXIT=has_tree_2b and _TREE_ATTN_FAST_EXIT,
         TREE_MAX_M=tree_st.max_m if has_tree else 8,
+        max_bt_cols=block_table.shape[1],
         num_warps=warps, num_stages=stages, launch_pdl=use_pdl,
     )
     if num_splits > 1:
@@ -1643,12 +1708,12 @@ def rel_attention_fused_s1(
     """0-ULP single-launch Target Attention + Gate + Sink for `NUM_SPLITS == 1` (`B >= 5` C=32).
     Eliminates FP32 `out`/`lse` allocations, `zero_()` launches, and `_gate_sink_kernel`!"""
     T, H, D = q.shape
-    if T == 0:
+    num_reqs = cache_seqlens.shape[0]
+    if T <= 0 or num_reqs <= 0:
         return
     Hkv = key_cache.shape[2]
     G = H // Hkv
     BS = key_cache.shape[1]
-    num_reqs = cache_seqlens.shape[0]
     window = window_size[0]
     EW = sheared_bias.shape[2]
     E = EW - 256
@@ -1691,6 +1756,7 @@ def rel_attention_fused_s1(
         ssk_t=sinks.stride(0),
         sy_t=y_out.stride(0),
         FUSE_GS=True,
+        max_bt_cols=block_table.shape[1],
         num_warps=warps, num_stages=stages, launch_pdl=use_pdl,
     )
 
@@ -1811,7 +1877,7 @@ def _plan_draft_attn_v5_splits(num_reqs: int, is_local: bool) -> tuple[int, int]
             return 17, 8
         s = _DRAFT_ATTN_C1_V4_SPLITS_LOCAL if is_local else _DRAFT_ATTN_C1_V4_SPLITS_GLOBAL
         return s, 8
-    if _C48_SPLIT_POLICY and 2 <= num_reqs <= 8:
+    if (_C48_SPLIT_POLICY or _DRAFT_ATTN_C48_SPLIT_POLICY) and 2 <= num_reqs <= 8:
         # Exact 48-SM wave-balanced C=2..8 drafter splits (42..48 CTAs = 0 double-loaded SM tail,
         # S * q_cap <= 384 <= 512 for every B=2..8!).
         q_cap = num_reqs * 8
@@ -1824,8 +1890,11 @@ def _plan_draft_attn_v5_splits(num_reqs: int, is_local: bool) -> tuple[int, int]
         if num_reqs == 5:
             return 9, q_cap
         if num_reqs == 6:
-            # S=6 has same max 3 tiles/CTA as S=8 on window=1032 (17 tiles) with 25% less OP/LP merge traffic!
-            return (6 if _DRAFT_ATTN_V9_SPLITS else 8), q_cap
+            # Local (window=1032, 17 KV tiles): S=6 keeps max 3 tiles/CTA with 25% less merge traffic.
+            # Global (window=4104+, 65+ KV tiles): under INKLING_DRAFT_ATTN_C48_SPLIT_POLICY=1,
+            # S=8 achieves exact 48/48 SM saturation (9 vs 11 tiles/CTA, S*q_cap=384 <= 512).
+            use_s6 = _DRAFT_ATTN_V9_SPLITS and (is_local or not _DRAFT_ATTN_C48_SPLIT_POLICY)
+            return (6 if use_s6 else 8), q_cap
         # B=7 (42 CTAs) and B=8 (48 CTAs exact): eliminates v5 S=8 56/64-CTA 2-CTA/SM wave tail!
         return 6, q_cap
     if num_reqs == 2:
@@ -1852,6 +1921,7 @@ def _try_draft_block_attention_v5(
     if (
         T <= 0 or T > num_reqs * 8 or block <= 0 or block > 8 or H != 6 or D != 128
         or key_cache.ndim != 4 or value_cache.ndim != 4
+        or block_table.ndim != 2 or block_table.shape[0] < num_reqs or block_table.shape[1] <= 0
         or key_cache.shape[2] != 1 or value_cache.shape[2] != 1
         or q.dtype != torch.bfloat16 or key_cache.dtype != torch.bfloat16
         or value_cache.dtype != torch.bfloat16 or out.dtype != torch.bfloat16
@@ -1878,9 +1948,14 @@ def _try_draft_block_attention_v5(
     n_splits, q_cap = _plan_draft_attn_v5_splits(num_reqs, is_local)
     if T > q_cap:
         return False
+    seq_arg = (
+        cache_seqlens.clamp(0, int(block_table.shape[1]) * int(key_cache.shape[1]))
+        if (_DECODE_EDGE_GUARD_V15 and not torch.cuda.is_current_stream_capturing())
+        else cache_seqlens
+    )
     rc = lib.drafter_attn_v5_fwd(
         q.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
-        block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+        block_table.data_ptr(), seq_arg.data_ptr(), cu_seqlens_q.data_ptr(),
         ops[bank].data_ptr(), lps[bank].data_ptr(), split_done.data_ptr(), out_3d.data_ptr(),
         q.stride(0), q.stride(1),
         key_cache.stride(0), key_cache.stride(1),
@@ -1978,6 +2053,7 @@ def _try_draft_block_attention_c1_v4(
     if (
         T <= 0 or T > 8 or block <= 0 or block > 8 or H != 6 or D != 128
         or key_cache.ndim != 4 or value_cache.ndim != 4
+        or block_table.ndim != 2 or block_table.shape[0] < 1 or block_table.shape[1] <= 0
         or key_cache.shape[2] != 1 or value_cache.shape[2] != 1
         or q.dtype != torch.bfloat16 or key_cache.dtype != torch.bfloat16
         or value_cache.dtype != torch.bfloat16 or out.dtype != torch.bfloat16
@@ -2003,9 +2079,14 @@ def _try_draft_block_attention_c1_v4(
         if (window and 0 < int(window) <= 2048)
         else _DRAFT_ATTN_C1_V4_SPLITS_GLOBAL
     )
+    seq_arg = (
+        cache_seqlens.clamp(0, int(block_table.shape[1]) * int(key_cache.shape[1]))
+        if (_DECODE_EDGE_GUARD_V15 and not torch.cuda.is_current_stream_capturing())
+        else cache_seqlens
+    )
     rc = lib.drafter_attn_c1_v4_fwd(
         q.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
-        block_table.data_ptr(), cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(),
+        block_table.data_ptr(), seq_arg.data_ptr(), cu_seqlens_q.data_ptr(),
         op.data_ptr(), lp.data_ptr(), split_done.data_ptr(), out_3d.data_ptr(),
         q.stride(0), q.stride(1),
         key_cache.stride(0), key_cache.stride(1),
@@ -2024,6 +2105,8 @@ def draft_block_attention(q, key_cache, value_cache, out, *, block_table,
     """SM12x drop-in for ops.attention.block_decode_attention: bf16 ``out``
     ``(T, H * D)``; each ``block``-token request sees its keys up to the last
     one, or the last ``window`` of them if ``window``."""
+    if q.shape[0] <= 0 or int(cu_seqlens_q.shape[0] - 1) <= 0:
+        return
     if _DRAFT_ATTN_V5 and _try_draft_block_attention_v5(
         q, key_cache, value_cache, out,
         block_table=block_table, cache_seqlens=cache_seqlens,
@@ -2066,12 +2149,22 @@ _PF_LOCAL_OTF_TRIED = False
 # Wave-V10 opt-in FP8 P@V attention v6 (`libpf_fp8_attn_v6.so`, default OFF!)
 # Strictly gated to eager prefill `max_seqlen_q >= 1024` & `!capturing` so Warm-1M
 # (`qlen=436`) stays on `v5_zspill` + BF16 OTF and decode (`M <= 128`) is 100% untouched.
-_PF_FP8_ATTN_V6 = os.environ.get("INKLING_PF_FP8_ATTN_V6", "0").strip().lower() in (
+_PF_FP8_ATTN_V13 = os.environ.get("INKLING_PF_FP8_ATTN_V13", "0").strip().lower() in (
     "1", "on", "true", "yes"
 )
-_PF_FP8_ATTN_V6_LIB_PATH = os.environ.get(
-    "INKLING_PF_FP8_ATTN_V6_LIB", "/rdma/libpf_fp8_attn_v6.so"
+_PF_FP8_ATTN_V6 = _PF_FP8_ATTN_V13 or (
+    os.environ.get("INKLING_PF_FP8_ATTN_V6", "0").strip().lower() in (
+        "1", "on", "true", "yes"
+    )
+)
+_PF_FP8_ATTN_V13_LIB_PATH = os.environ.get(
+    "INKLING_PF_FP8_ATTN_V13_LIB", "/rdma/libpf_fp8_attn_v13.so"
 ).strip()
+_PF_FP8_ATTN_V6_LIB_PATH = (
+    _PF_FP8_ATTN_V13_LIB_PATH
+    if (_PF_FP8_ATTN_V13 and _PF_FP8_ATTN_V13_LIB_PATH and os.path.exists(_PF_FP8_ATTN_V13_LIB_PATH))
+    else os.environ.get("INKLING_PF_FP8_ATTN_V6_LIB", "/rdma/libpf_fp8_attn_v6.so").strip()
+)
 _PF_FP8_PV_F16_ACC = os.environ.get("INKLING_PF_FP8_PV_F16_ACC", "0").strip().lower() in (
     "1", "on", "true", "yes"
 )
@@ -2275,6 +2368,9 @@ def local_swa_otf_rel_prefill(
     if key_cache is None or value_cache is None or block_table is None:
         return False
     T, H, D = q.shape
+    num_reqs = int(cu_seqlens_q.shape[0] - 1)
+    if T <= 0 or num_reqs <= 0:
+        return True
     Hkv = key_cache.shape[2]
     BS = key_cache.shape[1]
     E = rel_proj_t.shape[0]
@@ -2287,7 +2383,8 @@ def local_swa_otf_rel_prefill(
         or key_cache.stride(3) != 1 or value_cache.stride(3) != 1
     ):
         return False
-    num_reqs = int(cu_seqlens_q.shape[0] - 1)
+    if _DECODE_EDGE_GUARD_V15 and block_table.ndim == 2 and block_table.shape[1] > 0:
+        cache_seqlens = cache_seqlens.clamp(0, int(block_table.shape[1]) * int(BS))
     stream_u64 = int(torch.cuda.current_stream(q.device).cuda_stream)
     if v6_lib is not None:
         rc6 = v6_lib.local_swa_fp8_otf_rel_v6_sm121_fwd(
@@ -2491,11 +2588,15 @@ def global_otf_rel_prefill(
         return False
 
     T, H, D = q.shape
+    num_reqs = int(cu_seqlens_q.shape[0] - 1)
+    if T <= 0 or num_reqs <= 0:
+        return True
     Hkv = int(kv_bf12_cache.shape[1]) if use_kv_bf12 else int(key_cache.shape[2])
     G = H // Hkv
     BS = 256 if use_kv_bf12 else int(key_cache.shape[1])
     E = rel_proj_t.shape[0]
-    num_reqs = int(cu_seqlens_q.shape[0] - 1)
+    if _DECODE_EDGE_GUARD_V15 and block_table.ndim == 2 and block_table.shape[1] > 0:
+        cache_seqlens = cache_seqlens.clamp(0, int(block_table.shape[1]) * int(BS))
     if seq_lens_cpu is not None and len(seq_lens_cpu) >= num_reqs and num_reqs > 0:
         max_seq = int(max(seq_lens_cpu[:num_reqs]))
     else:

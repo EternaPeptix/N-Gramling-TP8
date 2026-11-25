@@ -5,78 +5,72 @@ Production-grade, **100% 0-ULP bit-exact** inference stack for
 (594B total / 17B active MoE, 384 routed experts top-8, 40 NVFP4 local SWA-1024 layers + 8 MXFP8 global layers, 1M context, 5-layer DSpark speculator)
 on **8× NVIDIA DGX Spark (GB10, SM121a)** over **4× 200GbE ConnectX-7 RoCEv2**.
 
-> **Status (2026-11-24): LIVE & 6-FOR-6 ALL-TIME RECORD on 8/8 nodes (`tp8/config/live_champion_v12.env`, `V12-FINAL`).**
-> This repository started as a fork of `msuiche/dgx-inkling-small` (which documented the 4-Spark TP4 driver livelock — preserved under `launch/inkling2-tp4.sh`, `repro/`, and `nvidia-bug-report.md`). On 8× DGX Spark (`TP8`), `V12-FINAL` achieves **10/10 0-ULP deterministic decode (`1dcf…f8c3`)**, **`151.66 tok/s` C=1**, **`200.78 tok/s` C=4**, **`286.03 tok/s` C=8** (`269.66` `bench.py`), **`563.02 tok/s` C=32** (`496.72` `conc_exact`), **`112.07 s` 1M cold prefill (`9,354 tok/s`)**, and **`7.43×` simultaneous 1M-token KV residency (`7.79M` tokens, `1.84 GiB` CUDA graphs)**.
+> **Status (2026-11-25): PERMANENT LIVE PRODUCTION CHECKPOINT on 8/8 nodes (`0.0.0.0:8010`, `tp8/config/live_champion_v16.env`, `V16-FINAL`).**
+> Empirically qualified and pruned across Wave-V13→V16 on live 8-node GB10 silicon, `V16-FINAL` delivers **10/10 0-ULP deterministic decode (`1dcf…f8c3`)** across cold, warm, post-chaos/harvester/multimodal, and post-1M runs, **`139.07` GM / `144.88` mean `C=1`** (`bench.py single 1024t`, `202.30 tok/s` math), **`136.74 tok/s` (`74.85 min`) `C=2`**, **`187.64 tok/s` (`51.28 min`) `C=4`**, **`567.68 tok/s` (`23.10 mean / 18.90 min`) `C=32`**, **`90.1 tok/s` `1M` decode (`+38.8%` over `V12-FINAL`!)** at **`113.02 s` cold / `2.34 s` warm (`3/3` needles)**, **`417.78 tok/s`** zero-sync `temp=0.6` `16×4` RLVR harvesting (`1.00` unique ratio), **`7.11×` simultaneous 1M KV residency**, **`0` KV leaks** under 20%-abort chaos soak, and **`0 MiB` new swap**.
 
 ---
 
-## Qualified Checkpoint Results (`V12-FINAL` → `tp8/config/live_champion_v12.env`)
+## Qualified Permanent Checkpoint Results (`V16-FINAL` → `tp8/config/live_champion_v16.env`)
 
-All numbers below were measured on **one unified live server** on clean UMA (`GMU=0.85`, `MAX_BATCHED=24576`, port `8010`, stock 2000 MHz GB10 clocks, `live_champion_v12.env` sha256 `f028df17b550…`).
+All `V16-FINAL` numbers were measured on **one unified live 8-Spark server** (`GMU=0.85`, `MAX_BATCHED=24576`, port `8010`, stock 2000 MHz GB10 clocks, `live_champion_v16.env` sha256 `413f1ae7275d…`).
 
-| Metric / Gate | `EXP-6B` (`best.env`) | `EXP-7C` / `Inc P7` | **Current (`V12-FINAL`)** | How Measured |
-|---|---:|---:|---:|---|
-| **1. Bit-Exact Decode (0-ULP)** | `1dcf…f8c3` (3/3) | `1dcf…f8c3` (10/10) | **`1dcf…f8c3` (10/10 cold+warm)** | `exact_ink.py` (10 prompts, `temp=0`, 384 tok, serial). Full SHA-256: `1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3` |
-| **2a. `C=1` `exact_ink.py`** | — | `147.12` / `147.58` | **`151.66 tok/s`** (`21.74 s`) | `exact_ink.py` cold & warm serial wall speed (`+4.54 tok/s` vs `EXP-7C`) |
-| **2b. `C=1` `bench.py single` (`G1`)** | `139.5` *(1024t)* | `134.42` *(256t)* | **`137.20 tok/s`** (`131.0 / 106.2 / 174.4`) | `bench.py single` (`code / prose / math` GM, beats Ds41f `132.0–134.1`) |
-| **3a. `C=2` `bench.py` (`256t`)** | — | — | **`134.60 agg`** (`80.39 mean / 72.46 min`) | `bench.py conc --conc 2 --max-tokens 256` (`AL 2.33`) |
-| **3b. `C=4` `conc_exact` (`128t`)** | — | `186.86` / `194.68` | **`200.78 tok/s`** (`2.55 s` warm) | `conc_exact` (`C=4, 128t`, `+13.92 tok/s` / `+7.5%` vs `EXP-7C`) |
-| **3c. `C=4` `bench.py` (`256t`)** | — | `176.55` (`56.1 / 48.2`) | **`181.25 agg`** (`57.52 mean / 48.20 min`) | `bench.py conc --conc 4 --max-tokens 256` (`AL 2.50`) |
-| **3d. `C=8` `conc_exact` (`128t`)** | — | `265.97` / `274.53` | **`286.03` cold / `279.78` warm** (`3.58 s`) | `conc_exact` (`C=8, 128t`, `+20.06 tok/s` / `+7.5%` vs `EXP-7C`) |
-| **3e. `C=8` `bench.py` (`256t`)** | — | `215.95` (`38.8 / 30.6`) | **`269.66 agg`** (**`45.12 mean / 36.36 min`**) | `bench.py conc --conc 8 --max-tokens 256` (`AL 2.62`, **`+24.9%`** vs `Inc P7`) |
-| **4a. `C=32` `conc_exact` (`128t`)** | — | `463.87` / `487.62` | **`496.72 tok/s`** (`8.24 s` warm) | `conc_exact` (`C=32, 128t`, `+32.85 tok/s` / `+7.1%` vs `EXP-7C`) |
-| **4b. `C=32` `bench.py` (`256t`)** | `518.71` *(512t)* | `494.44` (`20.5 / 16.9`) | **`563.02 agg`** (**`22.90 mean / 18.88 min`**) | `bench.py conc --conc 32 --max-tokens 256` (`AL 2.35`, **`+13.9%`** vs `Inc P7`) |
-| **5a. `32K` / `128K` Prefill (`256t`)** | — | `4.34 s` / `15.05 s` | **`4.30 s` (`158.4` dec)** / **`14.45 s` (`134.0` dec)** | `bench_1m_e2e.py --warm --max-tokens 256`, **3/3 needles** (warm `0.32 s / 0.44 s`) |
-| **5b. `1M` Cold / Warm Prefill** | `120.90 s` / `2.95 s` | `118.86 s` / `112.83 s` | **`112.07 s` (`9,354 tok/s`) / `2.36 s` warm** | `bench_1m_e2e.py --ctx 1048500 --warm --max-tokens 256`, `64.9 tok/s` dec, **3/3 needles** |
-| **6. 1M KV Residency & Graphs** | `4.8×` (`5.07M` tok) | `5.11×` / `7.50×` | **`7.43×` (`7,791,866` tok, `1.84 GiB` graphs)** | Simultaneous 1M KV pool (`5 s` graph capture, `HEALTH_200_OK`) |
-| **WikiText-2 Quality** (`lm-eval`) | `5.8052` / `0.4745` | `5.8052` / `0.4745` | **`word_ppl = 5.8052` · `BPB = 0.4745`** | `wikitext-2-raw-v1`, test, 62 docs, `max_length=2048` (0-ULP invariant) |
+| Metric / Gate | `EXP-6B` (`best.env`) | `V12-FINAL` (`live_champion_v12.env`) | **Current (`V16-FINAL`)** | Delta vs `V12-FINAL` | How Measured |
+|---|---:|---:|---:|---:|---|
+| **1. Bit-Exact Decode (0-ULP)** | `1dcf…f8c3` (3/3) | `1dcf…f8c3` (10/10) | **`1dcf…f8c3` (10/10)** | **0-ULP LOCK** | `exact_ink.py` cold, warm, post-stress, post-1M & live `0.0.0.0:8010` (`1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3`) |
+| **2a. `C=1` `bench.py single` (`1024t`)** | `139.5` | `137.20` GM (`131.0 / 106.2 / 174.4`) | **`139.07` GM (`144.88` mean: `130.3 / 102.1 / 202.3`)** | **`+1.87` GM (`+27.9` math)** | `bench.py single --max-tokens 1024 --temp 0` (`code / prose / math`) |
+| **2b. `C=1` `exact_ink.py`** | — | `151.66` *(today `150.27`)* | **`148.58` warm** (`147.72` prod cold) | `-1.7` | `exact_ink.py` (10 prompts, 384 tok, serial) |
+| **3a. `C=2` `bench.py` (`256t`)** | — | `134.60` (`80.39 / 72.46 min`) | **`136.74` (`81.08 / 74.85 min`)** | **`+2.14` agg / `+2.39` min** | `bench.py conc --conc 2 --max-tokens 256` (`AL 2.44`, **ALL-TIME RECORD**) |
+| **3b. `C=4` `bench.py` (`256t`)** | — | `181.25` (`57.52 / 48.20 min`) | **`187.64` (`58.23 / 51.28 min`)** | **`+6.39` agg / `+3.08` min** | `bench.py conc --conc 4 --max-tokens 256` (`AL 2.72`, **ALL-TIME RECORD**) |
+| **3c. `C=8` `bench.py` / `conc_exact`** | — | `269.66` / `286.03` | **`259.49` (`44.14 / 35.08 min`)** / **`276.01`** | `-10.2` / `-10.0` | `bench.py conc --conc 8` (`256t`) & `conc_exact` (`128t`) |
+| **4. `C=32` `bench.py` (`256t`)** | `518.71` *(512t)* | `563.02` (`22.90 / 18.88 min`) | **`567.68` (`23.10 / 18.90 min`)** | **`+4.66` agg (`+88.7` vs Ds41f)** | `bench.py conc --conc 32 --max-tokens 256` (`AL 2.41`, **ALL-TIME RECORD**) |
+| **5a. `32K` Prefill & Decode** | — | `4.30 s` / `0.32 s` (`158.4` dec) | **`4.30 s` / `0.30 s` (`166.3 tok/s` dec)** | **`+7.9 tok/s` dec (`3/3`)** | `bench_1m_e2e.py --ctx 32768 --max-tokens 384 --warm` |
+| **5b. `128K` Prefill & Decode** | — | `14.45 s` / `0.44 s` (`134.0` dec) | **`14.49 s` / `0.44 s` (`132.0 tok/s` dec)** | `parity` (`3/3`) | `bench_1m_e2e.py --ctx 131072 --max-tokens 384 --warm` |
+| **5c. `1M` Cold / Warm / Decode** | `120.90 s` / `2.95 s` | `112.07 s` / `2.36 s` (`64.9` dec) | **`113.02 s` / `2.34 s` (`90.1 tok/s` dec!)** | **`+25.2 tok/s` (`+38.8%` dec!)** | `bench_1m_e2e.py --ctx 1048500 --max-tokens 384 --warm` (`48.3×` warm, `3/3` needles) |
+| **6. RLVR Harvester (`16×4`, `temp=0.6`)** | — | Synced PyTorch sampler | **`417.78 tok/s`** (`64/64`, `1.00` uniq, `0` collapsed) | **Zero-Sync SM121a** | `v16_harvester_stress_test.py --workers 16 --n 4 --max-tokens 128` |
+| **7. Chaos Soak & Multimodal API** | — | — | **`96/96` OK, `24/24` aborts, `0` leaks, `7/7` API PASS** | **Production Hardened** | `v15_chaos_soak.py` (120 req, C=16, 20% abort) + `test_api_multimodal_live_v15.py` |
+| **8. 1M KV Residency & Telemetry** | `4.8×` (`5.07M` tok) | `7.43×` (`7.79M` tok) | **`7.11×` (`7,455,548` tok, `0 MiB` new swap)** | **`/dev/shm` telemetry** | `43.58 GiB` KV (`4.68×` Ds41f's `1.52×`), `HEALTH_200_OK`, `0` KV audit anomalies |
 
-- **Optional Agentic/Shared-Prefix Variant (`tp8/config/live_champion_v12_sam.env`, `V12-B11`):** Enables GPU Suffix-Automaton Hybrid Speculation (`INKLING_SAM_HYBRID=1`, `GMU=0.76`, zero swap, **10/10 `1dcf…f8c3`**) for **`155.69 tok/s`** warm `C=1` and **`184.17 tok/s`** `C=4` on repetitive/code workloads.
-- Full machine-readable archives: [`tp8/results/checkpoint_2026-11-24_v12_final.json`](tp8/results/checkpoint_2026-11-24_v12_final.json) · [`tp8/results/wave_v12_live_report.md`](tp8/results/wave_v12_live_report.md) · [`tp8/results/checkpoint_2026-11-22.json`](tp8/results/checkpoint_2026-11-22.json).
+- Full machine-readable archives: [`tp8/results/checkpoint_2026-11-25_v16_final.json`](tp8/results/checkpoint_2026-11-25_v16_final.json) · [`tp8/results/checkpoint_2026-11-24_v12_final.json`](tp8/results/checkpoint_2026-11-24_v12_final.json) · [`tp8/results/wave_v12_live_report.md`](tp8/results/wave_v12_live_report.md).
 
 ---
 
 ## Hardware Topology (8× DGX Spark)
 
-- **GPU:** NVIDIA GB10 (`SM121a`), 48 SMs, 99 KiB SMEM/SM, **244 GB/s** sustained UMA LPDDR5X, 24 MiB L2, 121.63 GiB usable UMA/node (maintain clean contiguous 2 MiB–32 MiB UMA blocks; post-OOM fragmentation degrades decode by `-7%` to `-10%`).
+- **GPU:** NVIDIA GB10 (`SM121a`), 48 SMs, 99 KiB SMEM/SM, **244 GB/s** sustained UMA LPDDR5X, 24 MiB L2, 121.63 GiB usable UMA/node.
 - **CPU:** 20-core Grace ARM (`0..4, 10..14` Cortex-A725 LITTLE; `5..9, 15..19` Cortex-X925 BIG). Container pinned to `--cpuset-cpus=5-9,15-19` with `SCHED_FIFO` RDMA proxies on CPUs `9` & `19` (`tp8/patches/host_pin.py`).
 - **Fabric:** 4× 200GbE ConnectX-7 RoCEv2 (`~25.8 GB/s` aggregate wire, `NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`, `NCCL_IB_QPS_PER_CONNECTION=2`, `NCCL_IB_PCI_RELAXED_ORDERING=1`).
 
 ---
 
-## What We Built & Proven Wins
+## What Shipped in `V16-FINAL` (Live-Verified Wins)
 
-### 1. Wave-V9 through Wave-V12 `C=1..8` & Unified Serving Upgrades (Live in `V12-FINAL`)
-All target decode kernels are compiled with **`-gencode arch=compute_121a,code=sm_121a --fmad=false`** (no `--ftz=true`, no `--use_fast_math`, verified `0` register spills) and gated by `exact_ink.py` (`1dcf…f8c3`, 10/10):
-- **`CertHead V12` (`tp8/kernels/cert_head_fast_v12.cu`):** Verified `63/63` exact (`ref=b1_exact`) across `M=2..64`, eliminating the `-717 us/step` silent FP32 `lm_head` fallback at `C=4..8` at 10/10 `1dcfb306`.
-- **`Drafter U4 TC V9` (`tp8/kernels/drafter_u4_tc_v9.cu`, `MIN_M=9`) + `DSpark V10` (`dspark_markov_v10.cu`, `drafter_attn_v10.cu`):** Saves `-260 us/step` at `C=2..8` while leaving `B=1` untouched, and fixes 4 runtime wiring typos in `dspark_ops.py` (`tc_skip=1/1, es_tc=1, top2_id=1`), unlocking native Batch-All Early-Stop and fused tail/epilogue kernels.
-- **`L2PF v11` Adaptive `C=2..8` QKVR+Tail + `PDL_WO_BF11=1` + `DTGraph/SyncFree` Fast-Replay v11:** Directly drove `+8.7%` `C=4` and `+8.6%` `C=8` gains in isolated same-hour A/B (`V12-B3` vs `P7_CTRL`).
-- **`C=4` 48-CTA SWA (`fused_decode_attn_exact_sm121_v10.cu`, `V8_SWA_MIN_B=5`, `C28_SWA_B34_SPLITS=4`):** Reaches 100% SM utilization (48 CTAs across 48 SMs) on `B=3..4`, cutting critical-path SWA passes/SM by `-44%`.
-- **Context-Aware Confidence Pruning (`INKLING_CTX_ADAPTIVE_TAU=1, FLOOR=0.04`):** Dynamically tightens pruning at `512K–1M` contexts (`+1.5–3.2%` decode) with zero overhead at short prompts.
-- **0-ULP RDMA AllReduce V9 (`rdma_ar_c32_v9.cu`), MoE & Router (`nvfp4_ws5_c32.cu`, `mxfp8_mx7_c48_v9.cu`, `mxfp8_mx7_c1_v5.cu`, `router_bf12_fused_v10.cu`), Fused ShortConv+AR (`fused_sconv_ar_c32_exact.cu`), and BF11 Dense GEMMs (`bf11_flip_exact_c32.cu`).**
+All decode kernels compile with **`-gencode arch=compute_121a,code=sm_121a --fmad=false --ptxas-options=-v`** (`0` register spills, `0` stack frames, no `--ftz=true`, no `--use_fast_math`) and are strictly gated by `exact_ink.py` (`1dcf…f8c3`, 10/10):
 
-### 2. `112.07 s` 1M Cold Prefill & `7.43×` Simultaneous Multi-1M KV Residency
-- **Compact Logical-Block FP8 Shadow K (`global_attn_sage2_sm121_v5_zspill.cu`):** Decouples Shadow K to a constant **`1.016 GiB`**, enabling `GMU=0.85` with **`7.43×` simultaneous 1M KV capacity** (`7.79M` tokens) and **`1.84 GiB`** CUDA graphs (`4.9×` more 1M KV capacity than DeepSeek-V4.1 on the same 8-Spark cluster).
-- **Persistent NVFP4 W2 + V10 Non-MoE + 8-Channel NCCL Ring (`pf_moe_native_sm121_v4.cu`, `pf_attn_nonmoe_v4_sm121.cu`, `pf_mx7_prefill_v10.cu`, `MAX_BATCHED=24576`):** Cuts 1M cold prefill from `120.90 s` (`EXP-6B`) → **`112.07 s` (`9,354 tok/s`, warm `2.36 s`, 3/3 needles)** — `1.51×` faster than Ds41f (`169.1 s`).
-- **Bounded Depth-2 DBO Allocator Ring (`INKLING_PREFILL_DBO_MAX_INFLIGHT_LAYERS=2`):** Caps cross-stream `record_stream` limbo at `0.90 GB` (preventing 21.75 GB UMA page-fault thrash).
-
-### 3. Verified R&D Kernels Included (Non-Default / Wave-V13 Offline Targets)
-- **`nvfp4_ws5_c48_v12.cu` & `nvfp4_ws5_c1_v12.cu`:** `c48_v12` Section A passed **10/10 `1dcf…f8c3`** on live silicon (`V12-B6`), closing the Wave-V10 `dadc285c` SiTU bug; queued for max-occupancy `4 8 6 4 3` / `5 8 6 5 4` rebuild and `S8=1` 1-ULP isolation.
-- **`bf11_flip_exact_v12.cu`:** `+17.8` `C=4` / `+23.1` `C=32` standalone potential; queued for decode-only CUDA graph capture gating (fixing `M=17..128` prefill graph leak).
-- **`mxfp8_mx6_v12.cu` (`MX6-Huff7`) & `pf_rhd_comm_sm121.cu` (`rhd_int8`):** Both 0-ULP / standalone verified; kept non-default as `MX7 v5` and 8ch NCCL BF16 Ring won end-to-end on GB10.
+1. **RDMA V16 (`tp8/kernels/v16/rdma_sconv_v16/rdma_ar_c32_v16.cu`):** Register-fused BF12 AllReduce for `C=4..32` (`P1=262144`, `P2=196608`, `MIN_NVEC=18432`, `ACTIVE_RED=1`, `EXACT_GRID=1`, `EXACT_ROWS=1`, `PAR_QP2_POLL=1`, `TIMEOUT_MS=25000`). Head-to-head beat RDMA V9 by `+14.6 tok/s` `C=4`, `+4.6` `C=8`, `+9.2` `C=32` at `10/10 1dcfb306`.
+2. **Max-Occupancy 48L `C48 MoE V16` (`tp8/kernels/v16/moe_v16/{nvfp4_ws5_c48_v16.cu, mxfp8_mx7_c48_v16.cu}`):** Compiled at `BN16=8, W2=6` (`0` spills) with `L2::evict_first` (`EVICT=1`), `LPT=0`, and V12 default `FC_MODE=-1`.
+3. **`CertHead V14 M<=128` (`tp8/kernels/v16/certhead_router_v14/cert_head_fast_v14.cu`):** Qualified `127/127` exact (`ref=b1_exact`) across `M=2..128`, eliminating the `C=32` (`M=128`) FP32 `lm_head` fallback and pushing `bench C=32` to a new **`567.68 tok/s`** all-time record.
+4. **`Attn V16` Long-Context `S=48` (`tp8/kernels/v16/pf_v13_base/attn_v13/` + `pf_attn_v16/attn_global_v16.patch`):** Enabled strictly for long-context global decode (`S=48`, preserving V12 SWA & short-context kernels untouched), surging `1M` decode from **`64.9` → `90.1 tok/s` (`+38.8%`)** and `32K` decode from `158.4` → **`166.3 tok/s`** at `3/3` needles.
+5. **Zero-Sync `temp>0` Sampling & `DTGraph V14/V16` (`tp8/kernels/v16/sync_free_temp_v16/sync_free_temp_v16.cu`):** SM121a zero-sync stochastic sampler (`ok=1`) + `CERT_HEAD_TEMP_DIRECT_V16=1`, delivering **`417.78 tok/s`** on `16×4` (`64` concurrent completions) `temp=0.6` RLVR rollout harvesting with `1.00` unique ratio and `0` collapsed groups.
+6. **Non-Tail Draft Prefill Skip V16 (`INKLING_PF_SKIP_NONTAIL_DRAFT_V16=1`) + Markov Auto-Slices (`INKLING_MARKOV_FOLD_C48_AUTO_SLICES=1`).**
+7. **V15/V16 Production Hardening, Mixed-Decode Guards & Zero-Overhead Telemetry:** Prefill mixed-decode guards (`PREFILL_SP_GUARD_MIXED_DECODE`, `PF_GLOBAL_GUARD_MIXED_DECODE`, `PF_MOE_MIXED_FP32_COMBINE`, `PF_MIXED_DECODE_BF16`), `PF_SHADOW_K_STRICT_VERIFY=1`, and background telemetry thread writing `/dev/shm/inkling_v16_rank0_metrics.json` every `5 s` + complete ops stack under `tp8/ops/`.
 
 ---
 
-## Dead Ends Proven & Closed
+## Empirically Pruned Candidates (Do Not Re-Enable Without Redesign)
 
-| Idea Tested | Measured Outcome | Why |
+| Candidate Tested Live | Measured Outcome | Why Pruned |
 |---|---|---|
-| **`MX6-Huff7 V12` (`mxfp8_mx6_v12.cu`)** | `125.6 / 169.0 / 231.7 / 374.8` vs `MX7 v5` (`137.0 / 186.9 / 268.1 / 453.1`) | 0-ULP verified (`1dcfb306` 10/10 with `MX7=0`), but Huffman decode ALU overhead outweighs memory savings on GB10 |
-| **`RDMA v12` full overlay (`rdma_ar_c32_v12.cu`)** | `-15%` across `C=1..32` | `h64_q8` drafter AR / `P2_SLEEP_NS=32` / `ADAPTIVE_BLOCKS=1` regressed vs `rdma_ar_c32_v9.cu` |
-| **7-peer P2P INT8/FP8 All-to-All RS** | `130.4–138.6 s` vs `112.1 s` | 7-to-1 RoCEv2 incast vs 8-channel Ring |
-| **C=32 `K=4 / 5 / 7` & Tier-2 Live Compaction** | `K=4` `-2.57%`, `K=7` `-47 tok/s` | Extra verify rows & prose stragglers outweigh AL gain; `K=3` is optimal |
-| **BF11 Dense GEMMs above `M=64`** | `+1.7 to +7.4 ms/step` slower | Above `M=64`, cuBLAS BF16 Tensor Cores beat custom BF11 unpack on GB10 |
-| **`RDMA_AR_WIRE_BF12=1` / `RDMA_AR_ROWS_P2=3` on C=1** | `-1.3` to `-3.2 tok/s` | Extra pack/wire latency hurts C=1 (`M=8`) |
+| **`TREE_SPEC=1` / `SAME_BUDGET_TREE_V16`** | `2/10 f7e65036`, `-2.4 tok/s` `C=1` | Violated 0-ULP `1dcfb306` hard gate |
+| **`MOE_S8=1` (`v10/v5/c1_v16`)** | `0/10 ab56fa68`, `-9.6 tok/s` `C=2`; `c1_v16` IMA | Violated 0-ULP gate / warmup IMA |
+| **`BF11_V13=1` / `ROUTER_V14=1`** | `-6.5` to `-8.5 tok/s` `C=1` | Regressed vs V12 BF11/Router |
+| **`L2PF_V16=1`** (`185 GB/s`, `17.25 MB`) | `-17 tok/s` `C=32`, `-7 tok/s` `C=4` | Thrashed 24 MiB GB10 L2; kept V12 L2PF |
+| **`DRAFT_SWA_SPARSE=1` / `L2PF_DRAFT_ATTN=1`** | Step-3/4 RDMA hang + `700%` KV warn | Deadlocked in live multi-node decode |
+| **`SPEC_K=15` / `DYN_K_EXTEND_V16=1`** | `-11.7 tok/s` `C=1` (`148.5 → 136.8`) | Drafted `K=15` unconditionally even on prose |
+| **`HETERO_BUDGET_SPEC=1` / `K=7@C2..4`** | `C=4` `188.6 → 174.4`, `C=8` `259.5 → 243.3` | Kept V12 schedule `[[1,1,7],[2,3,6],[4,8,5],[9,24,3],[25,32,3]]` |
+| **`Prefill V16` (`W13_V6/W2_V5/MX7_V10/FP8_ATTN_V13`)** | `128K` `18.56 s`, `1M` `142.3 s` | Slower than V12 Prefill (`14.49 s` / `113.02 s`) |
+| **`KV_BF12_GLOBAL_ONLY=1`** | Prompt-0 `CUDA_ERROR_LAUNCH_FAILED`, KV `6.81×` | Crashed AND shrank KV via pool padding |
+| **`C48 MoE V16 LPT=2`** | Prompt-0 IMA | PDL `launch_dependents` raced shared `ws["work_queue"]` between W13 & W2; clean at `LPT=0` |
+| **`DECODE_EDGE_GUARD_V15=1`** | Prompt-0 decode IMA | Allocated temp tensors inside CUDA graph capture + wrong KV axis (`shape[0]=2`); patched in source & kept OFF on hot decode path |
 
 ---
 
@@ -85,30 +79,36 @@ All target decode kernels are compiled with **`-gencode arch=compute_121a,code=s
 ```text
 tp8/
   config/
-    live_champion_v12.env                  # Promoted V12-FINAL 6-for-6 TP8 default (GMU=0.85)
-    live_champion_v12_sam.env              # Optional GPU-SAM agentic variant (GMU=0.76, zero swap)
+    live_champion_v16.env                  # Promoted V16-FINAL permanent production default (GMU=0.85)
+    live_champion_v12.env                  # Preserved V12-FINAL rollback baseline (GMU=0.85)
+    live_champion_v12_sam.env              # Optional GPU-SAM agentic variant (GMU=0.76)
     best.env                               # Preserved EXP-6B rollback baseline (GMU=0.72)
     inkling-cal*.json                      # Confidence calibration tables
   launch/inkling-tp8-s6.sh                 # Per-rank Docker launcher (CPU pinning + RoCEv2 + RDMA)
-  patches/                                 # 54 vLLM Inkling-2 Python overlays + MANIFEST (py_compile green)
-  kernels/                                 # SM121a (GB10) CUDA kernels (.cu/.cuh) + build scripts
-  bench/                                   # Multi-1M, 8-rank RHD comm, and 0-ULP attention verifiers
+  ops/                                     # V15/V16 supervisor, watchdog, UMA guard, Prometheus exporter, Grafana, systemd
+  patches/                                 # V16-FINAL vLLM Inkling-2 Python overlays (py_compile green)
+  kernels/
+    *.cu, *.cuh, build_*.sh                # Preserved V12 SM121a CUDA kernels & build scripts
+    v16/                                   # Wave-V13..V16 SM121a CUDA sources (0 spills) + build_wave_v16_all.sh
+  bench/
+    bench_multi_1m.py, bench_rhd_8rank.py, verify_c1_attn_v2_gb10.py
+    v16_qa/                                # Harvester 16x4, multimodal API, chaos soak, env auditor, qualification suites
   results/
-    checkpoint_2026-11-24_v12_final.json   # Clean-UMA V12-FINAL verified metrics archive
-    wave_v12_live_report.md                # Full Wave-V12 live A/B progression & verdicts
-    checkpoint_2026-11-22.json             # Prior EXP-6B baseline archive
+    checkpoint_2026-11-25_v16_final.json   # Live-verified V16-FINAL permanent checkpoint archive
+    checkpoint_2026-11-24_v12_final.json   # Prior V12-FINAL archive
+    wave_v12_live_report.md                # Wave-V12 live A/B report
+    checkpoint_2026-11-22.json             # Prior EXP-6B archive
 
 # Preserved 4-Spark TP4 archive (2026-11-16):
 launch/inkling2-tp4.sh · config/cluster.env.example · patches/ · repro/ · nvidia-bug-report.md
 ```
 
-## Quickstart (8× DGX Spark TP8)
+## Rollback & Operations
 
-1. Build the SM121a `.so` libraries on one quiet GB10 node using `-gencode arch=compute_121a,code=sm_121a` (using `--fmad=false` on all decode kernels, 0 spills) and distribute to `/home/<user>/inkling-tp8/rdma/` on all 8 nodes.
-2. Sync `tp8/patches/` to `/home/<user>/inkling-tp8/patches-s6-v12/` and `tp8/config/live_champion_v12.env` + `tp8/launch/inkling-tp8-s6.sh` to all 8 nodes.
-3. Launch ranks `7..0` via `tp8/launch/inkling-tp8-s6.sh` (`vllm/vllm-openai:inkling-2-small` image) with `live_champion_v12.env` sourced and verify:
-   - Health: `curl -sf http://127.0.0.1:8010/health`
-   - Bit-exactness: `exact_ink.py` must match `1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3` (`10/10`).
-   - Long-context & KV residency: `bench_1m_e2e.py --ctx 1048500 --warm --max-tokens 256` and `python3 tp8/bench/bench_multi_1m.py --sessions 4`.
+All prior baselines (`live_champion_v12.env`, `best.env`, `patches-s6-v12/`, `patches-s6/`, and V12 `.so`s) remain untouched on all 8 Sparks for instant 1-command rollback:
 
-See [`STATUS.md`](STATUS.md) for the full wave-by-wave engineering log, GB10 operational rules, and Wave-V13 offline optimization roadmap.
+- **Live Health & Telemetry:** `curl -sf http://spark-one:8010/health` · `cat /dev/shm/inkling_v16_rank0_metrics.json`
+- **0-ULP Certification:** `python3 /home/jeweled/inkling-tp8/exact_ink.py` must return `10/10` SHA-256 `1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3`.
+- **Instant Rollback to `V12-FINAL`:** Source `/home/jeweled/inkling-tp8/live_champion_v12.env` across ranks `0..7` and relaunch `inkling-tp8-s6.sh`.
+
+See [`STATUS.md`](STATUS.md) for the complete wave-by-wave engineering log and GB10 operational rules.

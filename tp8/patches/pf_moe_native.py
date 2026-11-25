@@ -203,6 +203,47 @@ PF_MX7_V10_SPLIT_M = int(os.environ.get("INKLING_PF_MX7_V10_SPLIT_M", "512"))
 PF_MX7_V10_W_EVICT = int(os.environ.get("INKLING_PF_MX7_V10_W_EVICT", "1"))
 _MX7_V10_ZM_RAW = os.environ.get("INKLING_PF_MX7_V10_ZERO_MODE", "auto").strip().lower()
 PF_MX7_V10_RESERVE_SMS = int(os.environ.get("INKLING_PF_MX7_V10_RESERVE_SMS", "8"))
+# Wave-V13 ZERO-SPIN prefill MoE opt-in (strictly default OFF; unlocks 48/48 SMs with 0 deadlock risk!):
+PF_V13_ZEROSPIN = os.environ.get("INKLING_PF_V13_ZEROSPIN", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+# Wave-V16 SUB-60s 3-stage cp.async + fine LPT + L2::evict_first + DB slice opt-in (strictly default OFF!):
+PF_V16_SUB60S = os.environ.get("INKLING_PF_V16_SUB60S", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+PF_V16_DOUBLE_BUF_SLICE = os.environ.get("INKLING_PF_V16_DOUBLE_BUF_SLICE", "1").strip().lower() not in (
+    "0", "", "off", "false", "no",
+)
+PF_NVFP4_W13_V16_LIB_PATH = os.environ.get(
+    "INKLING_PF_NVFP4_W13_V16_LIB", "/rdma/libpf_nvfp4_w13_fused_v16.so"
+).strip()
+PF_NVFP4_W2_V16_LIB_PATH = os.environ.get(
+    "INKLING_PF_NVFP4_W2_V16_LIB", "/rdma/libpf_nvfp4_w2_v16.so"
+).strip()
+PF_MX7_V16_LIB_PATH = os.environ.get(
+    "INKLING_PF_MX7_V16_LIB", "/rdma/libpf_mx7_prefill_v16.so"
+).strip()
+# Wave-V15/V16 strict zero-spin gate: when PF_V13_ZEROSPIN=1 or PF_V16_SUB60S=1, refuse fallback to
+# legacy <1300 spinlocking .so libraries (prevents hardware GPU deadlock if reserve_sms=0 under DBO!).
+PF_V13_STRICT_ZEROSPIN = os.environ.get(
+    "INKLING_PF_V13_STRICT_ZEROSPIN", "1" if (PF_V13_ZEROSPIN or PF_V16_SUB60S) else "0"
+).strip().lower() not in ("0", "", "off", "false", "no")
+# Wave-V15 mixed prefill+decode precision guard: promote BF16x2 atomic combine (cm=2) to
+# FP32 atomic combine (cm=1) whenever active decode requests share the chunked prefill batch.
+PF_MOE_MIXED_FP32_COMBINE = os.environ.get(
+    "INKLING_PF_MOE_MIXED_FP32_COMBINE", "1"
+).strip().lower() not in ("0", "", "off", "false", "no")
+PF_NVFP4_W13_V13_LIB_PATH = os.environ.get(
+    "INKLING_PF_NVFP4_W13_V13_LIB", "/rdma/libpf_nvfp4_w13_fused_v13.so"
+).strip()
+PF_NVFP4_W2_V13_LIB_PATH = os.environ.get(
+    "INKLING_PF_NVFP4_W2_V13_LIB", "/rdma/libpf_nvfp4_w2_v13.so"
+).strip()
+PF_MX7_V13_LIB_PATH = os.environ.get(
+    "INKLING_PF_MX7_V13_LIB", "/rdma/libpf_mx7_prefill_v13.so"
+).strip()
+_PF_W2_RESERVE_EXPLICIT = "INKLING_PF_W2_RESERVE_SMS" in os.environ
+_PF_MX7_RESERVE_EXPLICIT = "INKLING_PF_MX7_V10_RESERVE_SMS" in os.environ
 _NVFP4_W13_V6_LIB: ctypes.CDLL | None = None
 _NVFP4_W13_V6_TRIED = False
 _V6_Y_SLOT_CACHE: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -211,6 +252,90 @@ _MX7_V10_TRIED = False
 _MX7_V10_PLAN_CACHE: dict[torch.device, torch.Tensor] = {}
 _MX7_V10_SLICE_STATE_CACHE: dict[torch.device, torch.Tensor] = {}
 _PF_MOE_SCRATCH_CACHE: dict[tuple[torch.device, str], torch.Tensor] = {}
+_DTYPE_ITEMSIZE: dict[torch.dtype, int] = {
+    torch.uint8: 1,
+    torch.int8: 1,
+    torch.bool: 1,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+    torch.int16: 2,
+    torch.int32: 4,
+    torch.float32: 4,
+    torch.int64: 8,
+    torch.float64: 8,
+}
+if hasattr(torch, "float8_e4m3fn"):
+    _DTYPE_ITEMSIZE[torch.float8_e4m3fn] = 1
+_PF_EVENT_POOL: dict[torch.device, list] = {}
+_PF_EVENT_POOL_MAX = 32
+
+
+def _is_stream_capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _dtype_itemsize(dtype: torch.dtype) -> int:
+    sz = _DTYPE_ITEMSIZE.get(dtype)
+    if sz is None:
+        sz = int(torch.empty((), dtype=dtype).element_size())
+        _DTYPE_ITEMSIZE[dtype] = sz
+    return sz
+
+
+def _dbo_or_sp_env_enabled() -> bool:
+    for var in ("INKLING_PREFILL_DBO", "INKLING_PREFILL_SP"):
+        if os.environ.get(var, "0").strip().lower() in ("1", "true", "on", "yes"):
+            return True
+    return False
+
+
+def _is_mixed_decode_batch() -> bool:
+    """Zero-GPU-sync check whether the active forward context mixes decode + prefill requests."""
+    try:
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+        if not is_forward_context_available():
+            return False
+        fc = get_forward_context()
+        am = getattr(fc, "attn_metadata", None)
+        if am is None:
+            return False
+        metas = am.values() if isinstance(am, dict) else (am,)
+        for m in metas:
+            if m is None:
+                continue
+            nd = getattr(m, "num_decode_reqs", None)
+            if nd is None:
+                nd = getattr(m, "num_decodes", 0)
+            np = getattr(m, "num_prefill_reqs", None)
+            if np is None:
+                np = getattr(m, "num_prefills", 0)
+            if nd is not None and int(nd) > 0:
+                if np is None or int(np) > 0:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _acquire_pf_event(device: torch.device, *, min_ring_before_reuse: int = 1):
+    """Acquire a CUDA event from a bounded per-device ring (reuses only completed events)."""
+    pool = _PF_EVENT_POOL.setdefault(device, [])
+    if len(pool) >= min_ring_before_reuse:
+        for i, ev in enumerate(pool):
+            try:
+                if ev.query():
+                    ev = pool.pop(i)
+                    pool.append(ev)
+                    return ev
+            except Exception:
+                pass
+    ev = torch.cuda.Event()
+    if len(pool) < _PF_EVENT_POOL_MAX:
+        pool.append(ev)
+    return ev
 
 
 def _bind_lib(lib: ctypes.CDLL) -> ctypes.CDLL:
@@ -342,21 +467,40 @@ def _get_mx7_v6_lib() -> ctypes.CDLL | None:
 
 
 def _get_pf_mx7_v10_lib() -> ctypes.CDLL | None:
-    """Lazy loader for Wave-V10 `libpf_mx7_prefill_v10.so` (1-launch co-resident MX7 W2 + DBO reserve)."""
+    """Lazy loader for Wave-V10/V13 `libpf_mx7_prefill_v13.so` / `v10.so` (with strict zero-spin gate)."""
     global _MX7_V10_LIB, _MX7_V10_TRIED
     if not (PF_MX7_V10 and USE_MX7):
         return None
     if _MX7_V10_LIB is not None:
         return _MX7_V10_LIB
-    if _MX7_V10_TRIED:
+    if _MX7_V10_TRIED or _is_stream_capturing():
         return None
     _MX7_V10_TRIED = True
     c_vp, c_i, c_u64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64
-    for p in (
+    _v16_cands = (
+        PF_MX7_V16_LIB_PATH,
+        "/rdma/libpf_mx7_prefill_v16.so",
+        os.path.join(_HERE, "libpf_mx7_prefill_v16.so"),
+    )
+    _v13_cands = (
+        PF_MX7_V13_LIB_PATH,
+        "/rdma/libpf_mx7_prefill_v13.so",
+        os.path.join(_HERE, "libpf_mx7_prefill_v13.so"),
+    )
+    _legacy_cands = (
         PF_MX7_V10_LIB_PATH,
         "/rdma/libpf_mx7_prefill_v10.so",
         os.path.join(_HERE, "libpf_mx7_prefill_v10.so"),
-    ):
+    )
+    _zs_cands = (_v16_cands + _v13_cands) if PF_V16_SUB60S else _v13_cands
+    _want_zs = PF_V13_ZEROSPIN or PF_V16_SUB60S
+    if _want_zs and PF_V13_STRICT_ZEROSPIN:
+        _mx7_cands = _zs_cands
+    elif _want_zs:
+        _mx7_cands = _zs_cands + _legacy_cands
+    else:
+        _mx7_cands = _legacy_cands
+    for p in _mx7_cands:
         if p and os.path.isfile(p):
             lib = ctypes.CDLL(p)
             lib.pf_mx7_build_expert_plan.argtypes = [c_vp] * 2 + [c_i] * 5 + [c_u64]
@@ -381,15 +525,43 @@ def _get_pf_mx7_v10_lib() -> ctypes.CDLL | None:
             lib.pf_mx7_w2_v10_unfused.restype = c_i
             lib.pf_mx7_w2_v10_combine.argtypes = [c_vp] * 12 + [c_i] * 12 + [c_u64]
             lib.pf_mx7_w2_v10_combine.restype = c_i
-            lib.pf_mx7_v10_set_reserve_sms(int(PF_MX7_V10_RESERVE_SMS))
+            if hasattr(lib, "pf_mx7_v16_version"):
+                lib.pf_mx7_v16_version.argtypes = []
+                lib.pf_mx7_v16_version.restype = c_i
+            if hasattr(lib, "pf_mx7_set_double_buf_slice_v16"):
+                lib.pf_mx7_set_double_buf_slice_v16.argtypes = [c_i]
+                lib.pf_mx7_set_double_buf_slice_v16.restype = c_i
+                lib.pf_mx7_set_double_buf_slice_v16(1 if PF_V16_DOUBLE_BUF_SLICE else 0)
+            _mx7_ver = int(lib.pf_mx7_v10_version())
+            if _want_zs and PF_V13_STRICT_ZEROSPIN and _mx7_ver < 1300:
+                print(
+                    f"[inkling-pf-moe-native] WARNING: rejecting legacy MX7 {p} (ver={_mx7_ver} < 1300) "
+                    "because INKLING_PF_V13_ZEROSPIN=1 & INKLING_PF_V13_STRICT_ZEROSPIN=1",
+                    flush=True,
+                )
+                continue
+            _eff_mx7_res = (
+                int(PF_MX7_V10_RESERVE_SMS)
+                if (_PF_MX7_RESERVE_EXPLICIT or _mx7_ver < 1300)
+                else 0
+            )
+            if _mx7_ver < 1300 and _dbo_or_sp_env_enabled() and _eff_mx7_res < 8:
+                _eff_mx7_res = 8
+            lib.pf_mx7_v10_set_reserve_sms(_eff_mx7_res)
             _MX7_V10_LIB = lib
             print(
                 f"[inkling-pf-moe-native] loaded MX7 v10 prefill {p} "
-                f"(ver={lib.pf_mx7_v10_version()}, reserve_sms={lib.pf_mx7_v10_get_reserve_sms()}, "
+                f"(ver={_mx7_ver}, reserve_sms={lib.pf_mx7_v10_get_reserve_sms()}, "
                 f"panels={PF_MX7_V10_PANELS}, split_m={PF_MX7_V10_SPLIT_M}, zm={_MX7_V10_ZM_RAW})",
                 flush=True,
             )
             return _MX7_V10_LIB
+    if PF_V13_ZEROSPIN and PF_V13_STRICT_ZEROSPIN:
+        print(
+            "[inkling-pf-moe-native] WARNING: zero-spin libpf_mx7_prefill_v13.so not found; "
+            "refusing legacy spinlocking v10 fallback (falling back to safe non-spinlocking path).",
+            flush=True,
+        )
     return None
 
 
@@ -404,7 +576,7 @@ def _get_pf_mx7_v4_lib() -> ctypes.CDLL | None:
         return None
     if _MX7_V4_LIB is not None:
         return _MX7_V4_LIB
-    if _MX7_V4_TRIED:
+    if _MX7_V4_TRIED or _is_stream_capturing():
         return None
     _MX7_V4_TRIED = True
     c_vp, c_i, c_u64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64
@@ -443,7 +615,7 @@ def _get_pf_nvfp4_w13_v4b_lib() -> ctypes.CDLL | None:
         return None
     if _NVFP4_V4B_LIB is not None:
         return _NVFP4_V4B_LIB
-    if _NVFP4_V4B_TRIED:
+    if _NVFP4_V4B_TRIED or _is_stream_capturing():
         return None
     _NVFP4_V4B_TRIED = True
     c_vp, c_i, c_u64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64
@@ -473,21 +645,40 @@ def _get_pf_nvfp4_w13_v4b_lib() -> ctypes.CDLL | None:
 
 
 def _get_pf_nvfp4_w13_v6_lib() -> ctypes.CDLL | None:
-    """Lazy loader for DBO-safe `libpf_nvfp4_w13_fused_v6.so` (W13+SiTU+Quant + Route v6)."""
+    """Lazy loader for zero-spin/DBO-safe `libpf_nvfp4_w13_fused_v13.so` / `v6.so`."""
     global _NVFP4_W13_V6_LIB, _NVFP4_W13_V6_TRIED
     if not (PF_NVFP4_W13_V6 or PF_ROUTE_V6):
         return None
     if _NVFP4_W13_V6_LIB is not None:
         return _NVFP4_W13_V6_LIB
-    if _NVFP4_W13_V6_TRIED:
+    if _NVFP4_W13_V6_TRIED or _is_stream_capturing():
         return None
     _NVFP4_W13_V6_TRIED = True
     c_vp, c_i, c_f, c_u64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_float, ctypes.c_uint64
-    for p in (
+    _v16_cands = (
+        PF_NVFP4_W13_V16_LIB_PATH,
+        "/rdma/libpf_nvfp4_w13_fused_v16.so",
+        os.path.join(_HERE, "libpf_nvfp4_w13_fused_v16.so"),
+    )
+    _v13_cands = (
+        PF_NVFP4_W13_V13_LIB_PATH,
+        "/rdma/libpf_nvfp4_w13_fused_v13.so",
+        os.path.join(_HERE, "libpf_nvfp4_w13_fused_v13.so"),
+    )
+    _legacy_cands = (
         PF_NVFP4_W13_V6_LIB_PATH,
         "/rdma/libpf_nvfp4_w13_fused_v6.so",
         os.path.join(_HERE, "libpf_nvfp4_w13_fused_v6.so"),
-    ):
+    )
+    _zs_cands = (_v16_cands + _v13_cands) if PF_V16_SUB60S else _v13_cands
+    _want_zs = PF_V13_ZEROSPIN or PF_V16_SUB60S
+    if _want_zs and PF_V13_STRICT_ZEROSPIN:
+        _w13_cands = _zs_cands
+    elif _want_zs:
+        _w13_cands = _zs_cands + _legacy_cands
+    else:
+        _w13_cands = _legacy_cands
+    for p in _w13_cands:
         if p and os.path.isfile(p):
             lib = ctypes.CDLL(p)
             lib.pf_nvfp4_w13_v6_version.argtypes = []
@@ -508,35 +699,71 @@ def _get_pf_nvfp4_w13_v6_lib() -> ctypes.CDLL | None:
             lib.pf_nvfp4_w13_ws5_v4b_fused_situ.restype = c_i
             lib.pf_route_tokens_place_v6.argtypes = [c_vp] * 11 + [c_i, c_f] + [c_i] * 5 + [c_u64]
             lib.pf_route_tokens_place_v6.restype = c_i
+            if hasattr(lib, "pf_nvfp4_w13_v16_version"):
+                lib.pf_nvfp4_w13_v16_version.argtypes = []
+                lib.pf_nvfp4_w13_v16_version.restype = c_i
+            _w13_ver = int(lib.pf_nvfp4_w13_v6_version())
+            if _want_zs and PF_V13_STRICT_ZEROSPIN and _w13_ver < 1300:
+                print(
+                    f"[inkling-pf-moe-native] WARNING: rejecting legacy W13 {p} (ver={_w13_ver} < 1300) "
+                    "because INKLING_PF_V13_ZEROSPIN=1 & INKLING_PF_V13_STRICT_ZEROSPIN=1",
+                    flush=True,
+                )
+                continue
             _NVFP4_W13_V6_LIB = lib
             print(
                 f"[inkling-pf-moe-native] loaded NVFP4 W13+Route v6 {p} "
-                f"(ver={lib.pf_nvfp4_w13_v6_version()}, w13_v6={int(PF_NVFP4_W13_V6)}, "
+                f"(ver={_w13_ver}, w13_v6={int(PF_NVFP4_W13_V6)}, "
                 f"route_v6={int(PF_ROUTE_V6)}, scratch_reuse={int(PF_MOE_SCRATCH_REUSE)})",
                 flush=True,
             )
             return _NVFP4_W13_V6_LIB
+    if PF_V13_ZEROSPIN and PF_V13_STRICT_ZEROSPIN:
+        print(
+            "[inkling-pf-moe-native] WARNING: zero-spin libpf_nvfp4_w13_fused_v13.so not found; "
+            "refusing legacy spinlocking v6 fallback (falling back to safe non-spinlocking path).",
+            flush=True,
+        )
     return None
 
 
 def _get_pf_nvfp4_w2_v5_lib() -> ctypes.CDLL | None:
-    """Lazy loader for DBO-safe `libpf_nvfp4_w2_v5_dbo.so` / `libpf_nvfp4_w2_v5.so` (strictly opt-in)."""
+    """Lazy loader for zero-spin/DBO-safe `libpf_nvfp4_w2_v13.so` / `v5_dbo.so` / `v5.so`."""
     global _NVFP4_W2_V5_LIB, _NVFP4_W2_V5_TRIED
     if not PF_NVFP4_W2_V5:
         return None
     if _NVFP4_W2_V5_LIB is not None:
         return _NVFP4_W2_V5_LIB
-    if _NVFP4_W2_V5_TRIED:
+    if _NVFP4_W2_V5_TRIED or _is_stream_capturing():
         return None
     _NVFP4_W2_V5_TRIED = True
     c_vp, c_i, c_u64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64
-    for p in (
+    _v16_cands = (
+        PF_NVFP4_W2_V16_LIB_PATH,
+        "/rdma/libpf_nvfp4_w2_v16.so",
+        os.path.join(_HERE, "libpf_nvfp4_w2_v16.so"),
+    )
+    _v13_cands = (
+        PF_NVFP4_W2_V13_LIB_PATH,
+        "/rdma/libpf_nvfp4_w2_v13.so",
+        os.path.join(_HERE, "libpf_nvfp4_w2_v13.so"),
+    )
+    _legacy_cands = (
         PF_NVFP4_W2_V5_LIB_PATH,
         "/rdma/libpf_nvfp4_w2_v5_dbo.so",
         "/rdma/libpf_nvfp4_w2_v5.so",
         os.path.join(_HERE, "libpf_nvfp4_w2_v5_dbo.so"),
         os.path.join(_HERE, "libpf_nvfp4_w2_v5.so"),
-    ):
+    )
+    _zs_cands = (_v16_cands + _v13_cands) if PF_V16_SUB60S else _v13_cands
+    _want_zs = PF_V13_ZEROSPIN or PF_V16_SUB60S
+    if _want_zs and PF_V13_STRICT_ZEROSPIN:
+        _w2_cands = _zs_cands
+    elif _want_zs:
+        _w2_cands = _zs_cands + _legacy_cands
+    else:
+        _w2_cands = _legacy_cands
+    for p in _w2_cands:
         if p and os.path.isfile(p):
             lib = ctypes.CDLL(p)
             lib.pf_nvfp4_w2_v5_version.argtypes = []
@@ -549,23 +776,51 @@ def _get_pf_nvfp4_w2_v5_lib() -> ctypes.CDLL | None:
             lib.pf_nvfp4_w2_ws5_v5_combine.restype = c_i
             lib.pf_nvfp4_w2_panel_v5_combine.argtypes = [c_vp] * 12 + [c_i] * 11 + [c_u64]
             lib.pf_nvfp4_w2_panel_v5_combine.restype = c_i
+            if hasattr(lib, "pf_nvfp4_w2_v16_version"):
+                lib.pf_nvfp4_w2_v16_version.argtypes = []
+                lib.pf_nvfp4_w2_v16_version.restype = c_i
+            if hasattr(lib, "pf_nvfp4_w2_set_double_buf_slice_v16"):
+                lib.pf_nvfp4_w2_set_double_buf_slice_v16.argtypes = [c_i]
+                lib.pf_nvfp4_w2_set_double_buf_slice_v16.restype = c_i
+                lib.pf_nvfp4_w2_set_double_buf_slice_v16(1 if PF_V16_DOUBLE_BUF_SLICE else 0)
+            _w2_ver = int(lib.pf_nvfp4_w2_v5_version())
+            if _want_zs and PF_V13_STRICT_ZEROSPIN and _w2_ver < 1300:
+                print(
+                    f"[inkling-pf-moe-native] WARNING: rejecting legacy W2 {p} (ver={_w2_ver} < 1300) "
+                    "because INKLING_PF_V13_ZEROSPIN=1 & INKLING_PF_V13_STRICT_ZEROSPIN=1",
+                    flush=True,
+                )
+                continue
             res_sms = 0
             if hasattr(lib, "pf_nvfp4_w2_v5_set_reserve_sms"):
                 lib.pf_nvfp4_w2_v5_set_reserve_sms.argtypes = [c_i]
                 lib.pf_nvfp4_w2_v5_set_reserve_sms.restype = c_i
                 lib.pf_nvfp4_w2_v5_get_reserve_sms.argtypes = []
                 lib.pf_nvfp4_w2_v5_get_reserve_sms.restype = c_i
-                lib.pf_nvfp4_w2_v5_set_reserve_sms(int(PF_W2_RESERVE_SMS))
+                _eff_w2_res = (
+                    int(PF_W2_RESERVE_SMS)
+                    if (_PF_W2_RESERVE_EXPLICIT or _w2_ver < 1300)
+                    else 0
+                )
+                if _w2_ver < 1300 and _dbo_or_sp_env_enabled() and _eff_w2_res < 8:
+                    _eff_w2_res = 8
+                lib.pf_nvfp4_w2_v5_set_reserve_sms(_eff_w2_res)
                 res_sms = int(lib.pf_nvfp4_w2_v5_get_reserve_sms())
             _NVFP4_W2_V5_LIB = lib
             print(
                 f"[inkling-pf-moe-native] loaded NVFP4 W2 v5 {p} "
-                f"(ver={lib.pf_nvfp4_w2_v5_version()}, reserve_sms={res_sms}, "
+                f"(ver={_w2_ver}, reserve_sms={res_sms}, "
                 f"panels={PF_NVFP4_W2_V5_PANELS}, split_m={PF_NVFP4_W2_V5_SPLIT_M}, "
                 f"zero_mode={_W2_V5_ZM_RAW}, w_evict={PF_NVFP4_W2_V5_W_EVICT})",
                 flush=True,
             )
             return _NVFP4_W2_V5_LIB
+    if PF_V13_ZEROSPIN and PF_V13_STRICT_ZEROSPIN:
+        print(
+            "[inkling-pf-moe-native] WARNING: zero-spin libpf_nvfp4_w2_v13.so not found; "
+            "refusing legacy spinlocking v5 fallback (falling back to safe non-spinlocking path).",
+            flush=True,
+        )
     return None
 
 
@@ -588,7 +843,7 @@ def get_lib(path: str | None = None) -> ctypes.CDLL | None:
         return None
     if _LIB is not None:
         return _LIB
-    if _LIB_TRIED:
+    if _LIB_TRIED or _is_stream_capturing():
         return None
     _LIB_TRIED = True
     for p in _LIB_PATHS:
@@ -761,6 +1016,8 @@ def uses_in_kernel_slice_zero(plan, tokens: int, nvfp4: bool) -> bool:
         return False
     if COMBINE_MODE != 2:
         return False
+    if PF_MOE_MIXED_FP32_COMBINE and _is_mixed_decode_batch():
+        return False
     if nvfp4 and PF_NVFP4_W2_V5 and _get_pf_nvfp4_w2_v5_lib() is not None:
         p5 = select_w2_v5_panels(tokens, 2)
         return select_w2_v5_zero_mode(tokens, 2, p5, out_prezeroed=False) > 0
@@ -812,7 +1069,7 @@ def _get_or_build_w2_v5_plan(
         return 0, num_experts
     ptr = sub.data_ptr()
     try:
-        tiles._inkling_w2_v5_plan = (ptr, max_work, num_experts)  # type: ignore[attr-defined]
+        tiles._inkling_w2_v5_plan = (ptr, max_work, num_experts, buf)  # type: ignore[attr-defined]
     except Exception:
         pass
     return ptr, max_work
@@ -852,13 +1109,15 @@ def _get_pf_moe_scratch_view(
     elems = 1
     for d in shape:
         elems *= int(d)
-    nbytes = max(elems * torch.empty((), dtype=dtype).element_size(), 16)
+    itemsize = _dtype_itemsize(dtype)
+    view_bytes = elems * itemsize
+    nbytes = max(view_bytes, 16)
     key = (device, tag)
     buf = _PF_MOE_SCRATCH_CACHE.get(key)
     if buf is None or buf.numel() < nbytes:
         buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
         _PF_MOE_SCRATCH_CACHE[key] = buf
-    return buf[: elems * torch.empty((), dtype=dtype).element_size()].view(dtype).view(shape)
+    return buf[:view_bytes].view(dtype).view(shape)
 
 
 def get_pf_route_scratch(
@@ -1007,18 +1266,41 @@ def _get_or_build_mx7_v10_plan(
         return 0, num_experts
     ptr = sub.data_ptr()
     try:
-        tiles._inkling_mx7_v10_plan = (ptr, max_work, num_experts)  # type: ignore[attr-defined]
+        tiles._inkling_mx7_v10_plan = (ptr, max_work, num_experts, buf)  # type: ignore[attr-defined]
     except Exception:
         pass
     return ptr, max_work
 
 
 def release_unused_scratch() -> int:
-    """Release cached `_Y_SITU_CACHE` and optional MoE scratch buffers."""
-    freed = sum(int(t.numel() * t.element_size()) for t in _Y_SITU_CACHE.values())
-    _Y_SITU_CACHE.clear()
-    freed += sum(int(t.numel() * t.element_size()) for t in _PF_MOE_SCRATCH_CACHE.values())
-    _PF_MOE_SCRATCH_CACHE.clear()
+    """Release ALL non-graphed prefill MoE scratch caches + drain async zero streams (capture-guarded)."""
+    if _is_stream_capturing():
+        return 0
+    for zs in list(_ZERO_STREAMS.values()):
+        try:
+            zs.synchronize()
+        except Exception:
+            pass
+    freed = 0
+    for cache in (
+        _Y_SITU_CACHE,
+        _PF_MOE_SCRATCH_CACHE,
+        _Y_FP32_CACHE,
+        _R2T_CACHE,
+        _PLAN_CACHE,
+        _WORK_M128_CACHE,
+        _W2_V5_PLAN_CACHE,
+        _W2_V5_SLICE_STATE_CACHE,
+        _MX7_V10_PLAN_CACHE,
+        _MX7_V10_SLICE_STATE_CACHE,
+    ):
+        freed += sum(int(t.numel() * t.element_size()) for t in cache.values())
+        cache.clear()
+    for pair in _V6_Y_SLOT_CACHE.values():
+        for t in pair:
+            freed += int(t.numel() * t.element_size())
+    _V6_Y_SLOT_CACHE.clear()
+    _PF_EVENT_POOL.clear()
     return freed
 
 
@@ -1037,7 +1319,7 @@ def _get_or_build_m128_worklist(
     assert rc == 0, f"pf_nvfp4_build_m128_worklist CUDA error {rc}"
     ptr = buf.data_ptr()
     try:
-        tiles._inkling_m128_work = (ptr, max_m128, num_experts)  # type: ignore[attr-defined]
+        tiles._inkling_m128_work = (ptr, max_m128, num_experts, buf)  # type: ignore[attr-defined]
     except Exception:
         pass
     return ptr, max_m128
@@ -1062,7 +1344,7 @@ def _get_or_build_mx7_plan(
         return 0, num_experts
     ptr = buf.data_ptr()
     try:
-        tiles._inkling_exp_plan = (ptr, max_work, num_experts)  # type: ignore[attr-defined]
+        tiles._inkling_exp_plan = (ptr, max_work, num_experts, buf)  # type: ignore[attr-defined]
     except Exception:
         pass
     return ptr, max_work
@@ -1153,6 +1435,8 @@ def w13_situ_pf_v4(
             plan.max_ctas, plan.tile, num_experts, max_w, bm_mx, int(base_ws),
             use_r2t, as_rm, 1, 12, PF_MX7_V4_W_EVICT, st,
         )
+        if rc in (-2, -3, -4):
+            return None
         assert rc == 0, f"pf_mx7_w13_prefill_fused_situ CUDA error {rc}"
         return values, scales, None
 
@@ -1189,8 +1473,8 @@ def w13_situ_pf_v4(
             )
             if rc_plan == 0:
                 try:
-                    tiles._inkling_m128_work = (work_buf.data_ptr(), max_m128, num_experts)  # type: ignore[attr-defined]
-                    tiles._inkling_w2_v5_plan = (w2_sub.data_ptr(), max_w2_work, num_experts)  # type: ignore[attr-defined]
+                    tiles._inkling_m128_work = (work_buf.data_ptr(), max_m128, num_experts, work_buf)  # type: ignore[attr-defined]
+                    tiles._inkling_w2_v5_plan = (w2_sub.data_ptr(), max_w2_work, num_experts, w2_buf)  # type: ignore[attr-defined]
                 except Exception:
                     pass
                 if PF_MOE_SCRATCH_REUSE:
@@ -1232,6 +1516,8 @@ def w13_situ_pf_v4(
         max_m128, plan.tile, use_r2t, as_rm,
         1 if ws5.get("has_patches", True) else 0, PF_NVFP4_W13_V4B_W_EVICT, st,
     )
+    if rc1 in (-2, -3, -4):
+        return None
     assert rc1 == 0, f"pf_nvfp4_w13_ws5_v4b_fused_situ CUDA error {rc1}"
 
     routed, num_routed, cta_expert = rows_tuple
@@ -1245,6 +1531,8 @@ def w13_situ_pf_v4(
         w2_weight_amax.data_ptr(), w2_weight_denominator.data_ptr(),
         int(routed.numel()), plan.tile, 0, st,
     )
+    if rc2 in (-2, -3, -4):
+        return None
     assert rc2 == 0, f"pf_nvfp4_quant_288 CUDA error {rc2}"
     return values, scales, row_scales
 
@@ -1279,7 +1567,7 @@ def get_or_build_expert_plan(
         return 0, num_experts
     ptr = buf.data_ptr()
     try:
-        tiles._inkling_exp_plan = (ptr, max_work, num_experts)  # type: ignore[attr-defined]
+        tiles._inkling_exp_plan = (ptr, max_work, num_experts, buf)  # type: ignore[attr-defined]
     except Exception:
         pass
     return ptr, max_work
@@ -1330,12 +1618,12 @@ def alloc_and_async_zero_out(
     cs = compute_stream if compute_stream is not None else torch.cuda.current_stream(device)
     zs = _get_zero_stream(device)
     out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=device)
-    ev_alloc = torch.cuda.Event()
+    ev_alloc = _acquire_pf_event(device, min_ring_before_reuse=1)
     ev_alloc.record(cs)
     zs.wait_event(ev_alloc)
     out.record_stream(zs)
     zero_bf16_out(out, lib=lib, stream=zs)
-    ev_done = torch.cuda.Event()
+    ev_done = _acquire_pf_event(device, min_ring_before_reuse=8)
     ev_done.record(zs)
     return out, ev_done
 
@@ -1400,6 +1688,12 @@ def bmm_pf_native(
     """
     lib = lib or get_lib()
     if lib is None or plan.tile < 64 or plan.tile % 64 != 0:
+        return None
+    if int(plan.rows) <= 0 or int(plan.max_ctas) <= 0 or int(act.shape[0]) <= 0:
+        return None
+    # When called via trtllm_bmm.bmm with row2tok, act.shape[0] == exact token count:
+    # enforce MIN_TOKENS strictly even when plan.tile == 128 (T in 769..1023).
+    if row2tok is not None and int(act.shape[0]) < MIN_TOKENS:
         return None
 
     nvfp4 = weight.dtype == torch.uint8
@@ -1795,8 +2089,18 @@ def w2_combine_pf_native(
         return None
     if plan.tile < 64 or plan.tile % 64 != 0:
         return None
+    if int(plan.rows) <= 0 or int(plan.max_ctas) <= 0 or int(act.shape[0]) <= 0:
+        return None
+    if int(topk) <= 0 or src2dst.numel() <= 0 or (src2dst.numel() % int(topk)) != 0:
+        return None
+    # Wave-V15 mixed prefill+decode precision guard: promote BF16x2 atomic combine (cm=2) to
+    # FP32 atomic combine (cm=1) when active decode requests share the chunked prefill batch.
+    if combine_mode is None and cm == 2 and PF_MOE_MIXED_FP32_COMBINE and _is_mixed_decode_batch():
+        cm = 1
 
     nvfp4 = weight.dtype == torch.uint8
+    if nvfp4 and row_scale is None:
+        return None
     pack = 2 if nvfp4 else 1
     num_experts = int(weight.shape[0])
     n = weight.shape[1]
@@ -1807,6 +2111,8 @@ def w2_combine_pf_native(
     use_persist = PERSISTENT if persistent is None else persistent
     use_l2_zero = L2_ZERO_SLICE if l2_zero_slice is None else l2_zero_slice
     tokens = src2dst.numel() // topk
+    if tokens <= 0:
+        return None
     bm_sel = select_bm(plan, bm)
     w_evict = W_EVICT_MODE if w_evict_mode is None else w_evict_mode
     w_evict_v4 = select_v4_w_evict(w_evict_mode)
@@ -2084,10 +2390,19 @@ def w2_combine_pf_native(
                 finally:
                     if _mx6_tmp is not None:
                         del _mx6_tmp, w_eff, ws_eff
-    assert rc == 0, f"w2_combine_pf_native CUDA error {rc} (nvfp4={nvfp4}, cm={cm})"
+    if rc != 0:
+        if cm == 1:
+            _Y_FP32_CACHE.pop(device, None)
+        assert rc == 0, f"w2_combine_pf_native CUDA error {rc} (nvfp4={nvfp4}, cm={cm})"
 
     if cm == 1:
-        rc2 = lib.pf_fp32_to_bf16_zero(y_accum.data_ptr(), out.data_ptr(), tokens * n, st)
-        assert rc2 == 0, f"pf_fp32_to_bf16_zero CUDA error {rc2}"
+        try:
+            rc2 = lib.pf_fp32_to_bf16_zero(y_accum.data_ptr(), out.data_ptr(), tokens * n, st)
+            if rc2 != 0:
+                _Y_FP32_CACHE.pop(device, None)
+            assert rc2 == 0, f"pf_fp32_to_bf16_zero CUDA error {rc2}"
+        except Exception:
+            _Y_FP32_CACHE.pop(device, None)
+            raise
 
     return out

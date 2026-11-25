@@ -52,6 +52,7 @@ _SHAPES = {
 }
 
 _LIB = None
+_LIB_TRIED = False
 _LIB_LOCK = threading.Lock()
 _CACHE: dict[tuple[int, int, int], "PackedBF10Torch"] = {}
 _PART_BUFS: dict[int, list] = {}
@@ -504,23 +505,29 @@ class PackedBF10Torch:
 
 
 def _load_lib():
-    global _LIB
-    if _LIB is not None:
+    global _LIB, _LIB_TRIED
+    if _LIB_TRIED:
         return _LIB
     with _LIB_LOCK:
-        if _LIB is None and os.path.exists(_LIB_PATH):
-            lib = ctypes.CDLL(_LIB_PATH)
-            lib.bf10_smem2sym_fwd.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                ctypes.c_uint64,
-            ]
-            lib.bf10_smem2sym_fwd.restype = ctypes.c_int
-            _LIB = lib
+        if not _LIB_TRIED:
+            _LIB_TRIED = True
+            if os.path.exists(_LIB_PATH):
+                try:
+                    lib = ctypes.CDLL(_LIB_PATH)
+                    lib.bf10_smem2sym_fwd.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_uint64,
+                    ]
+                    lib.bf10_smem2sym_fwd.restype = ctypes.c_int
+                    _LIB = lib
+                except Exception as e:
+                    print(f"[inkling-bf10] failed to load {_LIB_PATH}: {e!r}", flush=True)
+                    _LIB = None
     return _LIB
 
 
@@ -545,21 +552,37 @@ def _ensure_scratch(device, min_part_elems: int, min_sem_tiles: int) -> None:
 
 def _next_scratch(device, min_part_elems: int, min_sem_tiles: int):
     dev_idx = device.index if device.index is not None else 0
-    _ensure_scratch(device, min_part_elems, min_sem_tiles)
-    idx = _SCRATCH_IDX[dev_idx]
+    parts = _PART_BUFS.get(dev_idx)
+    sems = _SEM_BUFS.get(dev_idx)
+    if parts is None or parts[0].numel() < min_part_elems or sems is None or sems[0].numel() < min_sem_tiles:
+        if torch.cuda.is_current_stream_capturing():
+            part = torch.empty(min_part_elems, dtype=torch.float32, device=device)
+            if sems is not None and sems[0].numel() >= min_sem_tiles:
+                idx = _SCRATCH_IDX.get(dev_idx, 0)
+                _SCRATCH_IDX[dev_idx] = idx ^ 1
+                return part, sems[idx]
+            return part, torch.zeros(max(_MIN_SEM_TILES, min_sem_tiles), dtype=torch.int32, device=device)
+        _ensure_scratch(device, min_part_elems, min_sem_tiles)
+        parts = _PART_BUFS[dev_idx]
+        sems = _SEM_BUFS[dev_idx]
+    idx = _SCRATCH_IDX.get(dev_idx, 0)
     _SCRATCH_IDX[dev_idx] = idx ^ 1
-    return _PART_BUFS[dev_idx][idx], _SEM_BUFS[dev_idx][idx]
+    return parts[idx], sems[idx]
 
 
 def prepack(w, cfg_id: int | None = None, split: int | None = None, n_active: int | None = None):
     """Prepack a CUDA bf16 [N, K] tensor into GPU BF10_SMEM2SYM buffers (offline before graph capture)."""
     assert torch is not None
+    if w is None or w.dim() != 2 or w.dtype != torch.bfloat16 or not w.is_cuda:
+        return None
     N, K = int(w.shape[0]), int(w.shape[1])
     if cfg_id is None or split is None:
         cfg_id, split = _SHAPES.get((N, K), (1, 6 if K >= 4096 else 1))
     key = (int(w.data_ptr()), N, K)
     if key in _CACHE:
         return _CACHE[key]
+    if w.untyped_storage().size() == 0 or torch.cuda.is_current_stream_capturing():
+        return None
     w_u16 = w.detach().contiguous().view(torch.uint16).cpu().numpy()
     try:
         pk = pack_bf10_smem2sym_np(w_u16, cfg_id=cfg_id, split=split, n_active=n_active)
@@ -601,14 +624,30 @@ def l2pf_tensor(w):
 def bf10_linear(x, w, out=None, pdl: bool = False, trig: bool = False, n_live_buf=None):
     """Execute 0-ULP BF10_SMEM2SYM skinny GEMM (`M <= 16`). Returns None if unavailable."""
     lib = _load_lib()
-    if lib is None or torch is None:
+    if (
+        lib is None
+        or torch is None
+        or not x.is_cuda
+        or x.dim() != 2
+        or x.dtype != torch.bfloat16
+        or x.stride(1) != 1
+        or w.dim() != 2
+    ):
         return None
     M, K = int(x.shape[0]), int(x.shape[1])
     N = int(w.shape[0])
-    if M <= 0 or M > 16:
+    if M <= 0 or M > 16 or int(w.shape[1]) != K:
         return None
     hit = _CACHE.get((int(w.data_ptr()), N, K))
     if hit is None:
+        return None
+    if out is not None and (
+        not out.is_cuda
+        or out.dim() != 2
+        or out.shape != (M, N)
+        or out.dtype != x.dtype
+        or out.stride(1) != 1
+    ):
         return None
     if out is None:
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)

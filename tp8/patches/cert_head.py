@@ -91,6 +91,69 @@ LOG_EVERY = int(os.environ.get("INKLING_CERT_HEAD_LOG_EVERY", "4000") or 0)
 LISTCAP = int(os.environ.get("INKLING_CERT_HEAD_LISTCAP", "6000") or 0)
 PERIOD = LOG_EVERY if LOG_EVERY > 0 else 4000  # window of the list-length cap (and of the log)
 DRAFT_MXINT8 = os.environ.get("INKLING_DRAFT_HEAD", "").strip().lower() in ("mxint8", "int8", "1", "on", "true")
+# Wave-V16 opt-in temp > 0 & n=4 shared-prefix direct logit fast handoff (default OFF = 0, 100% 0-ULP safe).
+TEMP_DIRECT_V16 = os.environ.get("INKLING_CERT_HEAD_TEMP_DIRECT_V16", "0").strip().lower() not in _OFF
+_TEMP_DIRECT_ACTIVE = False
+_TEMP_DIRECT_SHARED_PREFIX_N = 1
+_TEMP_DIRECT_STATS: dict[str, int] = {
+    "bypass_steps": 0,
+    "shared_prefix_steps": 0,
+    "last_shared_prefix_n": 1,
+}
+
+
+def set_temp_direct_step(active: bool, shared_prefix_n: int = 1) -> None:
+    """Mark current decode step as temp > 0 so CertHead skips screening & hands off cleanly (0 host syncs)."""
+    global _TEMP_DIRECT_ACTIVE, _TEMP_DIRECT_SHARED_PREFIX_N
+    _TEMP_DIRECT_ACTIVE = bool(active)
+    sp_n = max(1, int(shared_prefix_n))
+    _TEMP_DIRECT_SHARED_PREFIX_N = sp_n
+    if active and TEMP_DIRECT_V16:
+        _TEMP_DIRECT_STATS["bypass_steps"] += 1
+        _TEMP_DIRECT_STATS["last_shared_prefix_n"] = sp_n
+        if sp_n > 1:
+            _TEMP_DIRECT_STATS["shared_prefix_steps"] += 1
+
+
+def is_temp_direct_active() -> bool:
+    return bool(TEMP_DIRECT_V16 and _TEMP_DIRECT_ACTIVE)
+
+
+def get_temp_direct_stats() -> dict[str, int]:
+    return dict(_TEMP_DIRECT_STATS)
+
+
+def direct_head_logits(
+    lp,
+    head,
+    hidden_states: torch.Tensor,
+    shared_prefix_groups: tuple[int, ...] | list[int] | None = None,
+) -> torch.Tensor:
+    """Zero-sync direct BF16/FP32 head handoff for temp > 0 steps (optional n=4 shared-prefix row dedup)."""
+    if (
+        TEMP_DIRECT_V16
+        and shared_prefix_groups is not None
+        and isinstance(hidden_states, torch.Tensor)
+        and hidden_states.dim() == 2
+        and len(shared_prefix_groups) == int(hidden_states.shape[0])
+        and len(shared_prefix_groups) > 1
+    ):
+        first_idx: dict[int, int] = {}
+        uniq_rows: list[int] = []
+        gather_idx: list[int] = []
+        for row_i, g_id in enumerate(shared_prefix_groups):
+            u_pos = first_idx.get(g_id)
+            if u_pos is None:
+                u_pos = len(uniq_rows)
+                first_idx[g_id] = u_pos
+                uniq_rows.append(row_i)
+            gather_idx.append(u_pos)
+        if 0 < len(uniq_rows) < len(shared_prefix_groups):
+            idx_u = torch.tensor(uniq_rows, dtype=torch.int64, device=hidden_states.device)
+            idx_g = torch.tensor(gather_idx, dtype=torch.int64, device=hidden_states.device)
+            uniq_logits = lp._apply_head(head, hidden_states.index_select(0, idx_u), None)
+            return uniq_logits.index_select(0, idx_g)
+    return lp._apply_head(head, hidden_states, None)
 
 GROUP = 128
 BV = 16  # refine rows per tile (tl.dot M dimension)
@@ -711,12 +774,31 @@ class CertState:
 
 
 _NLIVE_FULL: dict = {}
+_RAR_MOD_CACHE = None
+_RAR_IMPORT_FAILED = False
+
+
+def _get_rar_mod():
+    global _RAR_MOD_CACHE, _RAR_IMPORT_FAILED
+    if _RAR_MOD_CACHE is not None:
+        return _RAR_MOD_CACHE
+    if _RAR_IMPORT_FAILED:
+        return None
+    try:
+        from vllm.distributed.device_communicators import rdma_all_reduce as ra
+        _RAR_MOD_CACHE = ra
+        return ra
+    except Exception:
+        _RAR_IMPORT_FAILED = True
+        return None
 
 
 def _nlive_for(M: int, dev, num_tokens: int = 0) -> torch.Tensor:
     """Device int32 [1] live-row count: ROWAR buf when M matches the armed target forward, else M."""
     try:
-        from vllm.distributed.device_communicators import rdma_all_reduce as ra
+        ra = _get_rar_mod()
+        if ra is None:
+            raise ImportError("rdma_all_reduce unavailable")
         # Safe under BOTH FULL CUDA graph replay and eager: whenever the pure-decode forward that
         # just ran had num_tokens == M == _ROW_FULL (and rowar_begin has armed at least once),
         # _n_live_kernel ran on this exact step and updated ROWAR["buf"] even if an earlier prefill
@@ -749,9 +831,11 @@ def _nlive_for(M: int, dev, num_tokens: int = 0) -> torch.Tensor:
 
 def certified_local(
     cs: CertState, x: torch.Tensor, debug: dict | None = None, num_tokens: int = 0
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     """x [M, K] bf16 -> fp32 [M, V]: the exact stock fp32 head logits on every listed row, NaN elsewhere (the local
-    argmax reads NaN as -inf). No host sync; M <= 128."""
+    argmax reads NaN as -inf). No host sync; M <= 128. Returns None on temp > 0 direct-bypass steps."""
+    if TEMP_DIRECT_V16 and _TEMP_DIRECT_ACTIVE:
+        return None
     k = _kernels()
     triton = k["triton"]
     t = cs.t
@@ -823,6 +907,8 @@ def tick(cs: CertState, rank: int = 0) -> None:
     """Call once per certified call. Every PERIOD calls: ONE host read of the listed-row counters; log them (when
     LOG_EVERY) and trip the list-length cap (mean listed rows per call over the window > LISTCAP -> this rank
     serves the stock head from now on; the exchanged records are identical either way)."""
+    if TEMP_DIRECT_V16 and _TEMP_DIRECT_ACTIVE:
+        return
     cs.calls += 1
     if cs.calls % PERIOD:
         return

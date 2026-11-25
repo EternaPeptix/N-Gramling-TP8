@@ -24,8 +24,17 @@ import torch
 from vllm.triton_utils import tl, triton
 
 _LIB = None
+_NVFP4_WS5_V16 = os.environ.get("INKLING_NVFP4_C48_V16", "0").strip().lower() not in ("0", "", "off", "false", "no")
 _LIB_PATHS = (
     os.environ.get("INKLING_NVFP4_WS5_LIB", ""),
+    *(
+        (
+            "/rdma/libnvfp4_ws5_c48_v16.so",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "libnvfp4_ws5_c48_v16.so"),
+        )
+        if _NVFP4_WS5_V16
+        else ()
+    ),
     "/rdma/libnvfp4_ws5_exact.so",
     "/tmp/swarm_nvfp4/libnvfp4_ws5_exact.so",
 )
@@ -391,6 +400,7 @@ def _nvfp4_ws5_prefill_w13_kernel(
     HAS_PATCHES: tl.constexpr,
     USE_R2T: tl.constexpr = False,
     AS_ROW_MAJOR: tl.constexpr = False,
+    AS_STRIDE: tl.constexpr = 288,
 ):
     """Fast 0-ULP prefill/high-concurrency W13 kernel (N=576, K=4608, PB=32) reading WS5 SLABS.
     Eliminates dead CTAs, uses L2-friendly CTA ordering (pid0 = nb*SUB_M+sub, pid1 = t),
@@ -422,7 +432,7 @@ def _nvfp4_ws5_prefill_w13_kernel(
     else:
         a_idx = rows.to(tl.int64)
     a_rows = A + a_idx[:, None] * KP
-    as_rows = AS + a_idx[:, None] * KG
+    as_rows = AS + a_idx[:, None] * AS_STRIDE
 
     panel_base = SLABS + (e * 18 + nb) * (9 * 8832)
     base_e = tl.load(WS_BASE + e).to(tl.int32)
@@ -625,6 +635,7 @@ def _nvfp4_ws5_prefill_w2_kernel(
     BM: tl.constexpr,
     HAS_PATCHES: tl.constexpr,
     AS_ROW_MAJOR: tl.constexpr = False,
+    AS_STRIDE: tl.constexpr = 18,
 ):
     """Fast 0-ULP prefill/high-concurrency W2 kernel (N=4608, K=288, PB=128) reading WS5 W_PACK+WS5_PACK.
     Eliminates dead CTAs, uses L2-friendly CTA ordering (pid0 = nb*SUB_M+sub, pid1 = t),
@@ -652,7 +663,7 @@ def _nvfp4_ws5_prefill_w2_kernel(
     KG: tl.constexpr = 18
 
     a_rows = A + rows.to(tl.int64)[:, None] * KP
-    as_rows = AS + rows.to(tl.int64)[:, None] * KG
+    as_rows = AS + rows.to(tl.int64)[:, None] * AS_STRIDE
 
     puid = e * 36 + nb
     w_panel = W_PACK + puid * 18432
@@ -742,11 +753,25 @@ def bmm_nvfp4_ws5(
     lib = _get_lib()
     if lib is None or weight.dtype != torch.uint8:
         return None
+    if (
+        not act.is_cuda
+        or not act.is_contiguous()
+        or not act_scale.is_contiguous()
+        or not row_scale.is_contiguous()
+        or not tiles.is_contiguous()
+        or not ones.is_contiguous()
+        or (row2tok is not None and not row2tok.is_contiguous())
+    ):
+        return None
     n = weight.shape[1]
     k = weight.shape[2] * 2
     if not ((projection == 0 and n == 576 and k == 4608) or (projection == 1 and n == 4608 and k == 288)):
         return None
     if plan.tile <= 16 and (row2tok is not None or as_row_major):
+        return None
+    if plan.rows == 0 or plan.max_ctas == 0:
+        return torch.empty((0, n), dtype=torch.bfloat16, device=act.device)
+    if plan.tile <= 16 and act.shape[0] < plan.rows:
         return None
 
     meta = pack_w13_ws5_inplace(weight, weight_scale) if projection == 0 else pack_w2_ws5_inplace(weight, weight_scale)
@@ -794,12 +819,14 @@ def bmm_nvfp4_ws5(
         bm = min(bm, plan.tile)
         sub_m = plan.tile // bm
         grid = (18 * sub_m, plan.max_ctas)
+        as_stride_w13 = int(act_scale.stride(0)) if ((use_r2t or as_row_major) and act_scale.ndim >= 2) else 288
         _nvfp4_ws5_prefill_w13_kernel[grid](
             act.view(torch.uint8), act_scale.view(torch.uint8), row_scale, r2t_arg,
             meta["slabs"], meta["ws_base"], meta["p_off"], meta["patches"],
             ones, tiles, out,
             MAX_CTAS=plan.max_ctas, TILE=plan.tile, BM=bm, BK_DOT=bk_dot,
             HAS_PATCHES=has_patches, USE_R2T=use_r2t, AS_ROW_MAJOR=as_row_major,
+            AS_STRIDE=as_stride_w13,
             num_warps=warps, num_stages=stages,
         )
         return out
@@ -816,6 +843,7 @@ def bmm_nvfp4_ws5(
     bm = min(bm, plan.tile)
     sub_m = plan.tile // bm
     grid = (36 * sub_m, plan.max_ctas)
+    as_stride_w2 = int(act_scale.stride(0)) if (as_row_major and act_scale.ndim >= 2) else 18
     _nvfp4_ws5_prefill_w2_kernel[grid](
         act.view(torch.uint8), act_scale.view(torch.uint8), row_scale,
         meta["w_pack"], meta["ws5_pack"].view(torch.uint8),
@@ -823,6 +851,7 @@ def bmm_nvfp4_ws5(
         ones, tiles, out,
         MAX_CTAS=plan.max_ctas, TILE=plan.tile, BM=bm,
         HAS_PATCHES=has_patches, AS_ROW_MAJOR=as_row_major,
+        AS_STRIDE=as_stride_w2,
         num_warps=warps, num_stages=stages,
     )
     return out

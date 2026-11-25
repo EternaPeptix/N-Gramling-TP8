@@ -52,7 +52,11 @@ def plan_attention(
     """
     if is_local:
         return 1, True
+    if query_lens.size == 0 or seq_lens.size == 0:
+        return 1, True
     num_tokens = int(query_lens.sum())
+    if num_tokens <= 0:
+        return 1, True
     if num_tokens * num_kv_heads < 512:
         return max(1, min(128, 8192 // num_tokens)), True
     num_sms = num_compute_units()
@@ -109,7 +113,9 @@ def _unshear_rel_logits(
     """
     device = sheared.device
     num_heads = sheared.shape[1]
-    q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.long)
+    if num_tokens <= 0 or cu_seqlens_q.shape[0] <= 1:
+        return sheared.new_empty((0, num_heads, rel_extent)).contiguous()
+    q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.long).clamp(min=0)
     past = cache_seqlens.to(torch.long) - q_lens
     req = torch.repeat_interleave(
         torch.arange(q_lens.shape[0], device=device), q_lens, output_size=num_tokens
@@ -469,6 +475,8 @@ def gate_sink(
         if consume_pending(output, gate, lse, sinks, result):
             return
     num_tokens, num_heads = sinks.shape
+    if num_tokens <= 0:
+        return
     assert lse.shape == (num_tokens, num_heads)
     assert output.shape[1] == num_heads and output.is_contiguous()
     assert gate.stride(1) == sinks.stride(1) == 1
@@ -515,6 +523,8 @@ def compute_log_scaling_tau(
     """Return fp32 ``1 + alpha * log(max((positions + 1) / n_floor, 1))``."""
     output = torch.empty(positions.shape, device=positions.device, dtype=torch.float32)
     n = positions.numel()
+    if n <= 0:
+        return output
     _log_scaling_tau_kernel[(triton.cdiv(n, 256),)](
         positions, output, n, n_floor, alpha, 256, enable_fp_fusion=False
     )
@@ -548,6 +558,8 @@ def plan_decode_attention(
     but never less than one CTA per SM. The count depends only on the batch,
     not the KV lengths, so it holds for every replay of a CUDA graph.
     """
+    if num_reqs <= 0 or num_kv_heads <= 0 or max_query_len <= 0:
+        return 0
     if max_query_len > _VERIFY_BLOCK_M // (num_heads // num_kv_heads):
         return 0
     _cap = current_platform.get_device_capability()
@@ -645,7 +657,11 @@ def _rel_decode_combine_kernel(
     # Requests without keys (padding) come out zero.
     o = tl.sum(o_s * (w / tl.where(w_sum == 0.0, 1.0, w_sum))[:, None], 0)
     if GATED:
-        lse = (_lg2(w_sum) + lse_max) * 0.6931471805599453
+        lse = tl.where(
+            w_sum > 0.0,
+            (_lg2(w_sum) + lse_max) * 0.6931471805599453,
+            float("-inf"),
+        )
         o = o * _sigmoid(gate)
         o = o * _sigmoid(lse - sink)
     tl.store(y_ptrs, o)
@@ -1068,8 +1084,8 @@ def _rel_verify_kernel(
     kv_head = gl.program_id(1)
     req = gl.program_id(2)
     q_start = gl.load(CuSeqlensQ + req)
-    q_len = gl.load(CuSeqlensQ + req + 1) - q_start
-    seqlen_k = gl.load(SeqLens + req)
+    q_len = gl.maximum(gl.load(CuSeqlensQ + req + 1) - q_start, 0)
+    seqlen_k = gl.maximum(gl.load(SeqLens + req), 0)
     past = seqlen_k - q_len
     # The first query's position, and the first block with relative logits.
     if DRAFT:

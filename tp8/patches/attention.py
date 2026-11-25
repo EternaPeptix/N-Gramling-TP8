@@ -139,6 +139,26 @@ _KV_BF12 = os.environ.get("INKLING_KV_BF12", "0").strip().lower() in (
 _KV_BF12_GLOBAL_ONLY = os.environ.get("INKLING_KV_BF12_GLOBAL_ONLY", "0").strip().lower() in (
     "1", "on", "true", "yes"
 )
+# Wave-V15 Decode Edge Guard (opt-in, default OFF):
+#   - Pure GPU-side (0 host syncs, CUDA-graph safe) out-of-bounds KV slot_mapping
+#     sanitization (>= num_kv_slots -> -1) and eager overflow (> max_bt_cols * BS)
+#     rerouting to max_bt_cols-clamped Triton `_attn_kernel` at 1M+K=7 boundaries.
+_DECODE_EDGE_GUARD_V15 = os.environ.get(
+    "INKLING_DECODE_EDGE_GUARD_V15", "0"
+).strip().lower() in ("1", "on", "true", "yes")
+
+
+def _sanitize_slot_mapping_v15(
+    slot_mapping: torch.Tensor, num_slots: int
+) -> torch.Tensor:
+    """Mask any out-of-range KV slot (>= num_slots) to PAD_SLOT_ID (-1) on device."""
+    if not _DECODE_EDGE_GUARD_V15 or num_slots <= 0:
+        return slot_mapping
+    return torch.where(
+        (slot_mapping >= 0) & (slot_mapping < num_slots),
+        slot_mapping,
+        torch.full_like(slot_mapping, -1),
+    )
 _FUSED_ATTN_V11 = (
     os.environ.get("INKLING_FUSED_ATTN_V11_S48", "0").strip().lower() in ("1", "on", "true", "yes")
     or os.environ.get("INKLING_FUSED_ATTN_V11_C1632_GLOBAL", "0").strip().lower() in ("1", "on", "true", "yes")
@@ -710,21 +730,41 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             _sm12_f.register_kv_bf12_emerg(self.kv_cache, self._kv_bf12_emerg)
         return self._kv_bf12_emerg
 
+    _PF_KV_BF12_LOCAL_DIRECT = os.environ.get(
+        "INKLING_PF_KV_BF12_LOCAL_DIRECT", "0"
+    ).strip().lower() in ("1", "true", "on", "yes")
+
     def _kv_bf12_prologue_and_store(
         self,
         q, r_view, k, v, tau, k_dynamic, v_dynamic,
         positions, conv_md, md, clipped_q, rel_out,
-        *, skip_rel: bool = False, include_rel_t: bool = False,
-    ) -> None:
+        *,
+        skip_rel: bool = False,
+        include_rel_t: bool = False,
+        tmp_k_out: torch.Tensor | None = None,
+        tmp_v_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Run unmodified `attention_prologue` into a compact BF16 staging buffer
         and encode bit-exact KV-BF12 into `self.kv_cache` via `kv_bf12_store_prefill`."""
         from .ops import sm12_attn_fused as _sm12_f
         T = int(md.slot_mapping.shape[0])
+        if T <= 0:
+            return (tmp_k_out, tmp_v_out) if (tmp_k_out is not None or tmp_v_out is not None) else None
+        kv_slots = int(self.kv_cache.shape[0]) * 256 if self.kv_cache.ndim >= 1 else 0
+        slot_map = _sanitize_slot_mapping_v15(md.slot_mapping, kv_slots)
         n_tmp_blks = max(1, (T + 255) // 256)
-        tmp_k = q.new_empty((n_tmp_blks, 256, self.num_kv_heads, self.head_dim))
-        tmp_v = q.new_empty((n_tmp_blks, 256, self.num_kv_heads, self.head_dim))
-        lin_slots = torch.arange(T, device=md.slot_mapping.device, dtype=torch.int64)
-        tmp_slot_mapping = torch.where(md.slot_mapping >= 0, lin_slots, md.slot_mapping)
+        tmp_k = (
+            tmp_k_out
+            if tmp_k_out is not None
+            else q.new_empty((n_tmp_blks, 256, self.num_kv_heads, self.head_dim))
+        )
+        tmp_v = (
+            tmp_v_out
+            if tmp_v_out is not None
+            else q.new_empty((n_tmp_blks, 256, self.num_kv_heads, self.head_dim))
+        )
+        lin_slots = torch.arange(T, device=slot_map.device, dtype=torch.int64)
+        tmp_slot_mapping = torch.where(slot_map >= 0, lin_slots, slot_map)
         kw = {
             "clip_threshold": self.qk_clip,
             "rel_threshold": self.rel_clip,
@@ -767,11 +807,14 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         _sm12_f.kv_bf12_store_prefill(
             tmp_k.view(-1, self.num_kv_heads, self.head_dim)[:T],
             tmp_v.view(-1, self.num_kv_heads, self.head_dim)[:T],
-            md.slot_mapping,
+            slot_map,
             self.kv_cache,
             self._get_kv_bf12_emerg(),
             discard_blk_dev=_discard_dev,
         )
+        if tmp_k_out is not None or tmp_v_out is not None:
+            return tmp_k, tmp_v
+        return None
 
     def _split_kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
         key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
@@ -823,6 +866,22 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             tau,
             output,
         )
+        if (
+            out is None
+            and getattr(self.wo_ud, "punica_wrapper", None) is None
+            and not hasattr(self.wo_ud, "lora_a_stacked")
+        ):
+            from . import prefill_sp_rs as _sp_rs
+
+            _fused_ctx = _sp_rs.get_fused_wo_ud_a2a_scope()
+            if _fused_ctx is not None:
+                from .ops.linear import pf_wo_ud_fused_a2a_int8_linear
+
+                _pq = pf_wo_ud_fused_a2a_int8_linear(
+                    output, self.wo_ud.weight, _fused_ctx[0], _fused_ctx[1]
+                )
+                if _pq is not None:
+                    return _pq
         out = linear(output, self.wo_ud.weight, out)
         add_linear_lora(self.wo_ud, out, output)
         return out
@@ -850,6 +909,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         same token count.
         """
         num_tokens = q.shape[0]
+        if num_tokens <= 0:
+            return
         q = q.view(num_tokens, self.num_heads, self.head_dim)
         attn_metadata = get_forward_context().attn_metadata
         md = None
@@ -887,20 +948,88 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             r_view = r.view(num_tokens, self.num_heads, self.d_rel)
             if self._is_kv_bf12():
                 from .ops import sm12_attn_fused as _sm12_f
-                self._kv_bf12_prologue_and_store(
-                    q, r_view, k, v, tau, k_dynamic, v_dynamic,
-                    positions, conv_md, md, clipped_q, None, skip_rel=True,
+
+                _sl_cpu = getattr(md, "seq_lens_cpu", None)
+                _ql_cpu = getattr(md, "query_lens_cpu", None)
+                _use_local_direct = (
+                    self._PF_KV_BF12_LOCAL_DIRECT
+                    and md.num_prefill_reqs == 1
+                    and md.num_decode_reqs == 0
+                    and _sl_cpu is not None
+                    and _ql_cpu is not None
+                    and len(_sl_cpu) >= 1
+                    and len(_ql_cpu) >= 1
                 )
-                key_cache, value_cache, _bt_swa = _sm12_f.kv_bf12_stage_active_blocks(
-                    self.kv_cache, self._get_kv_bf12_emerg(),
-                    md.block_table, md.seq_lens, cu_seqlens_q=md.query_start_loc,
-                    window=self.window_size[0], unpack_k=True, unpack_v=True,
-                    seq_lens_cpu=getattr(md, "seq_lens_cpu", None),
-                    query_lens_cpu=getattr(md, "query_lens_cpu", None),
-                )
+                if _use_local_direct:
+                    _sl0 = int(_sl_cpu[0])
+                    _ql0 = int(_ql_cpu[0])
+                    _past = _sl0 - _ql0
+                    _max_bt_cols = int(md.block_table.shape[1])
+                    _use_local_direct = (
+                        (_past >= 0)
+                        and ((_past & 255) == 0)
+                        and (_ql0 > 0)
+                        and ((_past // 256) <= _max_bt_cols)
+                    )
+                if _use_local_direct:
+                    _past_end_blk = min(_max_bt_cols, _past // 256)
+                    _k_beg = max(0, _past - int(self.window_size[0]))
+                    _past_beg_blk = min(_max_bt_cols, _k_beg // 256)
+                    _n_past_blks = max(0, _past_end_blk - _past_beg_blk)
+                    _t_slots = int(md.slot_mapping.shape[0])
+                    _n_cur_blks = max(1, (_t_slots + 255) // 256)
+                    key_cache = q.new_empty(
+                        (_n_past_blks + _n_cur_blks, 256, self.num_kv_heads, self.head_dim)
+                    )
+                    value_cache = q.new_empty(
+                        (_n_past_blks + _n_cur_blks, 256, self.num_kv_heads, self.head_dim)
+                    )
+                    self._kv_bf12_prologue_and_store(
+                        q, r_view, k, v, tau, k_dynamic, v_dynamic,
+                        positions, conv_md, md, clipped_q, None,
+                        skip_rel=True,
+                        tmp_k_out=key_cache[_n_past_blks:],
+                        tmp_v_out=value_cache[_n_past_blks:],
+                    )
+                    if _n_past_blks > 0:
+                        _pk, _pv = _sm12_f.kv_bf12_unpack_bt_range(
+                            self.kv_cache,
+                            self._get_kv_bf12_emerg(),
+                            md.block_table[:1],
+                            num_reqs=1,
+                            max_bt_cols=_max_bt_cols,
+                            b_beg=_past_beg_blk,
+                            n_blks_per_req=_n_past_blks,
+                            unpack_k=True,
+                            unpack_v=True,
+                        )
+                        key_cache[:_n_past_blks].copy_(_pk)
+                        value_cache[:_n_past_blks].copy_(_pv)
+                    _tot_blks = _past_end_blk + _n_cur_blks
+                    if _past_beg_blk == 0:
+                        _bt_swa = _sm12_f._get_kv_bf12_arange_bt(q.device, _tot_blks)
+                    else:
+                        _bt_swa = torch.zeros((1, _tot_blks), dtype=torch.int32, device=q.device)
+                        _bt_swa[0, _past_beg_blk:_tot_blks] = _sm12_f._get_kv_bf12_arange_bt(
+                            q.device, _n_past_blks + _n_cur_blks
+                        )[0]
+                else:
+                    self._kv_bf12_prologue_and_store(
+                        q, r_view, k, v, tau, k_dynamic, v_dynamic,
+                        positions, conv_md, md, clipped_q, None, skip_rel=True,
+                    )
+                    key_cache, value_cache, _bt_swa = _sm12_f.kv_bf12_stage_active_blocks(
+                        self.kv_cache, self._get_kv_bf12_emerg(),
+                        md.block_table, md.seq_lens, cu_seqlens_q=md.query_start_loc,
+                        window=self.window_size[0], unpack_k=True, unpack_v=True,
+                        seq_lens_cpu=_sl_cpu,
+                        query_lens_cpu=_ql_cpu,
+                    )
             else:
                 key_cache, value_cache = self._split_kv_cache()
                 _bt_swa = md.block_table
+                _kv_slots_swa = int(key_cache.shape[0]) * int(key_cache.shape[1])
+                _slot_map_swa = _sanitize_slot_mapping_v15(md.slot_mapping, _kv_slots_swa)
                 attention_prologue(
                     q,
                     r_view,
@@ -922,7 +1051,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                     conv_md.query_start,
                     key_cache,
                     value_cache,
-                    md.slot_mapping,
+                    _slot_map_swa,
                     clipped_q,
                     None,
                     md.query_start_loc,
@@ -934,6 +1063,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                     skip_rel=True,
                 )
             nt = md.num_actual_tokens
+            if nt <= 0:
+                output.zero_()
+                return
             if _sm12_attn.local_swa_otf_rel_prefill(
                 clipped_q[:nt],
                 r_view[:nt],
@@ -1007,6 +1139,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                             positions, conv_md, md, clipped_q, None, skip_rel=True,
                         )
                     else:
+                        _kv_slots_g = int(key_cache.shape[0]) * int(key_cache.shape[1])
+                        _slot_map_g = _sanitize_slot_mapping_v15(md.slot_mapping, _kv_slots_g)
                         attention_prologue(
                             q,
                             r_view,
@@ -1028,7 +1162,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                             conv_md.query_start,
                             key_cache,
                             value_cache,
-                            md.slot_mapping,
+                            _slot_map_g,
                             clipped_q,
                             None,
                             md.query_start_loc,
@@ -1040,6 +1174,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                             skip_rel=True,
                         )
                     nt = md.num_actual_tokens
+                    if nt <= 0:
+                        output.zero_()
+                        return
                     tau_nt = tau[:nt] if tau is not None else None
                     if _sm12_attn.global_otf_rel_prefill(
                         clipped_q[:nt],
@@ -1085,9 +1222,12 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 and getattr(_active_tree_st, "tree_meta", None) is not None
                 and sm12_attn_fused.has_tree_lib()
             )
+            _md_nr = getattr(md, "num_reqs", None)
+            if _md_nr is None:
+                _md_nr = int(md.seq_lens.shape[0]) if getattr(md, "seq_lens", None) is not None else 999
             _max_q_lim = (
                 96
-                if (_SAM_EXT_ATTN_FIX and num_tokens <= 32 and int(md.num_reqs) <= 2 and _max_q_bkt <= 16)
+                if (_SAM_EXT_ATTN_FIX and num_tokens <= 32 and int(_md_nr) <= 2 and _max_q_bkt <= 16)
                 else 64
             )
             _try_fused_c1 = (
@@ -1122,21 +1262,36 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 if _is_bf12_d:
                     key_cache = value_cache = self.kv_cache
                     _bf12_emerg = self._get_kv_bf12_emerg()
+                    _kv_bs_d = 256
                 else:
                     key_cache, value_cache = self._split_kv_cache()
                     _bf12_emerg = None
+                    _kv_bs_d = int(key_cache.shape[1])
+                _kv_slots_d = (int(self.kv_cache.shape[0]) if _is_bf12_d else int(key_cache.shape[0])) * _kv_bs_d if key_cache.ndim >= 1 else 0
+                _slot_map_d = (
+                    _sanitize_slot_mapping_v15(md.slot_mapping, _kv_slots_d)
+                    if (_DECODE_EDGE_GUARD_V15 and not torch.cuda.is_current_stream_capturing())
+                    else md.slot_mapping
+                )
+                _bt_overflow_d = (
+                    _DECODE_EDGE_GUARD_V15
+                    and not torch.cuda.is_current_stream_capturing()
+                    and md.block_table.ndim == 2
+                    and md.block_table.shape[1] > 0
+                    and int(getattr(md, "max_seq_len", 0)) > int(md.block_table.shape[1]) * _kv_bs_d
+                )
                 rel_proj_t = getattr(self, "rel_proj_t", None)
                 if rel_proj_t is None and self.rel_extent > 0 and not torch.cuda.is_current_stream_capturing():
                     rel_proj_t = sm12_attn_fused.prepack_rel_proj_t(self.rel_logits_proj)
                     self.rel_proj_t = rel_proj_t
-                if self.rel_extent == 0 or rel_proj_t is not None:
+                if not _bt_overflow_d and (self.rel_extent == 0 or rel_proj_t is not None):
                     if _can_tree_fused:
                         if sm12_attn_fused.fused_target_decode_attn_tree(
                             q, r, k, v,
                             self.q_scale, self.r_scale, tau, rel_proj_t,
                             self.k_sconv.conv_weight, self.v_sconv.conv_weight, k_dynamic, v_dynamic,
                             self.conv_state.kv_cache, key_cache, value_cache,
-                            md.slot_mapping, positions, conv_md.block_table, conv_md.seq_idx,
+                            _slot_map_d, positions, conv_md.block_table, conv_md.seq_idx,
                             conv_md.slot_mapping, conv_md.query_start,
                             md.block_table, md.seq_lens, md.query_start_loc,
                             gate, sinks, output,
@@ -1160,7 +1315,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                         self.q_scale, self.r_scale, tau, rel_proj_t,
                         self.k_sconv.conv_weight, self.v_sconv.conv_weight, k_dynamic, v_dynamic,
                         self.conv_state.kv_cache, key_cache, value_cache,
-                        md.slot_mapping, positions, conv_md.block_table, conv_md.seq_idx,
+                        _slot_map_d, positions, conv_md.block_table, conv_md.seq_idx,
                         conv_md.slot_mapping, conv_md.query_start,
                         md.block_table, md.seq_lens, md.query_start_loc,
                         gate, sinks, output,
@@ -1210,6 +1365,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 )
             else:
                 key_cache, value_cache = self._split_kv_cache()
+                _kv_slots = int(key_cache.shape[0]) * int(key_cache.shape[1])
+                _slot_map = _sanitize_slot_mapping_v15(md.slot_mapping, _kv_slots)
                 attention_prologue(
                     q,
                     r.view(num_tokens, self.num_heads, self.d_rel),
@@ -1231,7 +1388,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                     conv_md.query_start,
                     key_cache,
                     value_cache,
-                    md.slot_mapping,
+                    _slot_map,
                     clipped_q,
                     rel_logits,
                     md.query_start_loc,
@@ -1322,7 +1479,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 dtype=torch.float32,
             )
             lse = q.new_empty((self.num_heads, out.shape[0]), dtype=torch.float32)
-            if md is not None:
+            if md is not None and (md.num_actual_tokens - (md.num_decode_tokens if num_decodes else 0)) > 0:
                 num_splits, use_scheduler = plan_attention(
                     self.is_local,
                     md.query_lens_cpu[num_decodes:],
@@ -1358,6 +1515,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         ``rel_decode_attention``: the whole batch, or in a mixed batch the
         leading decode/verify requests."""
         num_reqs = md.seq_lens.shape[0]
+        if num_reqs <= 0 or num_tokens <= 0:
+            return 0, 0, 0
         plan = partial(
             plan_decode_attention,
             self.is_local,
@@ -1448,6 +1607,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         """FA4 for the requests after the first ``num_decodes``."""
         num_decode_tokens = md.num_decode_tokens if num_decodes else 0
         nt = md.num_actual_tokens - num_decode_tokens
+        if nt <= 0:
+            out.zero_()
+            lse.zero_()
+            return
         cu_seqlens_q = md.query_start_loc[num_decodes:]
         if num_decodes:
             cu_seqlens_q = cu_seqlens_q - num_decode_tokens

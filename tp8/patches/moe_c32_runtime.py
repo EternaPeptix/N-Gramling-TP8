@@ -170,8 +170,14 @@ ROUTER_C32_QUANT_FMA: int = (
     if _RAW_RT_QF is None
     else (1 if _RAW_RT_QF.strip().lower() not in ("0", "", "off", "false", "no") else 0)
 )
+# Wave-V16 48L L2::evict_first + LPT Dynamic Tile Queue + W2 Pre-Wait Hoist (ALL default OFF -> 100% V15 invariant!)
+NVFP4_C48_V16: bool = _env_flag("INKLING_NVFP4_C48_V16", False)
+NVFP4_V16_EVICT: int = max(0, min(2, _env_int("INKLING_NVFP4_V16_EVICT", 1 if NVFP4_C48_V16 else 0)))
+NVFP4_V16_LPT: int = max(0, min(2, _env_int("INKLING_NVFP4_V16_LPT", 2 if NVFP4_C48_V16 else 0)))
+MX7_C48_V16: bool = _env_flag("INKLING_MX7_C48_V16", False)
+MX7_V16_LPT: int = max(0, min(2, _env_int("INKLING_MX7_V16_LPT", 2 if MX7_C48_V16 else 0)))
 # Wave-V12 0-ULP NVFP4 MoE knobs (ALL default OFF -> 100% V10 invariant unless opted in!)
-C48_MOE_V12: bool = _env_flag("INKLING_C48_MOE_V12", False)
+C48_MOE_V12: bool = _env_flag("INKLING_C48_MOE_V12", NVFP4_C48_V16)
 # Opt-in NVFP4-only direct W2->SendBuf fuse_combine override (default -1 = inherit C32_FUSE_COMBINE):
 # Set INKLING_C32_NVFP4_FC_MODE=2 & INKLING_C32_NVFP4_FC_MAX_M=48 for zero-slice-tail Panel-Major
 # direct W2->RDMA SendBuf at C=2..8 (M=17..48), leaving M>48 on FC=4 + combine_c32_v9 and MX7 untouched!
@@ -187,10 +193,28 @@ NVFP4_V10_FUSE_QDEQ: bool = _env_flag("INKLING_NVFP4_V10_FUSE_QDEQ", C48_MOE_V10
 NVFP4_V10_BN16_MAX_M: int = _env_int("INKLING_NVFP4_V10_BN16_MAX_M", 48 if C48_MOE_V10 else 0)
 _C48_V10_ANY: bool = C48_MOE_V12 or C48_MOE_V10 or ROUTER_V10_FUSED or NVFP4_V10_FUSE_QDEQ
 _C48_V9_ANY: bool = C48_MOE_V9 or NVFP4_V9_QDEQ or _C48_V10_ANY
+# Wave-V14 Global MXFP8 MX7 C=2..32 0-ULP Max-Occupancy knobs (ALL default OFF -> 100% V13 invariant!)
+MX7_C48_V14: bool = _env_flag("INKLING_MX7_C48_V14", MX7_C48_V16)
+MX7_V14_FUSE_QDEQ: bool = _env_flag("INKLING_MX7_V14_FUSE_QDEQ", MX7_C48_V14)
+MX7_V14_W13_BN_MODE: int = max(0, min(2, _env_int("INKLING_MX7_V14_W13_BN_MODE", 2 if MX7_C48_V14 else 0)))
+MX7_V14_BN16_MARGIN: int = max(0, min(50, _env_int("INKLING_MX7_V14_BN16_MARGIN", 3)))
+MX7_V14_BN16_MAX_M: int = _env_int("INKLING_MX7_V14_BN16_MAX_M", 48 if MX7_C48_V14 else 0)
+MX7_V14_EVICT: int = 1 if _env_flag("INKLING_MX7_V14_EVICT", MX7_C48_V14) else 0
+# Opt-in MX7-only direct W2->SendBuf fuse_combine override (default -1 = inherit C32_FUSE_COMBINE):
+C32_MX7_FC_MODE: int = max(-1, min(3, _env_int("INKLING_C32_MX7_FC_MODE", -1)))
+C32_MX7_FC_MAX_M: int = max(0, _env_int("INKLING_C32_MX7_FC_MAX_M", 48))
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _NVFP4_PATHS = (
     os.environ.get("INKLING_NVFP4_WS5_C32_LIB", "").strip(),
+    *(
+        (
+            "/rdma/libnvfp4_ws5_c48_v16.so",
+            os.path.join(_DIR, "libnvfp4_ws5_c48_v16.so"),
+        )
+        if NVFP4_C48_V16
+        else ()
+    ),
     *(
         (
             "/rdma/libnvfp4_ws5_c48_v12.so",
@@ -243,7 +267,31 @@ _NVFP4_PATHS = (
     os.path.join(_DIR, "libnvfp4_ws5_c32.so"),
 )
 _MX7_PATHS = (
-    os.environ.get("INKLING_MX7_C32_LIB", ""),
+    os.environ.get("INKLING_MX7_C32_LIB", "").strip(),
+    *(
+        (
+            "/rdma/libmxfp8_mx7_c48_v16.so",
+            os.path.join(_DIR, "libmxfp8_mx7_c48_v16.so"),
+        )
+        if MX7_C48_V16
+        else ()
+    ),
+    *(
+        (
+            "/rdma/libmxfp8_mx7_c48_v14.so",
+            os.path.join(_DIR, "libmxfp8_mx7_c48_v14.so"),
+        )
+        if (MX7_C48_V14 or MX7_V14_FUSE_QDEQ)
+        else ()
+    ),
+    *(
+        (
+            "/rdma/libmxfp8_mx7_c48_v9.so",
+            os.path.join(_DIR, "libmxfp8_mx7_c48_v9.so"),
+        )
+        if _C48_V9_ANY
+        else ()
+    ),
     *(
         (
             "/rdma/libmxfp8_mx7_c48_v8.so",
@@ -522,6 +570,25 @@ def get_nvfp4_lib(path: str | None = None) -> ctypes.CDLL | None:
     if hasattr(lib, "nvfp4_ws5_c48_v9_bn16_min_cta"):
         lib.nvfp4_ws5_c48_v9_bn16_min_cta.argtypes = []
         lib.nvfp4_ws5_c48_v9_bn16_min_cta.restype = ctypes.c_int
+    if hasattr(lib, "nvfp4_ws5_c48_v16_w2_min_cta"):
+        lib.nvfp4_ws5_c48_v16_w2_min_cta.argtypes = []
+        lib.nvfp4_ws5_c48_v16_w2_min_cta.restype = ctypes.c_int
+    if hasattr(lib, "nvfp4_w13_ws5_c48_v16_fwd"):
+        lib.nvfp4_w13_ws5_c48_v16_fwd.argtypes = [
+            *[ctypes.c_void_p] * 15,
+            *[ctypes.c_int] * 17,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+        ]
+        lib.nvfp4_w13_ws5_c48_v16_fwd.restype = ctypes.c_int
+    if hasattr(lib, "nvfp4_w2_ws5_c48_v16_fwd"):
+        lib.nvfp4_w2_ws5_c48_v16_fwd.argtypes = [
+            *[ctypes.c_void_p] * 20,
+            *[ctypes.c_int] * 16,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+        ]
+        lib.nvfp4_w2_ws5_c48_v16_fwd.restype = ctypes.c_int
     if hasattr(lib, "nvfp4_w13_ws5_c48_v10_fwd"):
         lib.nvfp4_w13_ws5_c48_v10_fwd.argtypes = [
             ctypes.c_void_p,  # A
@@ -1174,6 +1241,138 @@ def get_mx7_lib(path: str | None = None) -> ctypes.CDLL | None:
             ctypes.c_uint64,  # stream_ptr
         ]
         lib.mx7_w2_c48_v8_panel_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_c48_v14_bn16_min_cta"):
+        lib.mx7_c48_v14_bn16_min_cta.argtypes = []
+        lib.mx7_c48_v14_bn16_min_cta.restype = ctypes.c_int
+    if hasattr(lib, "mx7_c48_v14_min_cta"):
+        lib.mx7_c48_v14_min_cta.argtypes = []
+        lib.mx7_c48_v14_min_cta.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w13_c48_v16_fwd"):
+        lib.mx7_w13_c48_v16_fwd.argtypes = [
+            *[ctypes.c_void_p] * 13,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            *[ctypes.c_int] * 8,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            *[ctypes.c_int] * 4,
+            ctypes.c_void_p, ctypes.c_uint64,
+        ]
+        lib.mx7_w13_c48_v16_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w2_c48_v16_fwd"):
+        lib.mx7_w2_c48_v16_fwd.argtypes = [
+            *[ctypes.c_void_p] * 15,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            *[ctypes.c_int] * 7,
+            ctypes.c_void_p, ctypes.c_void_p,
+            *[ctypes.c_int] * 4,
+            ctypes.c_void_p, ctypes.c_uint64,
+        ]
+        lib.mx7_w2_c48_v16_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w13_c48_v16_compat_fwd"):
+        lib.mx7_w13_c48_v16_compat_fwd.argtypes = [
+            *[ctypes.c_void_p] * 16,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            *[ctypes.c_int] * 8,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            *[ctypes.c_int] * 4,
+            ctypes.c_void_p, ctypes.c_uint64,
+        ]
+        lib.mx7_w13_c48_v16_compat_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w2_c48_v16_compat_fwd"):
+        lib.mx7_w2_c48_v16_compat_fwd.argtypes = [
+            *[ctypes.c_void_p] * 18,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            *[ctypes.c_int] * 7,
+            ctypes.c_void_p, ctypes.c_void_p,
+            *[ctypes.c_int] * 4,
+            ctypes.c_void_p, ctypes.c_uint64,
+        ]
+        lib.mx7_w2_c48_v16_compat_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w13_c48_v16_panel_fwd"):
+        lib.mx7_w13_c48_v16_panel_fwd.argtypes = [
+            *[ctypes.c_void_p] * 14,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            *[ctypes.c_int] * 8,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            *[ctypes.c_int] * 4,
+            ctypes.c_void_p, ctypes.c_uint64,
+        ]
+        lib.mx7_w13_c48_v16_panel_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w2_c48_v16_panel_fwd"):
+        lib.mx7_w2_c48_v16_panel_fwd.argtypes = [
+            *[ctypes.c_void_p] * 16,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            *[ctypes.c_int] * 7,
+            ctypes.c_void_p, ctypes.c_void_p,
+            *[ctypes.c_int] * 4,
+            ctypes.c_void_p, ctypes.c_uint64,
+        ]
+        lib.mx7_w2_c48_v16_panel_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w13_c48_v14_fwd"):
+        lib.mx7_w13_c48_v14_fwd.argtypes = [
+            *[ctypes.c_void_p] * 13,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ]
+        lib.mx7_w13_c48_v14_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w2_c48_v14_fwd"):
+        lib.mx7_w2_c48_v14_fwd.argtypes = [
+            *[ctypes.c_void_p] * 15,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ]
+        lib.mx7_w2_c48_v14_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w13_c48_v14_compat_fwd"):
+        lib.mx7_w13_c48_v14_compat_fwd.argtypes = [
+            *[ctypes.c_void_p] * 16,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ]
+        lib.mx7_w13_c48_v14_compat_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w2_c48_v14_compat_fwd"):
+        lib.mx7_w2_c48_v14_compat_fwd.argtypes = [
+            *[ctypes.c_void_p] * 18,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ]
+        lib.mx7_w2_c48_v14_compat_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w13_c48_v14_panel_fwd"):
+        lib.mx7_w13_c48_v14_panel_fwd.argtypes = [
+            *[ctypes.c_void_p] * 14,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ]
+        lib.mx7_w13_c48_v14_panel_fwd.restype = ctypes.c_int
+    if hasattr(lib, "mx7_w2_c48_v14_panel_fwd"):
+        lib.mx7_w2_c48_v14_panel_fwd.argtypes = [
+            *[ctypes.c_void_p] * 16,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ]
+        lib.mx7_w2_c48_v14_panel_fwd.restype = ctypes.c_int
     ver = 3
     if hasattr(lib, "mx7_c32_version"):
         lib.mx7_c32_version.argtypes = []
@@ -1435,13 +1634,14 @@ def get_workspace(device: torch.device) -> dict[str, torch.Tensor]:
             "tile_w13_done": torch.zeros((_WS_MAX_CTAS,), dtype=torch.int32, device=device),
             "tile_ready": torch.zeros((_WS_MAX_CTAS,), dtype=torch.int32, device=device),
             "overlap_meta": torch.zeros((32,), dtype=torch.int32, device=device),
+            "work_queue": torch.zeros((64,), dtype=torch.int32, device=device),
         }
         if not SHARED_MOE_SCRATCH or C32_FUSE_COMBINE == 1 or C32_FUSE_COMBINE_C18 == 1:
             ws["down_panel"] = torch.empty((2 * 6 * _WS_MAX_ROUTED, 128), dtype=torch.bfloat16, device=device)
         _WS[idx] = ws
-    if (C32_FUSE_COMBINE == 1 or C32_FUSE_COMBINE_C18 == 1 or C32_NVFP4_FC_MODE == 1) and "down_panel" not in ws:
+    if (C32_FUSE_COMBINE == 1 or C32_FUSE_COMBINE_C18 == 1 or C32_NVFP4_FC_MODE == 1 or C32_MX7_FC_MODE == 1) and "down_panel" not in ws:
         ws["down_panel"] = torch.empty((2 * 6 * _WS_MAX_ROUTED, 128), dtype=torch.bfloat16, device=device)
-    if (C32_FUSE_COMBINE in (2, 3) or C32_FUSE_COMBINE_C18 in (2, 3) or C32_NVFP4_FC_MODE in (2, 3) or C32_COMBINE_V6 or C48_MOE_V7 or C48_MOE_V8 or C48_MOE_V9 or C48_MOE_V10 or C48_MOE_V12 or C48_MOE_TILE8) and "down_compact" not in ws:
+    if (C32_FUSE_COMBINE in (2, 3) or C32_FUSE_COMBINE_C18 in (2, 3) or C32_NVFP4_FC_MODE in (2, 3) or C32_MX7_FC_MODE in (2, 3) or C32_COMBINE_V6 or C48_MOE_V7 or C48_MOE_V8 or C48_MOE_V9 or C48_MOE_V10 or C48_MOE_V12 or C48_MOE_TILE8 or MX7_C48_V14) and "down_compact" not in ws:
         # 36 panels * 2048 compact rows * 128 bf16 = 18.0 MiB (same size as [2048, 4608] bf16
         # for COMPACT_OUT + nvfp4_combine_c32_v6_fwd; 100% L2-hot <= 9.44 MB at M<=128!).
         ws["down_compact"] = torch.empty((36 * _WS_MAX_ROUTED, 128), dtype=torch.bfloat16, device=device)
@@ -1743,7 +1943,7 @@ def _is_full_decode_capturing() -> bool:
             return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
     except Exception:
         pass
-    return True
+    return False
 
 
 def will_use_bf12_gate(num_tokens: int) -> bool:
@@ -2339,6 +2539,7 @@ def forward_experts_c32(
     tile_w13_done_ptr = ws["tile_w13_done"].data_ptr()
     tile_ready_ptr = ws["tile_ready"].data_ptr()
     overlap_meta_ptr = ws["overlap_meta"].data_ptr()
+    work_queue_ptr = ws["work_queue"].data_ptr()
 
     if experts.nvfp4:
         lib = get_nvfp4_lib()
@@ -2368,6 +2569,12 @@ def forward_experts_c32(
         else:
             nv_fc = nv_fc_req
 
+        use_nv_v16 = (
+            NVFP4_C48_V16
+            and nv_ver >= 16
+            and hasattr(lib, "nvfp4_w13_ws5_c48_v16_fwd")
+            and hasattr(lib, "nvfp4_w2_ws5_c48_v16_fwd")
+        )
         use_nv_v9 = (
             _C48_V9_ANY
             and nv_ver >= 9
@@ -2423,6 +2630,32 @@ def forward_experts_c32(
         def _call_nv_w13(
             out_ptr: int, tcs_ptr: int, gam_ptr: int, amax_ptr: int, fs_flag: int
         ) -> int:
+            if use_nv_v16:
+                fq_flag = 1 if (use_v10_fuse_qdeq and fs_flag) else 0
+                return lib.nvfp4_w13_ws5_c48_v16_fwd(
+                    act.view(torch.uint8).data_ptr(),
+                    act_scale.view(torch.uint8).data_ptr(),
+                    row_scale.data_ptr(),
+                    0 if r2t is None else r2t.data_ptr(),
+                    m13["slabs"].data_ptr(),
+                    ws_base_13.data_ptr(),
+                    m13["p_off"].data_ptr(),
+                    m13["patches"].data_ptr(),
+                    experts.ones.data_ptr(),
+                    tiles.data_ptr(),
+                    tcs_ptr,
+                    gam_ptr,
+                    amax_ptr,
+                    out_ptr,
+                    tile_w13_done_ptr if fq_flag else 0,
+                    576, 4608, int(plan.max_ctas), int(plan.tile),
+                    bk_w13, 1 if r2t is not None else 0, 1 if (r2t is not None or as_rm) else 0, fs_flag,
+                    1 if (use_v9_qdeq and fs_flag) else 0,
+                    eff_v9_bn_mode,
+                    NVFP4_V9_BN16_MARGIN,
+                    pdl_w13_wait, trig, fq_flag, MOE_V9_QUANT_FMA,
+                    NVFP4_V16_EVICT, NVFP4_V16_LPT, work_queue_ptr, st,
+                )
             if use_v10_fuse_qdeq and fs_flag:
                 return lib.nvfp4_w13_ws5_c48_v10_fwd(
                     act.view(torch.uint8).data_ptr(),
@@ -2520,6 +2753,23 @@ def forward_experts_c32(
             tcs_ptr: int, out_ptr: int, s2c_ptr: int, nl_ptr: int,
             pd_ptr: int, bg_ptr: int, sb_ptr: int, fc_flag: int,
         ) -> int:
+            if use_nv_v16:
+                fq_mode = 2 if use_v9_qdeq else (1 if use_fuse_situ else 0)
+                return lib.nvfp4_w2_ws5_c48_v16_fwd(
+                    w2_a_ptr, w2_as_ptr, w2_rs_ptr,
+                    row_amax_w2.data_ptr() if use_fuse_situ else 0,
+                    w2_amax.data_ptr() if use_fuse_situ else 0,
+                    w2_denom.data_ptr() if use_fuse_situ else 0,
+                    m2["w_pack"].data_ptr(), m2["ws5_pack"].data_ptr(), ws_base_2.data_ptr(),
+                    m2["p_off"].data_ptr(), m2["patches"].data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(), tcs_ptr,
+                    out_ptr, s2c_ptr, nl_ptr, pd_ptr, bg_ptr, sb_ptr,
+                    4608, 288, int(plan.max_ctas), int(plan.tile), tokens,
+                    bk_w2, w2_as_rm, w2_as_stride, down_row_stride,
+                    fq_mode, fc_flag,
+                    pdl_w2_wait, trig, MOE_V9_QUANT_FMA,
+                    NVFP4_V16_EVICT, NVFP4_V16_LPT, work_queue_ptr, st,
+                )
             if use_nv_v9:
                 fq_mode = 2 if use_v9_qdeq else (1 if use_fuse_situ else 0)
                 return lib.nvfp4_w2_ws5_c48_v9_fwd(
@@ -2849,8 +3099,33 @@ def forward_experts_c32(
         slabs13, ws3_13, flips13, f_off13, base_ws13 = p13
         slabs2, ws3_2, flips2, f_off2, base_ws2 = p2
 
+    use_mx_v16 = (
+        MX7_C48_V16
+        and mx_ver >= 16
+        and hasattr(lib, "mx7_w13_c48_v16_fwd")
+        and hasattr(lib, "mx7_w2_c48_v16_fwd")
+    )
+    use_mx_v14 = (
+        (MX7_C48_V14 or MX7_V14_FUSE_QDEQ)
+        and mx_ver >= 14
+        and hasattr(lib, "mx7_w13_c48_v14_fwd")
+        and hasattr(lib, "mx7_w2_c48_v14_fwd")
+    )
+    use_mx_v14_qdeq = (
+        use_mx_v14
+        and MX7_V14_FUSE_QDEQ
+        and use_fuse_situ
+        and int(plan.max_ctas) <= _WS_MAX_CTAS
+    )
+    if MX7_V14_BN16_MAX_M > 0 and tokens > MX7_V14_BN16_MAX_M:
+        eff_mx_bn_mode = 0
+    else:
+        eff_mx_bn_mode = MX7_V14_W13_BN_MODE if int(plan.tile) == 8 else 0
+    mx_fq_w2 = (2 if use_mx_v14_qdeq else 1) if use_fuse_situ else 0
+
     use_mx_v8 = (
-        mx_ver >= 8
+        (not use_mx_v14)
+        and mx_ver >= 8
         and hasattr(lib, "mx7_w13_c48_v8_fwd")
         and hasattr(lib, "mx7_w2_c48_v8_fwd")
         and (C48_MOE_W13_W2_OVERLAP or C48_MOE_HOT_L2_HINT)
@@ -2858,7 +3133,7 @@ def forward_experts_c32(
     mx_overlap_flag = (
         1
         if (
-            use_mx_v8
+            (use_mx_v14 or use_mx_v8)
             and C48_MOE_W13_W2_OVERLAP
             and (C32_PDL > 0)
             and use_fuse_situ
@@ -2869,8 +3144,46 @@ def forward_experts_c32(
 
     def _call_w13(out_ptr: int, tcs_ptr: int, gam_ptr: int, fs_flag: int) -> int:
         ov_flag = mx_overlap_flag if fs_flag else 0
+        qdeq_flag = 1 if (use_mx_v14_qdeq and fs_flag) else 0
+        qdeq_ptr = tile_w13_done_ptr if qdeq_flag else 0
         if v5_mode == "panel":
             pp13, po13, sm13, so13, sf13, bws13, _ = v5_13
+            if use_mx_v16 and hasattr(lib, "mx7_w13_c48_v16_panel_fwd"):
+                return lib.mx7_w13_c48_v16_panel_fwd(
+                    act.view(torch.uint8).data_ptr(),
+                    act_scale.view(torch.uint8).data_ptr(),
+                    0 if r2t is None else r2t.data_ptr(),
+                    pp13.data_ptr(), po13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), sf13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    tcs_ptr, gam_ptr, out_ptr, qdeq_ptr,
+                    576, 4608, int(plan.max_ctas), int(plan.tile), int(bws13),
+                    1 if r2t is not None else 0, 1 if (r2t is not None or as_rm) else 0, fs_flag, qdeq_flag,
+                    eff_mx_bn_mode, MX7_V14_BN16_MARGIN,
+                    pdl_w13_wait, trig,
+                    tile_w13_done_ptr if ov_flag else 0,
+                    tile_ready_ptr if ov_flag else 0,
+                    overlap_meta_ptr if ov_flag else 0,
+                    ov_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_ptr, st,
+                )
+            if use_mx_v14 and hasattr(lib, "mx7_w13_c48_v14_panel_fwd"):
+                return lib.mx7_w13_c48_v14_panel_fwd(
+                    act.view(torch.uint8).data_ptr(),
+                    act_scale.view(torch.uint8).data_ptr(),
+                    0 if r2t is None else r2t.data_ptr(),
+                    pp13.data_ptr(), po13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), sf13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    tcs_ptr, gam_ptr, out_ptr, qdeq_ptr,
+                    576, 4608, int(plan.max_ctas), int(plan.tile), int(bws13),
+                    1 if r2t is not None else 0, 1 if (r2t is not None or as_rm) else 0, fs_flag, qdeq_flag,
+                    eff_mx_bn_mode, MX7_V14_BN16_MARGIN,
+                    pdl_w13_wait, trig,
+                    tile_w13_done_ptr if ov_flag else 0,
+                    tile_ready_ptr if ov_flag else 0,
+                    overlap_meta_ptr if ov_flag else 0,
+                    ov_flag, hot_l2_flag, MX7_V14_EVICT, st,
+                )
             if use_mx_v8 and hasattr(lib, "mx7_w13_c48_v8_panel_fwd"):
                 return lib.mx7_w13_c48_v8_panel_fwd(
                     act.view(torch.uint8).data_ptr(),
@@ -2902,6 +3215,44 @@ def forward_experts_c32(
             )
         if v5_mode == "compat":
             sl13, w3_13, sm13, so13, do13, sf13, bm13, bws13, _ = v5_13
+            if use_mx_v16 and hasattr(lib, "mx7_w13_c48_v16_compat_fwd"):
+                return lib.mx7_w13_c48_v16_compat_fwd(
+                    act.view(torch.uint8).data_ptr(),
+                    act_scale.view(torch.uint8).data_ptr(),
+                    0 if r2t is None else r2t.data_ptr(),
+                    sl13.data_ptr(), w3_13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), do13.data_ptr(),
+                    sf13.data_ptr(), bm13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    tcs_ptr, gam_ptr, out_ptr, qdeq_ptr,
+                    576, 4608, int(plan.max_ctas), int(plan.tile), int(bws13),
+                    1 if r2t is not None else 0, 1 if (r2t is not None or as_rm) else 0, fs_flag, qdeq_flag,
+                    eff_mx_bn_mode, MX7_V14_BN16_MARGIN,
+                    pdl_w13_wait, trig,
+                    tile_w13_done_ptr if ov_flag else 0,
+                    tile_ready_ptr if ov_flag else 0,
+                    overlap_meta_ptr if ov_flag else 0,
+                    ov_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_ptr, st,
+                )
+            if use_mx_v14 and hasattr(lib, "mx7_w13_c48_v14_compat_fwd"):
+                return lib.mx7_w13_c48_v14_compat_fwd(
+                    act.view(torch.uint8).data_ptr(),
+                    act_scale.view(torch.uint8).data_ptr(),
+                    0 if r2t is None else r2t.data_ptr(),
+                    sl13.data_ptr(), w3_13.data_ptr(),
+                    sm13.data_ptr(), so13.data_ptr(), do13.data_ptr(),
+                    sf13.data_ptr(), bm13.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(),
+                    tcs_ptr, gam_ptr, out_ptr, qdeq_ptr,
+                    576, 4608, int(plan.max_ctas), int(plan.tile), int(bws13),
+                    1 if r2t is not None else 0, 1 if (r2t is not None or as_rm) else 0, fs_flag, qdeq_flag,
+                    eff_mx_bn_mode, MX7_V14_BN16_MARGIN,
+                    pdl_w13_wait, trig,
+                    tile_w13_done_ptr if ov_flag else 0,
+                    tile_ready_ptr if ov_flag else 0,
+                    overlap_meta_ptr if ov_flag else 0,
+                    ov_flag, hot_l2_flag, MX7_V14_EVICT, st,
+                )
             if use_mx_v8 and hasattr(lib, "mx7_w13_c48_v8_compat_fwd"):
                 return lib.mx7_w13_c48_v8_compat_fwd(
                     act.view(torch.uint8).data_ptr(),
@@ -2932,6 +3283,40 @@ def forward_experts_c32(
                 576, 4608, int(plan.max_ctas), int(plan.tile), int(bws13),
                 1 if r2t is not None else 0, 1 if (r2t is not None or as_rm) else 0, fs_flag,
                 pdl_w13_wait, trig, st,
+            )
+        if use_mx_v16:
+            return lib.mx7_w13_c48_v16_fwd(
+                act.view(torch.uint8).data_ptr(),
+                act_scale.view(torch.uint8).data_ptr(),
+                0 if r2t is None else r2t.data_ptr(),
+                slabs13.data_ptr(), ws3_13.data_ptr(), flips13.data_ptr(), f_off13.data_ptr(),
+                experts.ones.data_ptr(), tiles.data_ptr(),
+                tcs_ptr, gam_ptr, out_ptr, qdeq_ptr,
+                576, 4608, int(plan.max_ctas), int(plan.tile), int(base_ws13),
+                1 if r2t is not None else 0, 1 if (r2t is not None or as_rm) else 0, fs_flag, qdeq_flag,
+                eff_mx_bn_mode, MX7_V14_BN16_MARGIN,
+                pdl_w13_wait, trig,
+                tile_w13_done_ptr if ov_flag else 0,
+                tile_ready_ptr if ov_flag else 0,
+                overlap_meta_ptr if ov_flag else 0,
+                ov_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_ptr, st,
+            )
+        if use_mx_v14:
+            return lib.mx7_w13_c48_v14_fwd(
+                act.view(torch.uint8).data_ptr(),
+                act_scale.view(torch.uint8).data_ptr(),
+                0 if r2t is None else r2t.data_ptr(),
+                slabs13.data_ptr(), ws3_13.data_ptr(), flips13.data_ptr(), f_off13.data_ptr(),
+                experts.ones.data_ptr(), tiles.data_ptr(),
+                tcs_ptr, gam_ptr, out_ptr, qdeq_ptr,
+                576, 4608, int(plan.max_ctas), int(plan.tile), int(base_ws13),
+                1 if r2t is not None else 0, 1 if (r2t is not None or as_rm) else 0, fs_flag, qdeq_flag,
+                eff_mx_bn_mode, MX7_V14_BN16_MARGIN,
+                pdl_w13_wait, trig,
+                tile_w13_done_ptr if ov_flag else 0,
+                tile_ready_ptr if ov_flag else 0,
+                overlap_meta_ptr if ov_flag else 0,
+                ov_flag, hot_l2_flag, MX7_V14_EVICT, st,
             )
         if use_mx_v8:
             return lib.mx7_w13_c48_v8_fwd(
@@ -2967,6 +3352,36 @@ def forward_experts_c32(
     ) -> int:
         if v5_mode == "panel":
             pp2, po2, sm2, so2, sf2, bws2, _ = v5_2
+            if use_mx_v16 and hasattr(lib, "mx7_w2_c48_v16_panel_fwd"):
+                return lib.mx7_w2_c48_v16_panel_fwd(
+                    w2_a_ptr, w2_as_ptr,
+                    pp2.data_ptr(), po2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), sf2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(), tcs_ptr,
+                    out_ptr, s2c_ptr, nl_ptr, pd_ptr, bg_ptr, sb_ptr,
+                    4608, 288, int(plan.max_ctas), int(plan.tile), tokens, int(bws2),
+                    w2_as_rm, w2_as_stride, down_row_stride,
+                    mx_fq_w2, fc_flag,
+                    pdl_w2_wait, trig,
+                    tile_ready_ptr if mx_overlap_flag else 0,
+                    overlap_meta_ptr if mx_overlap_flag else 0,
+                    mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_ptr, st,
+                )
+            if use_mx_v14 and hasattr(lib, "mx7_w2_c48_v14_panel_fwd"):
+                return lib.mx7_w2_c48_v14_panel_fwd(
+                    w2_a_ptr, w2_as_ptr,
+                    pp2.data_ptr(), po2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), sf2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(), tcs_ptr,
+                    out_ptr, s2c_ptr, nl_ptr, pd_ptr, bg_ptr, sb_ptr,
+                    4608, 288, int(plan.max_ctas), int(plan.tile), tokens, int(bws2),
+                    w2_as_rm, w2_as_stride, down_row_stride,
+                    mx_fq_w2, fc_flag,
+                    pdl_w2_wait, trig,
+                    tile_ready_ptr if mx_overlap_flag else 0,
+                    overlap_meta_ptr if mx_overlap_flag else 0,
+                    mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, st,
+                )
             if use_mx_v8 and hasattr(lib, "mx7_w2_c48_v8_panel_fwd"):
                 return lib.mx7_w2_c48_v8_panel_fwd(
                     w2_a_ptr, w2_as_ptr,
@@ -2995,6 +3410,38 @@ def forward_experts_c32(
             )
         if v5_mode == "compat":
             sl2, w3_2, sm2, so2, do2, sf2, bm2, bws2, _ = v5_2
+            if use_mx_v16 and hasattr(lib, "mx7_w2_c48_v16_compat_fwd"):
+                return lib.mx7_w2_c48_v16_compat_fwd(
+                    w2_a_ptr, w2_as_ptr,
+                    sl2.data_ptr(), w3_2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), do2.data_ptr(),
+                    sf2.data_ptr(), bm2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(), tcs_ptr,
+                    out_ptr, s2c_ptr, nl_ptr, pd_ptr, bg_ptr, sb_ptr,
+                    4608, 288, int(plan.max_ctas), int(plan.tile), tokens, int(bws2),
+                    w2_as_rm, w2_as_stride, down_row_stride,
+                    mx_fq_w2, fc_flag,
+                    pdl_w2_wait, trig,
+                    tile_ready_ptr if mx_overlap_flag else 0,
+                    overlap_meta_ptr if mx_overlap_flag else 0,
+                    mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_ptr, st,
+                )
+            if use_mx_v14 and hasattr(lib, "mx7_w2_c48_v14_compat_fwd"):
+                return lib.mx7_w2_c48_v14_compat_fwd(
+                    w2_a_ptr, w2_as_ptr,
+                    sl2.data_ptr(), w3_2.data_ptr(),
+                    sm2.data_ptr(), so2.data_ptr(), do2.data_ptr(),
+                    sf2.data_ptr(), bm2.data_ptr(),
+                    experts.ones.data_ptr(), tiles.data_ptr(), tcs_ptr,
+                    out_ptr, s2c_ptr, nl_ptr, pd_ptr, bg_ptr, sb_ptr,
+                    4608, 288, int(plan.max_ctas), int(plan.tile), tokens, int(bws2),
+                    w2_as_rm, w2_as_stride, down_row_stride,
+                    mx_fq_w2, fc_flag,
+                    pdl_w2_wait, trig,
+                    tile_ready_ptr if mx_overlap_flag else 0,
+                    overlap_meta_ptr if mx_overlap_flag else 0,
+                    mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, st,
+                )
             if use_mx_v8 and hasattr(lib, "mx7_w2_c48_v8_compat_fwd"):
                 return lib.mx7_w2_c48_v8_compat_fwd(
                     w2_a_ptr, w2_as_ptr,
@@ -3022,6 +3469,34 @@ def forward_experts_c32(
                 w2_as_rm, w2_as_stride, down_row_stride,
                 1 if use_fuse_situ else 0, fc_flag,
                 pdl_w2_wait, trig, st,
+            )
+        if use_mx_v16:
+            return lib.mx7_w2_c48_v16_fwd(
+                w2_a_ptr, w2_as_ptr,
+                slabs2.data_ptr(), ws3_2.data_ptr(), flips2.data_ptr(), f_off2.data_ptr(),
+                experts.ones.data_ptr(), tiles.data_ptr(), tcs_ptr,
+                out_ptr, s2c_ptr, nl_ptr, pd_ptr, bg_ptr, sb_ptr,
+                4608, 288, int(plan.max_ctas), int(plan.tile), tokens, int(base_ws2),
+                w2_as_rm, w2_as_stride, down_row_stride,
+                mx_fq_w2, fc_flag,
+                pdl_w2_wait, trig,
+                tile_ready_ptr if mx_overlap_flag else 0,
+                overlap_meta_ptr if mx_overlap_flag else 0,
+                mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_ptr, st,
+            )
+        if use_mx_v14:
+            return lib.mx7_w2_c48_v14_fwd(
+                w2_a_ptr, w2_as_ptr,
+                slabs2.data_ptr(), ws3_2.data_ptr(), flips2.data_ptr(), f_off2.data_ptr(),
+                experts.ones.data_ptr(), tiles.data_ptr(), tcs_ptr,
+                out_ptr, s2c_ptr, nl_ptr, pd_ptr, bg_ptr, sb_ptr,
+                4608, 288, int(plan.max_ctas), int(plan.tile), tokens, int(base_ws2),
+                w2_as_rm, w2_as_stride, down_row_stride,
+                mx_fq_w2, fc_flag,
+                pdl_w2_wait, trig,
+                tile_ready_ptr if mx_overlap_flag else 0,
+                overlap_meta_ptr if mx_overlap_flag else 0,
+                mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, st,
             )
         if use_mx_v8:
             return lib.mx7_w2_c48_v8_fwd(
@@ -3074,12 +3549,19 @@ def forward_experts_c32(
         w2_as_rm = 1 if bool(getattr(act2_s, "_inkling_rowmaj", False)) else 0
         w2_as_stride = int(act2_s.stride(0)) if (w2_as_rm and act2_s.ndim >= 2) else 9
 
-    if fc_mode == 3:
+    eff_mx_fc_mode = fc_mode
+    if (
+        C32_MX7_FC_MODE >= 0
+        and has_compact
+        and (C32_MX7_FC_MAX_M <= 0 or tokens <= C32_MX7_FC_MAX_M)
+    ):
+        eff_mx_fc_mode = C32_MX7_FC_MODE
+    if eff_mx_fc_mode == 3:
         mx_fc = 3 if mx_ver >= 7 else 0
-    elif fc_mode == 2:
+    elif eff_mx_fc_mode == 2:
         mx_fc = 2 if mx_ver >= 4 else 0
     else:
-        mx_fc = fc_mode if fc_mode in (0, 1) else 0
+        mx_fc = eff_mx_fc_mode if eff_mx_fc_mode in (0, 1) else 0
     if mx_fc > 0:
         out = out_buf if out_buf is not None else torch.empty(
             (tokens, 4608), dtype=torch.bfloat16, device=device
@@ -3100,7 +3582,7 @@ def forward_experts_c32(
         return out
 
     if (
-        (C32_COMBINE_V6 or C48_MOE_V8 or C48_MOE_V9)
+        (C32_COMBINE_V6 or C48_MOE_V8 or C48_MOE_V9 or C48_MOE_V10 or C48_MOE_V12 or MX7_C48_V14)
         and has_compact
         and mx_ver >= 7
         and hasattr(lib, "mx7_combine_c48_v7_fwd")

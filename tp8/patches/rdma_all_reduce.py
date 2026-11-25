@@ -60,8 +60,12 @@
 # (the kernel takes its sequence number from a single device counter). NCCL tolerates
 # collectives on side streams; this does not, so calls made on vLLM's shared-experts aux stream
 # are sent to NCCL, and RDMA_AR_AUDIT reports any other stream.
+import atexit
 import importlib.util
 import os
+import re
+import signal
+import weakref
 
 import torch
 import torch.distributed as dist
@@ -70,6 +74,225 @@ from torch.distributed import ProcessGroup
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# v15 RDMA resilience: process-wide live registry, fail-fast health checks, dynamic RoCEv2 HCA validation,
+# and ordered teardown (all aggressive hooks default-safe / opt-in via env vars).
+_V15_ABORT_REASONS = {
+    0: "NONE",
+    1: "IBV_WC_RETRY_EXC_ERR",
+    2: "IBV_WC_RNR_RETRY_EXC_ERR",
+    3: "IBV_WC_WR_FLUSH_ERR",
+    4: "IBV_WC_STATUS_ERR",
+    5: "IBV_POLL_CQ_ERR",
+    6: "IBV_POST_SEND_ERR",
+    7: "IBV_ASYNC_FATAL_EVENT",
+    8: "PROXY_P2_QUEUE_OVF",
+    9: "MANUAL_ABORT",
+    10: "CLEAN_SHUTDOWN",
+}
+_V15_HEALTH_CHECK_EVERY = int(os.environ.get("RDMA_AR_HEALTH_CHECK_EVERY", "0") or "0")
+_V15_HEALTH_TICKS = 0
+_V15_INSTALL_SIGNAL_HOOK = os.environ.get("RDMA_AR_INSTALL_SIGNAL_HOOK", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+_V15_LIVE_INSTANCES: weakref.WeakSet = weakref.WeakSet()
+_V15_ATEXIT_REGISTERED = False
+_V15_SIGNAL_HOOKS_INSTALLED = False
+
+
+def _v15_read_sysfs_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _v15_hca_sort_key(name: str) -> tuple:
+    """Sort RoCEv2 HCAs deterministically into DGX Spark opposite-root pairs:
+    (rocep1s0f0, roceP2p1s0f0, rocep1s0f1, roceP2p1s0f1) so hca2 = hca ^ 1 always crosses PCIe roots."""
+    m_f = re.search(r"f(\d+)$", name)
+    func_idx = int(m_f.group(1)) if m_f else 999
+    is_p2 = 1 if ("P2" in name or "p2" in name) else 0
+    return (func_idx, is_p2, name)
+
+
+def discover_and_validate_roce_hcas(
+    requested: list[str] | str | None,
+    ib_port: int = 1,
+    min_active: int = 0,
+    discover: bool = False,
+    validate: bool = False,
+    sysfs_root: str = "/sys/class/infiniband",
+) -> tuple[list[str], dict[str, dict[str, str]]]:
+    """Discover RoCEv2 HCAs from sysfs and/or validate that all selected ports are ACTIVE.
+    Default-safe: when discover=False, validate=False, min_active=0, and requested is non-auto,
+    returns the requested HCA list unchanged without requiring sysfs."""
+    if isinstance(requested, str):
+        req_list = [h.strip() for h in requested.split(",") if h.strip()]
+    elif requested is None:
+        req_list = []
+    else:
+        req_list = [h.strip() for h in requested if h and h.strip()]
+
+    auto_mode = (not req_list) or (len(req_list) == 1 and req_list[0].lower() == "auto")
+    if not auto_mode and not discover and not validate and min_active <= 0:
+        return req_list, {}
+
+    def _probe_hca(name: str) -> dict[str, str]:
+        pdir = os.path.join(sysfs_root, name, "ports", str(ib_port))
+        return {
+            "exists": "1" if os.path.isdir(pdir) else "0",
+            "state": _v15_read_sysfs_text(os.path.join(pdir, "state")),
+            "phys_state": _v15_read_sysfs_text(os.path.join(pdir, "phys_state")),
+            "link_layer": _v15_read_sysfs_text(os.path.join(pdir, "link_layer")),
+            "rate": _v15_read_sysfs_text(os.path.join(pdir, "rate")),
+        }
+
+    def _is_active_roce(info: dict[str, str]) -> bool:
+        if info["exists"] != "1":
+            return False
+        st = info["state"].upper()
+        if "ACTIVE" not in st:
+            return False
+        ll = info["link_layer"].lower()
+        if ll and ll != "ethernet":
+            return False
+        return True
+
+    def _scan_sysfs() -> tuple[list[str], dict[str, dict[str, str]]]:
+        if not os.path.isdir(sysfs_root):
+            return [], {}
+        found = []
+        rep: dict[str, dict[str, str]] = {}
+        for name in sorted(os.listdir(sysfs_root), key=_v15_hca_sort_key):
+            info = _probe_hca(name)
+            ll = info["link_layer"].lower()
+            if ll and ll != "ethernet":
+                continue
+            rep[name] = info
+            if _is_active_roce(info):
+                found.append(name)
+        return found, rep
+
+    report: dict[str, dict[str, str]] = {}
+    selected: list[str]
+    if auto_mode:
+        selected, report = _scan_sysfs()
+        if not selected:
+            raise RuntimeError(
+                f"rdma_ar v15: RoCEv2 HCA auto-discovery found 0 ACTIVE Ethernet HCAs under "
+                f"{sysfs_root} (port={ib_port}, details={report})"
+            )
+    else:
+        selected = list(req_list)
+        if os.path.isdir(sysfs_root):
+            for name in selected:
+                report[name] = _probe_hca(name)
+            if discover and any(report[n]["exists"] != "1" for n in selected):
+                active_found, scan_rep = _scan_sysfs()
+                report.update(scan_rep)
+                if active_found and not validate:
+                    logger.warning(
+                        "rdma_ar v15: requested HCAs %s missing in %s; dynamically discovered ACTIVE RoCEv2 HCAs %s",
+                        selected, sysfs_root, active_found,
+                    )
+                    selected = active_found
+        elif validate or min_active > 0:
+            raise RuntimeError(
+                f"rdma_ar v15: RoCEv2 HCA validation enabled but sysfs root {sysfs_root} is unavailable"
+            )
+
+    if validate or min_active > 0:
+        bad = {}
+        active_cnt = 0
+        for name in selected:
+            info = report.get(name) or _probe_hca(name)
+            report[name] = info
+            if _is_active_roce(info):
+                active_cnt += 1
+            else:
+                bad[name] = (
+                    f"state={info['state'] or 'MISSING'} "
+                    f"phys={info['phys_state'] or 'N/A'} "
+                    f"link_layer={info['link_layer'] or 'N/A'}"
+                )
+        if validate and bad:
+            raise RuntimeError(
+                f"rdma_ar v15: RoCEv2 HCA link validation failed ({active_cnt}/{len(selected)} ACTIVE, "
+                f"min_active={min_active}, port={ib_port}): {bad}"
+            )
+        if min_active > 0 and active_cnt < min_active:
+            raise RuntimeError(
+                f"rdma_ar v15: insufficient ACTIVE RoCEv2 HCAs ({active_cnt}/{len(selected)} ACTIVE, "
+                f"required min_active={min_active}, port={ib_port}, report={report})"
+            )
+    return selected, report
+
+
+def _v15_atexit_cleanup() -> None:
+    for inst in list(_V15_LIVE_INSTANCES):
+        try:
+            inst.close(sync_gpu=False, abort_first=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _v15_install_signal_hooks() -> None:
+    global _V15_SIGNAL_HOOKS_INSTALLED
+    if _V15_SIGNAL_HOOKS_INSTALLED:
+        return
+    _V15_SIGNAL_HOOKS_INSTALLED = True
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig_num = getattr(signal, sig_name, None)
+        if sig_num is None:
+            continue
+        try:
+            prev = signal.getsignal(sig_num)
+
+            def _handler(signum, frame, _prev=prev):
+                for inst in list(_V15_LIVE_INSTANCES):
+                    try:
+                        inst.abort(10)  # kAbortShutdown: unblock any spinning GPU kernel in <1ms!
+                    except Exception:  # noqa: BLE001
+                        pass
+                if callable(_prev):
+                    _prev(signum, frame)
+                elif _prev == signal.SIG_DFL:
+                    signal.signal(signum, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+
+            signal.signal(sig_num, _handler)
+        except (ValueError, OSError):
+            pass  # non-main thread or unsupported signal
+
+
+def _v15_register_instance(inst) -> None:
+    global _V15_ATEXIT_REGISTERED
+    _V15_LIVE_INSTANCES.add(inst)
+    if not _V15_ATEXIT_REGISTERED:
+        _V15_ATEXIT_REGISTERED = True
+        atexit.register(_v15_atexit_cleanup)
+    if _V15_INSTALL_SIGNAL_HOOK:
+        _v15_install_signal_hooks()
+
+
+def _check_live_rdma_health() -> None:
+    for inst in list(_V15_LIVE_INSTANCES):
+        if inst.has_fatal_error():
+            inst.check_health(raise_on_error=True)
+
+
+def _is_piecewise_capturing_safe() -> bool:
+    global _L2PF_MOD_CACHE
+    try:
+        _l2pf_m = _L2PF_MOD_CACHE
+        if _l2pf_m is None:
+            from vllm.models.inkling2.ops import l2pf as _l2pf_m
+            _L2PF_MOD_CACHE = _l2pf_m
+        return bool(_l2pf_m._is_piecewise_capturing())
+    except Exception:  # noqa: BLE001
+        return False
 
 # r4 l2-prefetch (DSV41_L2_PREFETCH=1, default off): side-stream L2 prefetch of the next weights
 # while the collective spins. Off = this block does nothing and the hooks below are skipped.
@@ -261,15 +484,25 @@ def rowar_begin(
     Returns True if fused (pad + zero_mask executed inside _n_live_kernel), False otherwise."""
     ROWAR["scope"] = None
     buf = ROWAR["buf"]
+    if num_tokens <= 0:
+        return False
     c28_ok = _ROW_AR_C28 and 1 <= num_tokens <= _ROW_C28_MAX
     if buf is None or (num_tokens != _ROW_FULL and not c28_ok):
         return False
-    if vw_mask.dtype != torch.bool or not vw_mask.is_contiguous():
+    if (
+        not vw_mask.is_cuda
+        or vw_mask.dtype != torch.bool
+        or not vw_mask.is_contiguous()
+        or vw_mask.dim() != 1
+        or vw_mask.shape[0] != num_tokens
+    ):
         return False
     has_pad = (
         pad is not None
+        and pad.is_cuda
         and pad.dtype == torch.bool
         and pad.is_contiguous()
+        and pad.dim() == 1
         and pad.shape[0] == num_tokens
     )
     ROWAR["begins"] += 1
@@ -312,6 +545,11 @@ def rowar_stats_tick() -> None:
     INKLING_ROW_AR_STATS=1, every INKLING_ROW_AR_STATS_EVERY calls it logs the n_live histogram and rolling hash (one
     host read): the line must be identical on all 8 ranks (docker logs). The device counters live inside the captured
     graphs, so without this hook nothing ever reads them in a served process."""
+    global _V15_HEALTH_TICKS
+    if _V15_HEALTH_CHECK_EVERY > 0:
+        _V15_HEALTH_TICKS += 1
+        if _V15_HEALTH_TICKS % _V15_HEALTH_CHECK_EVERY == 0:
+            _check_live_rdma_health()
     if ROWAR["hist"] is None:
         return
     ROWAR["ticks"] += 1
@@ -355,12 +593,21 @@ def _load_ext():
     if _EXT is None:
         path = _ext_path()
         _EXT_PATH = path
-        spec = importlib.util.spec_from_file_location("rdma_ar_ext", path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"rdma_ar: cannot load {path}")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _EXT = mod
+        stem = os.path.splitext(os.path.basename(path))[0]
+        last_err = None
+        for mod_name in ("rdma_ar_ext", stem):
+            spec = importlib.util.spec_from_file_location(mod_name, path)
+            if spec is None or spec.loader is None:
+                continue
+            try:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _EXT = mod
+                break
+            except ImportError as exc:
+                last_err = exc
+        if _EXT is None:
+            raise last_err or ImportError(f"rdma_ar: cannot load {path}")
     return _EXT
 
 
@@ -460,6 +707,10 @@ class RdmaAllReduce:
         self._rs_h = None  # optional prefill-only pipelined RDMA RS / RingShift sidecar (RDMA_RS_EXT)
         self.ag_cols = False  # g2 colltrim (a): set below once the extension is up
         self._c32_fused_sconv_ok = False  # v8 C=2..8 fused AR+SConv+AttnRes readiness (set below)
+        self._closed = False
+        self._recv_decouple = False
+        self._recv_stride = self.max_bytes
+        self._hca_report: dict[str, dict[str, str]] = {}
 
         # rel-2 RDMA_AR_FINGERPRINT=1: refuse to start when ranks differ (exchanged before phase 1)
         if os.environ.get("RDMA_AR_FINGERPRINT", "0") == "1":
@@ -491,17 +742,28 @@ class RdmaAllReduce:
                 raise RuntimeError(f"DSV41_RDMA_PDL set but {_EXT_PATH} has no r6 (PDL) kernels")  # r6-comm
             if _R7_PROJ and getattr(ext, "R7_VARIANT", None) is None:  # r7-comm2
                 raise RuntimeError(f"DSV41_RDMA_PROJ set but {_EXT_PATH} has no r7 projection kernels")  # r7-comm2
-            hcas = [
-                h
-                for h in os.environ.get("RDMA_AR_HCAS", "rocep1s0f0,roceP2p1s0f1").split(",")
-                if h
-            ]
+            req_hcas = os.environ.get("RDMA_AR_HCAS", "rocep1s0f0,roceP2p1s0f1")
+            ib_port = max(1, _env_int("RDMA_AR_IB_PORT", 1))
+            hca_discover = os.environ.get("RDMA_AR_HCA_DISCOVER", "0").strip().lower() in (
+                "1", "on", "true", "yes",
+            )
+            hca_validate = os.environ.get("RDMA_AR_HCA_VALIDATE", "0").strip().lower() in (
+                "1", "on", "true", "yes",
+            )
+            min_active_hcas = max(0, _env_int("RDMA_AR_MIN_ACTIVE_HCAS", 0))
+            hcas, self._hca_report = discover_and_validate_roce_hcas(
+                req_hcas,
+                ib_port=ib_port,
+                min_active=min_active_hcas,
+                discover=hca_discover,
+                validate=hca_validate,
+            )
             gid = _env_int("RDMA_AR_GID_INDEX", _env_int("NCCL_IB_GID_INDEX", 5))
             core = _env_int("RDMA_AR_PROXY_CORE", -1)
-            timeout_ms = _env_int("RDMA_AR_TIMEOUT_MS", 600000)
+            timeout_ms = max(100, min(3600000, _env_int("RDMA_AR_TIMEOUT_MS", 600000)))
             dev = device.index if device.index is not None else torch.cuda.current_device()
             self.h = ext.RdmaAR(
-                rank, world, self.max_bytes, self.max_reduce_bytes, hcas, gid, 1, core,
+                rank, world, self.max_bytes, self.max_reduce_bytes, hcas, gid, ib_port, core,
                 timeout_ms, dev,
             )
             if _ROW_AR:
@@ -558,6 +820,8 @@ class RdmaAllReduce:
         dist.all_gather_object(infos, (info, err), group=cpu_group)
         bad = [(r, e) for r, (i, e) in enumerate(infos) if i is None]
         if bad:
+            if self.h is not None:
+                self.close(sync_gpu=False, abort_first=True)
             if _R3_ANY:  # r6-comm
                 raise RuntimeError(f"rdma_ar r6: setup failed on {bad}; refusing to start without rdma_ar")  # r6-comm
             logger.warning("rdma_ar disabled on all ranks; setup failed on %s", bad)
@@ -574,12 +838,15 @@ class RdmaAllReduce:
         dist.all_gather_object(oks, (ok, err), group=cpu_group)
         bad = [(r, e) for r, (o, e) in enumerate(oks) if not o]
         if bad:
+            if self.h is not None:
+                self.close(sync_gpu=False, abort_first=True)
             if _R3_ANY:  # r6-comm
                 raise RuntimeError(f"rdma_ar r6: connect failed on {bad}; refusing to start without rdma_ar")  # r6-comm
             logger.warning("rdma_ar disabled on all ranks; connect failed on %s", bad)
             return
         dist.barrier(group=cpu_group)
         self.disabled = False
+        _v15_register_instance(self)
         arena = list(self.h.arena_info())
         logger.info(
             "rdma_ar enabled: world=%d max_reduce=%d twoshot>=%d max_gather=%d fp32=%s "
@@ -629,11 +896,16 @@ class RdmaAllReduce:
                         int(hasattr(self.h, "all_reduce_add_rmsnorm_v2")),
                         int(hasattr(self.h, "markov_loop_persistent")))
         if getattr(_EXT, "C32_VARIANT", None) is not None and hasattr(self.h, "c32_info"):
+            _c32i = list(self.h.c32_info())
+            if len(_c32i) >= 8:
+                self._recv_decouple = bool(int(_c32i[5]) != 0)
+                if int(_c32i[7]) > 0:
+                    self._recv_stride = int(_c32i[7])
             logger.info(
                 "rdma_ar c32 %s: [c32_kern,bf12_mode,pipe2,dual_qp,pci_ro,recv_decouple,max_ctas,recv_stride,slot_chunk]=%s "
                 "sbuf_ring=%d draft_c32_mode=%s",
                 getattr(_EXT, "C32_VARIANT", None),
-                list(self.h.c32_info()),
+                _c32i,
                 int(_SBUF_RING),
                 _DRAFT_AR_C32_MODE,
             )
@@ -655,6 +927,25 @@ class RdmaAllReduce:
                 list(self.h.v12_info()),
                 int(_FUSED_AR_SCONV_C28_V12),
                 _FUSED_AR_SCONV_C28_MAX_NSTACK,
+            )
+        if getattr(_EXT, "V13_C28_RDMA_VARIANT", None) is not None and hasattr(self.h, "v13_info"):
+            logger.info(
+                "rdma_ar v13 %s: [exact_rows,active_red,par_qp2,exact_grid,min_nvec,blocks,stripe_min,bf12_p1_min,bf12_p2_min]=%s",
+                getattr(_EXT, "V13_C28_RDMA_VARIANT", None),
+                list(self.h.v13_info()),
+            )
+        if getattr(_EXT, "V15_RDMA_RESILIENCE_VARIANT", None) is not None and hasattr(self.h, "v15_info"):
+            logger.info(
+                "rdma_ar v15 %s: [timeout_ms,qp_to,retry,rnr,chk_port,ff_exit,grace_ms,exit_rc,abort_off,active_hcas]=%s hcas=%s",
+                getattr(_EXT, "V15_RDMA_RESILIENCE_VARIANT", None),
+                list(self.h.v15_info()),
+                list(self._hca_report.keys()) if self._hca_report else "default",
+            )
+        if getattr(_EXT, "V16_RDMA_REG_BF12_VARIANT", None) is not None and hasattr(self.h, "v16_info"):
+            logger.info(
+                "rdma_ar v16 %s: [reg_bf12_v16,eff_mode,eff_p1_min,eff_p2_min,v16_p1_min,v16_p2_min,pipe_min,stripe_min]=%s",
+                getattr(_EXT, "V16_RDMA_REG_BF12_VARIANT", None),
+                list(self.h.v16_info()),
             )
         if getattr(_EXT, "V9_C28_FUSED_SCONV_VARIANT", None) is not None:
             logger.info(
@@ -779,9 +1070,127 @@ class RdmaAllReduce:
                 " NEW_STREAM(total %d)" % len(self._streams_seen) if new else "",
             )
 
+    def v16_info(self) -> list[int]:
+        """Wave-V16 register-fused BF12-G128-OVF runtime config snapshot."""
+        h = self.h
+        if h is not None and hasattr(h, "v16_info"):
+            return [int(v) for v in h.v16_info()]
+        return []
+
+    # -- v15 health, fail-fast abort, and ordered teardown ---------------------------------
+    def has_fatal_error(self) -> bool:
+        """Fast non-synchronizing check for a latched fatal RDMA proxy/CQ/QP error."""
+        h = self.h
+        if h is None:
+            return False
+        fn = getattr(h, "proxy_error", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def health_status(self) -> dict:
+        """Structured health & forensics snapshot (safe to call from watchdog / health probes)."""
+        st = {
+            "rank": self.rank,
+            "world": self.world,
+            "disabled": bool(self.disabled),
+            "closed": bool(self._closed),
+            "proxy_error": False,
+            "abort_flag": 0,
+            "abort_reason": "NONE",
+            "error_code": 0,
+            "error_qp_num": 0,
+            "error_peer": -1,
+            "error_seq": 0,
+            "cqe_reaped": 0,
+            "n_hcas": len(self._hca_report),
+            "active_hcas": 0,
+            "last_error": "",
+        }
+        h = self.h
+        if h is not None and hasattr(h, "health_status"):
+            v = list(h.health_status())
+            if len(v) >= 10:
+                ab = int(v[2])
+                st.update({
+                    "proxy_error": bool(v[0]),
+                    "closed": bool(v[1]) or bool(self._closed),
+                    "abort_flag": ab,
+                    "abort_reason": _V15_ABORT_REASONS.get(ab, f"UNKNOWN({ab})"),
+                    "error_code": int(v[3]),
+                    "error_qp_num": int(v[4]),
+                    "error_peer": int(v[5]),
+                    "error_seq": int(v[6]),
+                    "cqe_reaped": int(v[7]),
+                    "n_hcas": int(v[8]),
+                    "active_hcas": int(v[9]),
+                })
+        if h is not None and hasattr(h, "last_error"):
+            st["last_error"] = str(h.last_error())
+        return st
+
+    def check_health(self, raise_on_error: bool = False) -> bool:
+        """Return True when RDMA transport is healthy. When raise_on_error=True, raises RuntimeError
+        immediately on a fatal QP/CQ error so the supervisor restarts all 8 ranks instead of hanging."""
+        if not self.has_fatal_error():
+            return not self._closed
+        st = self.health_status()
+        msg = (
+            f"rdma_ar v15 fatal error on rank {self.rank}/{self.world}: "
+            f"reason={st['abort_reason']} peer={st['error_peer']} qp={st['error_qp_num']} "
+            f"seq={st['error_seq']} detail={st['last_error']!r}"
+        )
+        logger.error(msg)
+        if raise_on_error:
+            raise RuntimeError(msg)
+        return False
+
+    def abort(self, reason: int = 9) -> None:
+        """Immediately write GPU-visible abort_flag so any spinning kernel unblocks in <1 ms."""
+        h = self.h
+        if h is not None and hasattr(h, "abort"):
+            try:
+                h.abort(int(reason))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("rdma_ar v15 abort(%s) failed: %s", reason, e)
+
+    def close(self, sync_gpu: bool = True, abort_first: bool = True) -> None:
+        """Idempotent ordered teardown: abort_flag -> stop proxies -> drain QPs -> sync GPU -> free MRs/arena."""
+        if self._closed:
+            return
+        self._closed = True
+        self.disabled = True
+        rs_h = self._rs_h
+        self._rs_h = None
+        if rs_h is not None and hasattr(rs_h, "close"):
+            try:
+                rs_h.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("rdma_rs_s8 close failed: %s", e)
+        h = self.h
+        if h is not None:
+            if abort_first and hasattr(h, "abort"):
+                try:
+                    h.abort(10)  # kAbortShutdown
+                except Exception:  # noqa: BLE001
+                    pass
+            if hasattr(h, "close"):
+                try:
+                    h.close(bool(sync_gpu))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("rdma_ar v15 close(sync_gpu=%s) failed: %s", sync_gpu, e)
+            self.h = None
+
+    def destroy(self) -> None:
+        """Alias for ordered teardown, invoked by CudaCommunicator.destroy()."""
+        self.close(sync_gpu=True, abort_first=True)
+
     # -- all-reduce ------------------------------------------------------------------------
     def should_use(self, x: torch.Tensor) -> bool:
-        if self.disabled:
+        if self.disabled or self._closed:
             return False
         nbytes = x.numel() * x.element_size()
         if not (
@@ -791,6 +1200,10 @@ class RdmaAllReduce:
             and 0 < nbytes <= self.max_reduce_bytes
             and nbytes % 16 == 0
         ):
+            return False
+        # v15: When RDMA_AR_RECV_DECOUPLE=1 and 1-shot would be chosen, verify payload fits decoupled recv_stride!
+        two_shot = 0 < self.twoshot_min_bytes <= nbytes
+        if not two_shot and self._recv_decouple and nbytes > max(0, self._recv_stride - 64):
             return False
         return not self._on_aux_stream()
 
@@ -861,7 +1274,7 @@ class RdmaAllReduce:
                 if _L2PF_AFTER is not None:  # w3 rowar
                     _L2PF_AFTER("ar")  # w3 rowar
                 return out  # w3 rowar
-            if _ROW_AR_C28_WIRE and hasattr(self.h, "all_reduce_c32_rows"):
+            if _ROW_AR_C28_WIRE and ROWAR["buf"] is not None and hasattr(self.h, "all_reduce_c32_rows"):
                 ROWAR["used"] += 1
                 out = self.h.all_reduce_c32_rows(x, ROWAR["buf"], two_shot)
                 if _L2PF_AFTER is not None:
@@ -1126,10 +1539,12 @@ class RdmaAllReduce:
 
     # -- all-gather (dim 0 into [world, *x.shape]) ------------------------------------------
     def should_gather(self, x: torch.Tensor) -> bool:
-        if self.disabled or not self.use_gather:
+        if self.disabled or self._closed or not self.use_gather:
             return False
         nbytes = x.numel() * x.element_size()
         if not (x.is_cuda and x.is_contiguous() and 0 < nbytes <= self.max_gather_bytes and nbytes % 16 == 0):
+            return False
+        if self._recv_decouple and nbytes > max(0, self._recv_stride - 64):
             return False
         return not self._on_aux_stream()
 
@@ -1186,7 +1601,16 @@ class RdmaAllReduce:
         """r3 G26 / c32: a tensor of `shape`/`dtype` in a registered send buffer (graph capture only).
         For M <= 16 (C=1), uses the legacy bump allocator (0 change). For M >= 17 with RDMA_AR_SENDBUF_RING=1,
         uses the domain-partitioned 8-slot ring (domain 0=target [0..3], domain 1=drafter [4..7])."""
-        if not _R3_SENDBUF or self.disabled or not torch.cuda.is_current_stream_capturing():  # r6-comm
+        if (
+            not _R3_SENDBUF
+            or self.disabled
+            or self._closed
+            or self.has_fatal_error()
+            or not shape
+            or int(shape[0]) <= 0
+            or not torch.cuda.is_current_stream_capturing()
+            or _is_piecewise_capturing_safe()
+        ):  # r6-comm
             return None  # r6-comm
         esz = getattr(dtype, "itemsize", None)
         if esz is None:
@@ -1265,7 +1689,7 @@ def get_send_buffer(shape, dtype: torch.dtype, max_tokens: int | None = None, do
     if not _R3_SENDBUF:
         return None
     lim = _SBUF_MAX_TOKENS if max_tokens is None else max_tokens
-    if shape[0] <= 0 or shape[0] > lim or not torch.cuda.is_current_stream_capturing():
+    if not shape or shape[0] <= 0 or shape[0] > lim or not torch.cuda.is_current_stream_capturing():
         return None
     try:
         _l2pf_m = _L2PF_MOD_CACHE

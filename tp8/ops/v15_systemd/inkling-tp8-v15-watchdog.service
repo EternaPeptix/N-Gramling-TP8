@@ -1,0 +1,28 @@
+# Wave-V15 Periodic Oneshot Health Watchdog Service (Triggered by inkling-tp8-v15-watchdog.timer)
+# Independent belt-and-suspenders liveness guard sharing /run/inkling-v15/recovery.lock with the supervisor
+# so timer ticks and daemon ticks NEVER race during coordinated 8-node crash recovery!
+[Unit]
+Description=Inkling-2-Small TP8 Wave-V15 Oneshot 8-Node Health Watchdog Probe
+Documentation=file://@V15_INSTALL_DIR@/REPORT.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@V15_USER@
+Group=@V15_USER@
+WorkingDirectory=@V15_INSTALL_DIR@
+EnvironmentFile=-/etc/inkling-v15/supervisor.env
+
+LogsDirectory=inkling-v15
+StateDirectory=inkling-v15
+RuntimeDirectory=inkling-v15
+
+ExecStart=/usr/bin/env python3 @V15_INSTALL_DIR@/v15_health_watchdog.py --once --auto-recover
+TimeoutStartSec=540s
+OOMScoreAdjust=-400
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=inkling-v15-watchdog

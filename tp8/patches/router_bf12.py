@@ -27,18 +27,40 @@ FREE_RAW = os.environ.get(
     "INKLING_ROUTER_BF12_FREE_RAW",
     os.environ.get("INKLING_FREE_PACKED_RAW_WEIGHTS", "0"),
 ).strip().lower() not in ("0", "", "off", "false", "no")
-_LIB_PATH = os.environ.get("INKLING_ROUTER_BF12_LIB", "/rdma/librouter_bf12_exact.so")
+ROUTER_V14 = os.environ.get("INKLING_ROUTER_V14", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
+ROUTER_V14_EARLY_PDL = os.environ.get(
+    "INKLING_ROUTER_V14_EARLY_PDL", "1" if ROUTER_V14 else "0"
+).strip().lower() in ("1", "on", "true", "yes")
+ROUTER_V14_QUANT_FMA = os.environ.get(
+    "INKLING_ROUTER_V14_QUANT_FMA",
+    os.environ.get("INKLING_ROUTER_C32_QUANT_FMA", "1"),
+).strip().lower() not in ("0", "", "off", "false", "no")
+_LIB_PATH = (
+    os.environ.get("INKLING_ROUTER_V14_LIB")
+    or os.environ.get("INKLING_ROUTER_BF12_LIB", "/rdma/librouter_bf12_v14.so")
+) if ROUTER_V14 else os.environ.get("INKLING_ROUTER_BF12_LIB", "/rdma/librouter_bf12_exact.so")
 _LIB = None
 _LIB_TRIED = False
+_HAS_V14 = False
+_V14_LIB_VER = 0
+ROUTER_L2PF_V16 = os.environ.get("INKLING_L2PF_V16", "0").strip().lower() in (
+    "1", "on", "true", "yes"
+)
 
 # (data_ptr, E, H) -> (weakref_w, slabs, outliers, o_off, base_exp)
 _CACHE: dict[tuple[int, int, int], tuple] = {}
+# (data_ptr, E, H) -> (weakref_w, entry11)
+_CACHE_BF11: dict[tuple[int, int, int], tuple] = {}
 # Persistent per-device tiny workspace (partials [5, 16, 384] fp32 = 120 KB)
 _WS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+# Persistent per-device V14 C128 fused workspace (logits [128, 384] f32 + sel_bits [128, 384] u32 + arrive [1] u32)
+_WS_C128: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
 def _get_lib(lib_path: str | None = None):
-    global _LIB, _LIB_TRIED
+    global _LIB, _LIB_TRIED, _HAS_V14, _V14_LIB_VER
     path = lib_path or _LIB_PATH
     if not os.path.exists(path) and lib_path is None:
         local_fallback = os.path.join(os.path.dirname(os.path.abspath(__file__)), "librouter_bf12_exact.so")
@@ -83,8 +105,56 @@ def _get_lib(lib_path: str | None = None):
                 ctypes.c_uint64,  # stream_ptr
             ]
             lib.router_bf12_exact_fwd.restype = ctypes.c_int
+            if hasattr(lib, "router_bf12_v14_version"):
+                lib.router_bf12_v14_version.argtypes = []
+                lib.router_bf12_v14_version.restype = ctypes.c_int
+                _V14_LIB_VER = int(lib.router_bf12_v14_version())
+            if hasattr(lib, "router_bf12_c128_fused_v14_fwd"):
+                lib.router_bf12_c128_fused_v14_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_float, ctypes.c_uint32,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                ]
+                lib.router_bf12_c128_fused_v14_fwd.restype = ctypes.c_int
+                _HAS_V14 = True
+            if hasattr(lib, "router_bf11_c128_fused_v14_fwd"):
+                lib.router_bf11_c128_fused_v14_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_float, ctypes.c_uint32,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                ]
+                lib.router_bf11_c128_fused_v14_fwd.restype = ctypes.c_int
             _LIB = lib
     return _LIB
+
+
+def router_v14_info() -> dict:
+    """Diagnostic summary for Wave-V14 Router BF12/BF11 status."""
+    return {
+        "router_v14": bool(ROUTER_V14),
+        "early_pdl": bool(ROUTER_V14_EARLY_PDL),
+        "quant_fma": bool(ROUTER_V14_QUANT_FMA),
+        "has_v14": bool(_HAS_V14),
+        "lib_ver": int(_V14_LIB_VER),
+        "lib_path": str(_LIB_PATH),
+    }
 
 
 def _get_ws(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -313,7 +383,16 @@ def get_packed_bf11(w: torch.Tensor | None) -> tuple | None:
     """Return cached Wave-V10 lossless BF11-Flip router entry `(slabs11, slab_meta, sflips, bmasks, outliers, o_off, base_exp)`."""
     if not ROUTER_BF11 or w is None or tuple(w.shape) != (384, 4608):
         return None
-    return getattr(w, "_inkling_router_bf11", None)
+    direct = getattr(w, "_inkling_router_bf11", None)
+    if direct is not None:
+        return direct
+    ptr = int(w.data_ptr())
+    if ptr == 0:
+        return None
+    hit = _CACHE_BF11.get((ptr, 384, 4608))
+    if hit is not None and hit[0]() is w:
+        return hit[1]
+    return None
 
 
 @torch.no_grad()
@@ -424,6 +503,9 @@ def prepack_bf11(w: torch.Tensor, flip_thresh: int | None = None) -> tuple | Non
         bmasks = torch.zeros((1, 32), dtype=torch.uint32, device=dev)
 
     entry11 = (slabs11, slab_meta, sflips, bmasks, outliers, o_off, int(base_exp))
+    ptr = int(w.data_ptr())
+    if ptr != 0:
+        _CACHE_BF11[(ptr, 384, 4608)] = (weakref.ref(w), entry11)
     try:
         w._inkling_router_bf11 = entry11  # type: ignore[attr-defined]
     except Exception:
@@ -431,8 +513,42 @@ def prepack_bf11(w: torch.Tensor, flip_thresh: int | None = None) -> tuple | Non
     return entry11
 
 
+def _c32_uses_bf12_for_m(num_tokens: int) -> bool:
+    try:
+        from . import moe_c32_runtime as _c32
+        if hasattr(_c32, "will_use_bf12_gate"):
+            return bool(_c32.will_use_bf12_gate(int(num_tokens)))
+    except Exception:
+        pass
+    mode = (
+        os.environ.get("INKLING_C32_ROUTER_MODE", "").strip().lower()
+        or os.environ.get("INKLING_MOE_C32_ROUTER_MODE", "bf12").strip().lower()
+    )
+    return mode in ("bf12", "bf11", "auto", "1", "on", "true") and int(num_tokens) <= 256
+
+
 def l2pf_tensor(w: torch.Tensor | None, num_tokens: int | None = None) -> torch.Tensor | None:
     if not ENABLED or w is None or tuple(w.shape) != (384, 4608):
+        return w
+    if ROUTER_L2PF_V16:
+        raw_freed = w.untyped_storage().size() == 0
+        m_i = None if num_tokens is None else int(num_tokens)
+        use_packed = (
+            raw_freed
+            or m_i is None
+            or m_i <= 16
+            or (m_i <= 128 and (ROUTER_V14 or _c32_uses_bf12_for_m(m_i)))
+            or (m_i <= 256 and _c32_uses_bf12_for_m(m_i))
+        )
+        if not use_packed:
+            return w
+        if ROUTER_BF11:
+            hit11 = get_packed_bf11(w)
+            if hit11 is not None:
+                return hit11[0]
+        hit = get_packed(w)
+        if hit is not None:
+            return hit[1]
         return w
     if ROUTER_BF11:
         hit11 = get_packed_bf11(w)
@@ -444,8 +560,27 @@ def l2pf_tensor(w: torch.Tensor | None, num_tokens: int | None = None) -> torch.
     if w.untyped_storage().size() == 0:
         return hit[1]
     if num_tokens is not None and num_tokens > 16:
+        # Wave-V14 fix: when C=4..32 runs the BF12/BF11 router (`will_use_bf12_gate(M)`),
+        # prefetch the active 2.654 MB BF12 slabs instead of the unused 3.54 MB raw BF16 `w`!
+        if ROUTER_V14 and _c32_uses_bf12_for_m(int(num_tokens)):
+            return hit[1]
         return w
     return hit[1]
+
+
+def router_l2pf_info(w: torch.Tensor | None, num_tokens: int | None = None) -> dict:
+    """Diagnostic summary of active L2PF router slab resolution (BF11 2.43 MB / BF12 2.65 MB / BF16 3.54 MB)."""
+    tgt = l2pf_tensor(w, num_tokens=num_tokens)
+    hit11 = get_packed_bf11(w) if ROUTER_BF11 else None
+    hit12 = get_packed(w)
+    if hit11 is not None and tgt is hit11[0]:
+        fmt = "bf11"
+    elif hit12 is not None and tgt is hit12[1]:
+        fmt = "bf12"
+    else:
+        fmt = "bf16"
+    nbytes = int(tgt.numel() * tgt.element_size()) if isinstance(tgt, torch.Tensor) else 0
+    return {"format": fmt, "bytes": nbytes, "num_tokens": num_tokens, "v16": bool(ROUTER_L2PF_V16)}
 
 
 def route_bf12(
@@ -497,15 +632,19 @@ def route_bf12(
     device = x.device
     nvfp4 = weight_amax is not None
     num_local = counts.numel()
+    _pdl_eff = int(pdl) if not isinstance(pdl, bool) else (2 if pdl else 0)
+    if ROUTER_V14_EARLY_PDL and _pdl_eff == 2:
+        # Wave-V14: upgrade C=1..2 late W13 trigger (2) -> early Last-CTA election trigger (3)
+        # so W13 launches onto the 47 freed SMs while Last CTA finishes Phase-3 route/placement!
+        _pdl_eff = 3
     # Dec160 S8 fast path: 48-CTA zero-tail K1 + 1-CTA Zero-Scatter SMEM-Route K2
     try:
         from . import moe_s8_runtime as _s8
         if _s8.S8_ROUTER or _s8.S8_ZERO_SCATTER or _s8.S8_FUSE_SITU:
-            _pdl_i = int(pdl) if not isinstance(pdl, bool) else (2 if pdl else 0)
             _s8_res = _s8.route_bf12_s8(
                 x, slabs, outliers, o_off, int(base_exp), bias, topk, float(route_scale),
                 expert_bounds, plan, weight_amax, weight_denominator, int(num_local),
-                is_padding=is_padding, nlive_buf=nlive_buf, pdl=_pdl_i,
+                is_padding=is_padding, nlive_buf=nlive_buf, pdl=_pdl_eff,
                 gate_weight=gate_weight if ROUTER_BF11 else None,
             )
             if _s8_res is not None:
@@ -562,9 +701,131 @@ def route_bf12(
         int(plan.tile),
         int(plan.max_ctas),
         1 if nvfp4 else 0,
-        int(pdl) if not isinstance(pdl, bool) else (2 if pdl else 0),
+        _pdl_eff,
         int(torch.cuda.current_stream().cuda_stream),
     )
     if rc != 0:
         raise RuntimeError(f"router_bf12_exact_fwd failed with cudaError={rc}")
     return (src2dst, gammas, routed, tiles), quantized
+
+
+def _get_ws_c128(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    idx = device.index or 0
+    ws = _WS_C128.get(idx)
+    if ws is None:
+        logits_ws = torch.empty((128, 384), dtype=torch.float32, device=device)
+        selbits_ws = torch.empty((128, 384), dtype=torch.uint32, device=device)
+        arrive = torch.zeros((1,), dtype=torch.uint32, device=device)
+        ws = (logits_ws, selbits_ws, arrive)
+        _WS_C128[idx] = ws
+    return ws
+
+
+def route_bf12_v14_c128(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    bias: torch.Tensor,
+    expert_bounds: torch.Tensor,
+    starts: torch.Tensor,
+    starts_compact: torch.Tensor,
+    src2dst: torch.Tensor,
+    src2compact: torch.Tensor,
+    gammas: torch.Tensor,
+    rows: torch.Tensor,
+    tiles: torch.Tensor,
+    tile_compact_start: torch.Tensor,
+    row2tok: torch.Tensor,
+    row_amax_w2: torch.Tensor | None,
+    q_values: torch.Tensor,
+    q_scales: torch.Tensor,
+    q_row_scales: torch.Tensor | None,
+    row_amax_in: torch.Tensor | None,
+    weight_amax: torch.Tensor | None,
+    weight_denominator: torch.Tensor | None,
+    route_scale: float,
+    num_local: int,
+    tile_sz: int,
+    max_ctas: int,
+    is_padding: torch.Tensor | None = None,
+    nlive_buf: torch.Tensor | None = None,
+    quant_fma: bool | None = None,
+    pdl: int = 3,
+    lib_path: str | None = None,
+) -> bool:
+    """Opt-in Wave-V14 single-launch 48-CTA fused router for T = 1..128 (zero-scatter, 1.000x slab read).
+
+    Preserves Wave-V13 0-ULP `1dcfb306` (`quant_fma=True` default). Returns True on dispatch, False if unavailable.
+    """
+    tokens, hidden = int(x.shape[0]), int(x.shape[1])
+    if (
+        not ROUTER_V14
+        or not ENABLED
+        or tokens <= 0
+        or tokens > 128
+        or hidden != 4608
+        or tuple(gate_weight.shape) != (384, 4608)
+    ):
+        return False
+    lib = _get_lib(lib_path)
+    if lib is None or not _HAS_V14:
+        return False
+    entry = get_packed(gate_weight)
+    if entry is None:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        prepack(gate_weight)
+        entry = get_packed(gate_weight)
+        if entry is None:
+            return False
+    _, slabs, outliers, o_off, base_exp = entry
+    logits_ws, selbits_ws, arrive = _get_ws_c128(x.device)
+    nvfp4 = 1 if weight_amax is not None else 0
+    qfma = 1 if (ROUTER_V14_QUANT_FMA if quant_fma is None else bool(quant_fma)) else 0
+    stream = int(torch.cuda.current_stream(x.device).cuda_stream)
+
+    entry11 = get_packed_bf11(gate_weight) if ROUTER_BF11 else None
+    if entry11 is not None and hasattr(lib, "router_bf11_c128_fused_v14_fwd"):
+        slabs11, slab_meta, sflips, bmasks, out11, ooff11, be11 = entry11
+        rc = lib.router_bf11_c128_fused_v14_fwd(
+            x.data_ptr(), slabs11.data_ptr(), slab_meta.data_ptr(), sflips.data_ptr(), bmasks.data_ptr(),
+            out11.data_ptr(), ooff11.data_ptr(),
+            bias.data_ptr(), expert_bounds.data_ptr(),
+            0 if is_padding is None else is_padding.data_ptr(),
+            0 if nlive_buf is None else nlive_buf.data_ptr(),
+            logits_ws.data_ptr(), selbits_ws.data_ptr(), arrive.data_ptr(),
+            starts.data_ptr(), starts_compact.data_ptr(),
+            src2dst.data_ptr(), src2compact.data_ptr(), gammas.data_ptr(), rows.data_ptr(),
+            tiles.data_ptr(), tile_compact_start.data_ptr(), row2tok.data_ptr(),
+            0 if row_amax_w2 is None else row_amax_w2.data_ptr(),
+            q_values.data_ptr(), q_scales.data_ptr(),
+            0 if q_row_scales is None else q_row_scales.data_ptr(),
+            0 if row_amax_in is None else row_amax_in.data_ptr(),
+            0 if weight_amax is None else weight_amax.data_ptr(),
+            0 if weight_denominator is None else weight_denominator.data_ptr(),
+            tokens, float(route_scale), int(be11),
+            int(num_local), int(tile_sz), int(max_ctas),
+            nvfp4, qfma, int(pdl), stream,
+        )
+    else:
+        rc = lib.router_bf12_c128_fused_v14_fwd(
+            x.data_ptr(), slabs.data_ptr(), outliers.data_ptr(), o_off.data_ptr(),
+            bias.data_ptr(), expert_bounds.data_ptr(),
+            0 if is_padding is None else is_padding.data_ptr(),
+            0 if nlive_buf is None else nlive_buf.data_ptr(),
+            logits_ws.data_ptr(), selbits_ws.data_ptr(), arrive.data_ptr(),
+            starts.data_ptr(), starts_compact.data_ptr(),
+            src2dst.data_ptr(), src2compact.data_ptr(), gammas.data_ptr(), rows.data_ptr(),
+            tiles.data_ptr(), tile_compact_start.data_ptr(), row2tok.data_ptr(),
+            0 if row_amax_w2 is None else row_amax_w2.data_ptr(),
+            q_values.data_ptr(), q_scales.data_ptr(),
+            0 if q_row_scales is None else q_row_scales.data_ptr(),
+            0 if row_amax_in is None else row_amax_in.data_ptr(),
+            0 if weight_amax is None else weight_amax.data_ptr(),
+            0 if weight_denominator is None else weight_denominator.data_ptr(),
+            tokens, float(route_scale), int(base_exp),
+            int(num_local), int(tile_sz), int(max_ctas),
+            nvfp4, qfma, int(pdl), stream,
+        )
+    if rc != 0:
+        raise RuntimeError(f"router_bf12_c128_fused_v14_fwd failed with cudaError={rc}")
+    return True

@@ -1006,18 +1006,23 @@ class SlidingWindowSpec(AttentionSpec):
         else:
             periodic_blocks = cdiv(num_tokens, max(self.block_size, ret)) * need_max
         dbo_blocks = 0
-        if (not self.is_draft) and os.environ.get(
-            "INKLING_PREFILL_AR_OVERLAP", "0"
-        ).strip().lower() not in ("0", "", "off", "false", "no"):
+        dbo_raw = os.environ.get("INKLING_PREFILL_AR_OVERLAP", "0").strip().lower()
+        if (not self.is_draft) and dbo_raw not in ("0", "", "off", "false", "no"):
             dbo_min_t = int(
                 os.environ.get("INKLING_PREFILL_AR_OVERLAP_MIN_T", "8192") or "8192"
             )
             if dbo_min_t > 0 and max_in_flight_tokens >= dbo_min_t:
-                # Up to 2 in-flight DBO chunks x (cdiv(sw-1, bs) + 2) midpoint blocks.
-                dbo_blocks = 2 * (cdiv(self.sliding_window - 1, self.block_size) + 2)
+                # Up to 2 in-flight DBO chunks x splits_per_chunk x (cdiv(sw-1, bs) + 2)
+                # midpoint blocks (3-microbatch TBO has 2 split points per chunk).
+                splits_per_chunk = 2 if dbo_raw in ("3", "tbo", "3mb") else 1
+                dbo_blocks = (
+                    2 * splits_per_chunk * (cdiv(self.sliding_window - 1, self.block_size) + 2)
+                )
         draft_warm_slack = 0
         if self.is_draft:
-            draft_warm_slack = max(
+            # Up to 2 disjoint reachable-boundary regions (prompt replay tail
+            # + shared-prefix junction), each receiving extra_slack blocks.
+            draft_warm_slack = 2 * max(
                 0,
                 int(os.environ.get("INKLING_DRAFT_SWA_WARM_SLACK_BLKS", "8") or "8"),
             )
@@ -1050,6 +1055,7 @@ class SlidingWindowSpec(AttentionSpec):
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
             and spec.sparse_prefill_discard == self.sparse_prefill_discard
+            and spec.sparse_retention_interval == self.sparse_retention_interval
             for spec in kv_cache_specs.values()
         )
 

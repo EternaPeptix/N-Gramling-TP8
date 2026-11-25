@@ -410,8 +410,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def all_reduce(self, input_):
         rdma_comm = self.rdma_comm
-        if rdma_comm is not None and rdma_comm.should_use(input_):
-            return rdma_comm.all_reduce(input_)
+        if rdma_comm is not None:
+            if rdma_comm.should_use(input_):
+                return rdma_comm.all_reduce(input_)
+            # v15: Never silently fall through to PyNCCL (600s hang) when RDMA proxy has latched a fatal QP error!
+            if getattr(rdma_comm, "has_fatal_error", None) is not None and rdma_comm.has_fatal_error():
+                rdma_comm.check_health(raise_on_error=True)
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
@@ -518,27 +522,38 @@ class CudaCommunicator(DeviceCommunicatorBase):
             dim += input_.dim()
         rdma_comm = self.rdma_comm
         if rdma_comm is not None:
-            input_c = input_.contiguous()
-            if rdma_comm.should_gather(input_c):
-                # g2 colltrim (a), DSV41_RDMA_AG_COLS=1: the kernel writes each rank's slice
-                # straight into the concatenated tensor (no staging tensor, no movedim copy).
-                if dim != 0 and getattr(rdma_comm, "ag_cols", False):
-                    out = rdma_comm.all_gather_cols(input_c, dim)
-                    if out is not None:
-                        return out
-                # [world, *shape] -> concat along `dim`, same layout as the PyNccl path.
-                input_size = input_c.size()
-                stacked = rdma_comm.all_gather_stacked(input_c)
-                if dim == 0:
+            if getattr(rdma_comm, "has_fatal_error", None) is not None and rdma_comm.has_fatal_error():
+                rdma_comm.check_health(raise_on_error=True)
+            # v15: Avoid unnecessary .contiguous() allocation on large prefill tensors before checking RDMA eligibility.
+            _ag_nbytes = input_.numel() * input_.element_size()
+            if (
+                not rdma_comm.disabled
+                and rdma_comm.use_gather
+                and input_.is_cuda
+                and 0 < _ag_nbytes <= rdma_comm.max_gather_bytes
+                and _ag_nbytes % 16 == 0
+            ):
+                input_c = input_.contiguous()
+                if rdma_comm.should_gather(input_c):
+                    # g2 colltrim (a), DSV41_RDMA_AG_COLS=1: the kernel writes each rank's slice
+                    # straight into the concatenated tensor (no staging tensor, no movedim copy).
+                    if dim != 0 and getattr(rdma_comm, "ag_cols", False):
+                        out = rdma_comm.all_gather_cols(input_c, dim)
+                        if out is not None:
+                            return out
+                    # [world, *shape] -> concat along `dim`, same layout as the PyNccl path.
+                    input_size = input_c.size()
+                    stacked = rdma_comm.all_gather_stacked(input_c)
+                    if dim == 0:
+                        return stacked.reshape(
+                            (self.world_size * input_size[0],) + tuple(input_size[1:])
+                        )
+                    stacked = stacked.movedim(0, dim)
                     return stacked.reshape(
-                        (self.world_size * input_size[0],) + tuple(input_size[1:])
+                        tuple(input_size[:dim])
+                        + (self.world_size * input_size[dim],)
+                        + tuple(input_size[dim + 1 :])
                     )
-                stacked = stacked.movedim(0, dim)
-                return stacked.reshape(
-                    tuple(input_size[:dim])
-                    + (self.world_size * input_size[dim],)
-                    + tuple(input_size[dim + 1 :])
-                )
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
@@ -908,6 +923,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        if getattr(self, "rdma_comm", None) is not None:
+            try:
+                if hasattr(self.rdma_comm, "destroy"):
+                    self.rdma_comm.destroy()
+                elif hasattr(self.rdma_comm, "close"):
+                    self.rdma_comm.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to destroy rdma_comm cleanly: %s", e)
+            self.rdma_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None

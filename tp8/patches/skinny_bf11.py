@@ -44,18 +44,49 @@ V5_C1 = os.environ.get("INKLING_BF11_V5_C1", "1").strip().lower() not in ("0", "
 V5_C32 = os.environ.get("INKLING_BF11_V5_C32", "1").strip().lower() not in ("0", "", "off", "false", "no")
 # Wave-V12 C=1..8 (M=1..48+) opt-in flags (ALL strictly default-OFF!)
 V12_ENABLED = os.environ.get("INKLING_BF11_V12", "0").strip().lower() in ("1", "true", "on", "yes")
-V12_BM48 = os.environ.get("INKLING_BF11_V12_BM48", "1" if V12_ENABLED else "0").strip().lower() in ("1", "true", "on", "yes")
-V12_FAST_UNPACK = os.environ.get("INKLING_BF11_V12_FAST_UNPACK", "1" if V12_ENABLED else "0").strip().lower() in ("1", "true", "on", "yes")
-FREE_RAW_SAFE = os.environ.get("INKLING_BF11_FREE_RAW_SAFE", "1" if V12_ENABLED else "0").strip().lower() in ("1", "true", "on", "yes")
-FUSE_DYN_STRICT = os.environ.get("INKLING_BF11_FUSE_DYN_STRICT", "1" if V12_ENABLED else "0").strip().lower() in ("1", "true", "on", "yes")
+# Wave-V13 Decode-Only + Split-First + M=33..64 W=4 opt-in flags (ALL strictly default-OFF!)
+V13_ENABLED = os.environ.get("INKLING_BF11_V13", "0").strip().lower() in ("1", "true", "on", "yes")
+C32_DECODE_ONLY = os.environ.get(
+    "INKLING_BF11_C32_DECODE_ONLY",
+    "1" if V13_ENABLED else "0",
+).strip().lower() in ("1", "true", "on", "yes")
+V13_ALLOW_GT64 = os.environ.get("INKLING_BF11_V13_ALLOW_GT64", "0").strip().lower() in ("1", "true", "on", "yes")
+if V13_ENABLED and not V13_ALLOW_GT64 and C32_MAX_M > 64:
+    # Wave-V13 roofline hard cap: M>64 (e.g. C=32 M=128) strictly falls back to cuBLASLt torch.mm
+    # to eliminate Split-K partial-buffer DRAM round-trips (572.5 MB/step @ M=128) and L2PF thrash.
+    C32_MAX_M = 64
+V12_BM48 = os.environ.get("INKLING_BF11_V12_BM48", "1" if (V12_ENABLED or V13_ENABLED) else "0").strip().lower() in ("1", "true", "on", "yes")
+V12_FAST_UNPACK = os.environ.get("INKLING_BF11_V12_FAST_UNPACK", "1" if (V12_ENABLED or V13_ENABLED) else "0").strip().lower() in ("1", "true", "on", "yes")
+FREE_RAW_SAFE = os.environ.get("INKLING_BF11_FREE_RAW_SAFE", "1" if (V12_ENABLED or V13_ENABLED) else "0").strip().lower() in ("1", "true", "on", "yes")
+FREE_RAW_FORCE = os.environ.get("INKLING_BF11_FREE_RAW_FORCE", "0").strip().lower() in ("1", "true", "on", "yes")
+FUSE_DYN_STRICT = os.environ.get("INKLING_BF11_FUSE_DYN_STRICT", "1" if (V12_ENABLED or V13_ENABLED) else "0").strip().lower() in ("1", "true", "on", "yes")
+# Wave-V15 opt-in startup self-check ("0"=OFF, "1"=audit & log, "strict"=audit & raise on critical failure)
+_AUDIT_V15_RAW = os.environ.get("INKLING_MOE_DENSE_AUDIT_V15", "0").strip().lower()
+AUDIT_V15_ENABLED = _AUDIT_V15_RAW not in ("0", "", "off", "false", "no")
+AUDIT_V15_STRICT = _AUDIT_V15_RAW in ("strict", "2", "fail")
+_AUDIT_V15_DONE = False
+_V15_COMPLETE_BUCKETS = os.environ.get(
+    "INKLING_BF11_V15_COMPLETE_BUCKETS", "1" if V13_ENABLED else "0"
+).strip().lower() in ("1", "true", "on", "yes")
+# Wave-V16 opt-in Dynamic-K (K=7->11/15: M=8,12,16 @ C=1 + M=16..64 @ B=2..8) complete bucket synergy (default OFF)
+V16_DYNK_BUCKETS = os.environ.get("INKLING_BF11_V16_DYNK_BUCKETS", "0").strip().lower() in (
+    "1", "true", "on", "yes"
+)
+_V16_DYNK_EXTEND = os.environ.get("INKLING_DYN_K_EXTEND_V16", "0").strip().lower() in (
+    "1", "true", "on", "yes"
+)
 _LIB_PATH = os.environ.get(
     "INKLING_BF11_LIB",
-    "/rdma/libbf11_flip_exact_v12.so"
-    if V12_ENABLED
+    "/rdma/libbf11_flip_exact_v13.so"
+    if V13_ENABLED
     else (
-        "/rdma/libbf11_flip_exact_v5.so"
-        if V5_ENABLED
-        else ("/rdma/libbf11_flip_exact_c32.so" if C32_ENABLED else "/rdma/libbf11_flip_exact.so")
+        "/rdma/libbf11_flip_exact_v12.so"
+        if V12_ENABLED
+        else (
+            "/rdma/libbf11_flip_exact_v5.so"
+            if V5_ENABLED
+            else ("/rdma/libbf11_flip_exact_c32.so" if C32_ENABLED else "/rdma/libbf11_flip_exact.so")
+        )
     ),
 )
 _LIB = None
@@ -67,16 +98,40 @@ _HAS_V5 = False
 _HAS_V9_DYN = False
 _HAS_V12 = False
 _HAS_V12_UNPACK = False
+_HAS_V13 = False
 # (N_dyn, K, M) -> (dyn_mode, dyn_split_k, torch_exact) or None (fail-closed)
 _DYN_QUAL: dict[tuple[int, int, int], tuple[int, int, bool] | None] = {}
 _DYN_QUAL_PREWARMED: set[tuple[int, int]] = set()
 _C32_QUAL_OK: dict[tuple[int, int, int], bool] = {}  # (N, K, M) -> 0-ULP verified
 _C32_TORCH_EXACT: dict[tuple[int, int, int], bool] = {}  # (N, K, M) -> literal torch.mm bit-identical
 _C32_DUAL_QUAL_OK: dict[tuple[int, int, int], bool] = {}  # (N_each, K, M) -> 0-ULP verified
-_C32_CANONICAL_MS = (24, 32, 36, 48, 60, 64, 72, 96, 112, 128, 160, 192, 224, 256)
+_C32_CANONICAL_MS = (
+    (
+        *range(17, 65),
+        68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128,
+        160, 192, 224, 256,
+    )
+    if V16_DYNK_BUCKETS
+    else (
+        (
+            *range(17, 33),
+            36, 40, 42, 44, 48, 52, 56, 60, 64,
+            68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128,
+            160, 192, 224, 256,
+        )
+        if _V15_COMPLETE_BUCKETS
+        else (24, 32, 36, 48, 60, 64, 72, 96, 112, 128, 160, 192, 224, 256)
+    )
+)
+# Wave-V15/V16 bucket completeness: cover EVERY integer M=17..64 (100% of K=0 & SPEC_BATCH_SCHEDULE
+# & V16 Dynamic-K K=7..15 & hetero waterfill buckets with ZERO silent capture-time fallbacks!) plus every 4*B up to 128.
 _C32_CANONICAL_MS_EXACT = (
-    (*range(17, 49), 52, 54, 56, 57, 60, 64, 66, 72, 75, 80, 84, 88, 96, 100, 104, 112, 120, 128, 160, 192, 224, 256)
-    if V12_ENABLED
+    (
+        *range(17, 65),
+        66, 68, 72, 75, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128,
+        160, 192, 224, 256,
+    )
+    if (V12_ENABLED or V13_ENABLED or _V15_COMPLETE_BUCKETS or V16_DYNK_BUCKETS)
     else (18, 20, 21, 22, 24, 25, 26, 28, 30, 32, 33, 35, 36, 40, 42, 44, 45, 48, 49, 52, 54, 56, 57, 60, 64, 66, 72, 75, 80, 84, 88, 96, 100, 104, 112, 120, 128, 160, 192, 224, 256)
 )
 _C32_EXTRA_MS = tuple(
@@ -87,7 +142,7 @@ _C32_EXTRA_MS = tuple(
 
 
 def _get_lib():
-    global _LIB, _LIB_TRIED, _HAS_C32, _HAS_V5, _HAS_V9_DYN, _HAS_V12, _HAS_V12_UNPACK
+    global _LIB, _LIB_TRIED, _HAS_C32, _HAS_V5, _HAS_V9_DYN, _HAS_V12, _HAS_V12_UNPACK, _HAS_V13
     if not _LIB_TRIED:
         _LIB_TRIED = True
         if os.path.exists(_LIB_PATH):
@@ -260,6 +315,19 @@ def _get_lib():
                     ]
                     lib.bf11_unpack_bf16_v12_fwd.restype = ctypes.c_int
                     _HAS_V12_UNPACK = True
+                if (
+                    _HAS_V5
+                    and hasattr(lib, "bf11_flip_v13_version")
+                    and hasattr(lib, "bf11_flip_v13_c32_fwd")
+                    and hasattr(lib, "bf11_flip_dual_kv_v13_c32_fwd")
+                ):
+                    lib.bf11_flip_v13_version.argtypes = []
+                    lib.bf11_flip_v13_version.restype = ctypes.c_int
+                    lib.bf11_flip_v13_c32_fwd.argtypes = list(lib.bf11_flip_v5_c32_fwd.argtypes)
+                    lib.bf11_flip_v13_c32_fwd.restype = ctypes.c_int
+                    lib.bf11_flip_dual_kv_v13_c32_fwd.argtypes = list(lib.bf11_flip_dual_kv_v5_c32_fwd.argtypes)
+                    lib.bf11_flip_dual_kv_v13_c32_fwd.restype = ctypes.c_int
+                    _HAS_V13 = True
                 _LIB = lib
             except Exception as e:
                 print(f"[inkling-bf11] failed to load {_LIB_PATH}: {e!r}", flush=True)
@@ -367,7 +435,7 @@ def _rowar_nlive_ptr(M: int) -> int:
         from vllm.distributed.device_communicators import rdma_all_reduce as rar
         if rar.ROWAR.get("scope") == M:
             buf = rar.ROWAR.get("buf")
-            if buf is not None:
+            if buf is not None and buf.numel() > 0 and buf.dtype == torch.int32:
                 return int(buf.data_ptr())
     except Exception:
         pass
@@ -515,16 +583,19 @@ def prepack(w: torch.Tensor) -> torch.Tensor | None:
     min_sem = max(_MIN_SEM_TILES, 2 * n_tiles)
     if V5_ENABLED and C32_ENABLED and split in (6, 9):
         max_m_sp = min(C32_MAX_M, 128) if N > 512 else C32_MAX_M
-        m_pad_sp = (
-            max(((max_m_sp + 127) // 128) * 128, ((max_m_sp + 47) // 48) * 48)
-            if (V12_ENABLED or C32_BM == 48)
-            else (((max_m_sp + 127) // 128) * 128)
-        )
+        if V13_ENABLED:
+            m_pad_sp = _v5_c32_mpad(max_m_sp)
+        else:
+            m_pad_sp = (
+                max(((max_m_sp + 127) // 128) * 128, ((max_m_sp + 47) // 48) * 48)
+                if (V12_ENABLED or C32_BM == 48)
+                else (((max_m_sp + 127) // 128) * 128)
+            )
         n_pad_sp = ((N + 31) // 32) * 32
         dual_mult = 2 if N <= 256 else 1
         min_part = max(min_part, dual_mult * split * m_pad_sp * n_pad_sp)
-        sem_n = (n_pad_sp // 8) if V12_ENABLED else ((N + 7) // 8)
-        min_sem = max(min_sem, dual_mult * sem_n * ((C32_MAX_M + 31) // 32))
+        sem_n = (n_pad_sp // 8) if (V12_ENABLED or V13_ENABLED) else ((N + 7) // 8)
+        min_sem = max(min_sem, dual_mult * sem_n * ((max_m_sp + 31) // 32))
     _ensure_scratch(w.device, min_part, min_sem)
     entry = (slabs, flips, warp_meta, outliers, o_off, base, ks, n_active, cfg_id, split, n_tiles, bn)
     _CACHE[key] = entry
@@ -613,12 +684,28 @@ def build_v5_sidecar(w: torch.Tensor, flip_thresh: int | None = None):
     return sc
 
 
+def _v5_c32_mpad(M: int) -> int:
+    if C32_BM in (32, 48, 64, 128):
+        return ((M + C32_BM - 1) // C32_BM) * C32_BM
+    if V13_ENABLED:
+        if M <= 32:
+            return 32
+        if M <= 48:
+            return 48
+        if M <= 64:
+            return 64
+        if M <= 96:
+            return 128
+        return ((M + 127) // 128) * 128
+    return (((M + 47) // 48) * 48) if (C32_BM == 48) else (((M + 127) // 128) * 128)
+
+
 def _v5_c32_scratch_req(M: int, N: int, split: int, dual: bool = False) -> tuple[int, int]:
-    m_pad = (((M + 47) // 48) * 48) if (C32_BM == 48) else (((M + 127) // 128) * 128)
+    m_pad = _v5_c32_mpad(M)
     n_pad = ((N + 31) // 32) * 32
     mult = 2 if dual else 1
     need_p = mult * split * m_pad * n_pad
-    need_s = mult * ((n_pad // 8) if V12_ENABLED else ((N + 7) // 8)) * ((M + 31) // 32)
+    need_s = mult * ((n_pad // 8) if (V12_ENABLED or V13_ENABLED) else ((N + 7) // 8)) * ((M + 31) // 32)
     return need_p, need_s
 
 
@@ -740,7 +827,10 @@ def free_raw_weight(w: torch.Tensor) -> int:
         return 0
     if FREE_RAW_SAFE:
         # Guard against v9 live 4.5x/16.7W unpack_bf16() capture storm:
-        # NEVER free raw BF16 storage unless C=4/8/32 active buckets are actually qualified!
+        # NEVER free raw BF16 storage when C32_DECODE_ONLY=1 (prefill needs raw BF16!),
+        # when C32_MAX_M < 128 (C=32 M=128 needs raw BF16!), or when C=4/8 buckets are unqualified!
+        if (C32_DECODE_ONLY or C32_MAX_M < 128) and not FREE_RAW_FORCE:
+            return 0
         _get_lib()
         if not C32_ENABLED or not _HAS_C32:
             return 0
@@ -760,8 +850,83 @@ _L2PF_MULTI = os.environ.get("INKLING_BF11_L2PF_MULTI", "0").strip().lower() not
 _L2PF_FLIPS_BYTES = int(os.environ.get("INKLING_BF11_L2PF_FLIPS_KB", "128")) * 1024
 
 
+def _is_strict_decode_capturing() -> bool:
+    """Bulletproof fail-closed DECODE-ONLY CUDA graph capture predicate (Wave-V13).
+
+    Returns True ONLY when ALL 5 independent invariants hold simultaneously:
+      1. `torch.cuda.is_current_stream_capturing()` is True (blocks ALL eager prefill/decode).
+      2. `l2pf._is_piecewise_capturing()` is False (blocks breakable PIECEWISE prefill capture).
+      3. `is_forward_context_available()` is True AND `fc.cudagraph_runtime_mode == CUDAGraphMode.FULL`
+         (fixes V12's fail-open `return True` fallback and rejects NONE / PIECEWISE).
+      4. `fc.batch_descriptor` is present with `uniform == True`, `cg_mode == FULL` (if set),
+         and `num_reqs > 0` (if set) — matching `cuda_communicator_rdma.py:952-955`.
+      5. `fc.attn_metadata` is a non-empty dict where EVERY attention metadata entry reports
+         `num_prefill_tokens == 0` & `num_prefill_reqs == 0` AND at least ONE entry reports
+         `num_decode_reqs > 0` (rejects dummy `attn_metadata=None` PIECEWISE graphs and any
+         prefill/mixed batch; matches `attention.py:195-209, 856-862` and `model_l2pf.py:884-892`).
+
+    Any missing metadata, unexpected state, or exception strictly fails CLOSED (`return False`).
+    """
+    try:
+        if not torch.cuda.is_current_stream_capturing():
+            return False
+    except Exception:
+        return False
+    try:
+        from . import l2pf
+        if l2pf._is_piecewise_capturing():
+            return False
+    except ImportError:
+        pass
+    except Exception:
+        return False
+    try:
+        from vllm.config.compilation import CUDAGraphMode
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+
+        if not is_forward_context_available():
+            return False
+        fc = get_forward_context()
+        if getattr(fc, "cudagraph_runtime_mode", None) != CUDAGraphMode.FULL:
+            return False
+        bd = getattr(fc, "batch_descriptor", None)
+        if bd is None or not bool(getattr(bd, "uniform", False)):
+            return False
+        bd_cg = getattr(bd, "cg_mode", None)
+        if bd_cg is not None and bd_cg != CUDAGraphMode.FULL:
+            return False
+        bd_reqs = getattr(bd, "num_reqs", None)
+        if bd_reqs is not None and int(bd_reqs) <= 0:
+            return False
+        amd = getattr(fc, "attn_metadata", None)
+        if not isinstance(amd, dict) or len(amd) == 0:
+            return False
+        saw_decode_md = False
+        for md in amd.values():
+            if md is None:
+                continue
+            has_pf_tok = hasattr(md, "num_prefill_tokens")
+            has_pf_req = hasattr(md, "num_prefill_reqs")
+            has_dec_req = hasattr(md, "num_decode_reqs")
+            if has_pf_tok and int(getattr(md, "num_prefill_tokens")) != 0:
+                return False
+            if has_pf_req and int(getattr(md, "num_prefill_reqs")) != 0:
+                return False
+            if has_pf_tok and has_dec_req:
+                if int(getattr(md, "num_decode_reqs")) <= 0:
+                    return False
+                if hasattr(md, "num_decode_tokens") and int(getattr(md, "num_decode_tokens")) <= 0:
+                    return False
+                saw_decode_md = True
+        return saw_decode_md
+    except Exception:
+        return False
+
+
 def _is_full_decode_capturing() -> bool:
     """True ONLY inside FULL decode CUDA graph capture (never eager or PIECEWISE prefill)."""
+    if C32_DECODE_ONLY or V13_ENABLED:
+        return _is_strict_decode_capturing()
     if not torch.cuda.is_current_stream_capturing():
         return False
     try:
@@ -769,7 +934,7 @@ def _is_full_decode_capturing() -> bool:
         if l2pf._is_piecewise_capturing():
             return False
     except Exception:
-        pass
+        return False
     try:
         from vllm.config.compilation import CUDAGraphMode
         from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -777,8 +942,8 @@ def _is_full_decode_capturing() -> bool:
         if is_forward_context_available():
             return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
     except Exception:
-        pass
-    return True
+        return False
+    return False
 
 
 def _bf16_ulp_diff(a: torch.Tensor, b: torch.Tensor) -> int:
@@ -805,12 +970,20 @@ def will_use_bf11(w: torch.Tensor | None, num_tokens: int | None = None) -> bool
         return False
     if get_packed(w) is None:
         return False
+    if num_tokens is not None and num_tokens <= 0:
+        return False
     if num_tokens is None or num_tokens <= 16:
         return True
     if not C32_ENABLED or num_tokens > C32_MAX_M:
         return False
     if C32_MIN_N > 0 and int(w.shape[0]) < C32_MIN_N:
         return False
+    if C32_DECODE_ONLY:
+        try:
+            if torch.cuda.is_current_stream_capturing() and not _is_strict_decode_capturing():
+                return False
+        except Exception:
+            return False
     _get_lib()
     if not _HAS_C32:
         return False
@@ -898,7 +1071,12 @@ def _qualify_c32_one(w: torch.Tensor, M: int) -> bool:
                 need_p, need_s = _v5_c32_scratch_req(M, N, split, dual=False)
                 part_b, sem_b = _next_scratch(dev, need_p, need_s)
                 p_ptr, s_ptr = part_b.data_ptr(), sem_b.data_ptr()
-            fn_c32 = lib.bf11_flip_v12_c32_fwd if (V12_ENABLED and V12_BM48 and _HAS_V12) else lib.bf11_flip_v5_c32_fwd
+            if V13_ENABLED and _HAS_V13:
+                fn_c32 = lib.bf11_flip_v13_c32_fwd
+            elif V12_ENABLED and V12_BM48 and _HAS_V12:
+                fn_c32 = lib.bf11_flip_v12_c32_fwd
+            else:
+                fn_c32 = lib.bf11_flip_v5_c32_fwd
             return fn_c32(
                 x_in.data_ptr(), slabs.data_ptr(),
                 smeta_v5.data_ptr(), sflips_v5.data_ptr(), bmasks_v5.data_ptr(),
@@ -953,6 +1131,20 @@ def _qualify_c32_one(w: torch.Tensor, M: int) -> bool:
             if rc2 != 0 or not bool(torch.equal(out.view(torch.int16), ref_bm32.view(torch.int16))):
                 ok = False
                 break
+            # 2b) Double protection (Wave-V13): when K_ORDER=0, also prove literal 0-ULP bit-identity
+            # against legacy `bf11_flip_c32_fwd` (`bf11_flip_exact_c32.cu` exact ascending-K order).
+            if V13_ENABLED and C32_KORDER == 0 and v5_sc is not None:
+                ref_c32_k0 = torch.empty_like(out)
+                st_k0 = int(torch.cuda.current_stream().cuda_stream)
+                rc_k0 = lib.bf11_flip_c32_fwd(
+                    x.data_ptr(), slabs.data_ptr(), flips.data_ptr(), warp_meta.data_ptr(),
+                    outliers.data_ptr(), o_off.data_ptr(), ref_c32_k0.data_ptr(), 0,
+                    M, N, n_active, K, int(x.stride(0)), ks, split, int(ref_c32_k0.stride(0)),
+                    cfg_id, 32, 0, base, 0, 0, st_k0,
+                )
+                if rc_k0 != 0 or not bool(torch.equal(out.view(torch.int16), ref_c32_k0.view(torch.int16))):
+                    ok = False
+                    break
             # 3) Sanity-check against true FP32 matmul (<= 2 BF16 ULPs; avoids cuBLAS BF16-reduced split-K & 0-crossing ULP artifacts).
             if not _bf16_fp32_exact_ok(out, x, w_ref):
                 ok = False
@@ -1000,10 +1192,13 @@ def qualify_c32(weights: list[torch.Tensor]) -> dict[tuple[int, int, int], bool]
         print(
             f"[inkling-bf11-c32] qualified {n_pass}/{n_pass + n_fail} (shape, M) pairs "
             f"(ref={C32_EXACT_REF}, torch_exact={n_torch}/{n_pass + n_fail}, "
-            f"capture_only={int(C32_CAPTURE_ONLY)}, min_n={C32_MIN_N}, "
+            f"capture_only={int(C32_CAPTURE_ONLY)}, decode_only={int(C32_DECODE_ONLY)}, "
+            f"v13={int(V13_ENABLED and _HAS_V13)}, min_n={C32_MIN_N}, "
             f"k_order={C32_KORDER}, bm={C32_BM}, max_m={C32_MAX_M})",
             flush=True,
         )
+    if AUDIT_V15_ENABLED and not _AUDIT_V15_DONE:
+        audit_moe_dense_invariants_v15()
     return dict(_C32_QUAL_OK)
 
 
@@ -1015,13 +1210,31 @@ def bf11_linear(
     trig: bool = False,
 ) -> torch.Tensor | None:
     """Run 0-ULP BF11_FLIP_EXACT CUDA GEMM (M<=16 S7 path; opt-in M=17..C32_MAX_M C=32 path)."""
-    if not ENABLED or x.dim() != 2 or x.dtype != torch.bfloat16 or x.stride(1) != 1:
+    if (
+        not ENABLED
+        or not x.is_cuda
+        or x.dim() != 2
+        or x.dtype != torch.bfloat16
+        or x.stride(1) != 1
+        or w is None
+        or w.dim() != 2
+    ):
         return None
     M, K = int(x.shape[0]), int(x.shape[1])
+    N = int(w.shape[0])
+    if M < 0 or int(w.shape[1]) != K:
+        return None
+    if out is not None and (
+        not out.is_cuda
+        or out.dim() != 2
+        or out.shape != (M, N)
+        or out.dtype != x.dtype
+        or out.stride(1) != 1
+    ):
+        return None
     if M > 16:
         if not C32_ENABLED or M > C32_MAX_M:
             return None
-        N = int(w.shape[0])
         if C32_MIN_N > 0 and N < C32_MIN_N:
             return None
         lib = _get_lib()
@@ -1030,9 +1243,14 @@ def bf11_linear(
         entry = get_packed(w)
         if entry is None:
             return None
+        if C32_DECODE_ONLY:
+            # Strict Wave-V13 decode-only gate: NEVER run M>16 BF11 on eager or PIECEWISE prefill,
+            # and NEVER allow `_C32_TORCH_EXACT` (2-trial Gaussian check) to bypass the gate!
+            if not _is_strict_decode_capturing():
+                return None
         if not _qualify_c32_one(w, M):
             return None
-        if C32_CAPTURE_ONLY and not _C32_TORCH_EXACT.get((N, K, M), False) and not _is_full_decode_capturing():
+        if not C32_DECODE_ONLY and C32_CAPTURE_ONLY and not _C32_TORCH_EXACT.get((N, K, M), False) and not _is_full_decode_capturing():
             return None
         slabs, flips, warp_meta, outliers, o_off, base, ks, n_active, cfg_id, split, n_tiles, bn = entry
         if out is None:
@@ -1047,7 +1265,12 @@ def bf11_linear(
                 need_p, need_s = _v5_c32_scratch_req(M, N, split, dual=False)
                 part_b, sem_b = _next_scratch(x.device, need_p, need_s)
                 p_ptr, s_ptr = part_b.data_ptr(), sem_b.data_ptr()
-            fn_c32 = lib.bf11_flip_v12_c32_fwd if (V12_ENABLED and V12_BM48 and _HAS_V12) else lib.bf11_flip_v5_c32_fwd
+            if V13_ENABLED and _HAS_V13:
+                fn_c32 = lib.bf11_flip_v13_c32_fwd
+            elif V12_ENABLED and V12_BM48 and _HAS_V12:
+                fn_c32 = lib.bf11_flip_v12_c32_fwd
+            else:
+                fn_c32 = lib.bf11_flip_v5_c32_fwd
             rc = fn_c32(
                 x.data_ptr(), slabs.data_ptr(),
                 smeta_v5.data_ptr(), sflips_v5.data_ptr(), bmasks_v5.data_ptr(),
@@ -1133,13 +1356,18 @@ def bf11_dual_kv(
     """Fused 0-ULP global-layer K+V projection in ONE single-kernel launch (M<=16; opt-in M=17..C32_MAX_M)."""
     if (
         not ENABLED or not USE_DUAL_KV
+        or not x_k.is_cuda or not x_v.is_cuda
         or x_k.dim() != 2 or x_v.dim() != 2
         or x_k.shape != x_v.shape
         or x_k.dtype != torch.bfloat16 or x_v.dtype != torch.bfloat16
         or x_k.stride(1) != 1 or x_v.stride(1) != 1
+        or w_k is None or w_v is None
+        or w_k.dim() != 2 or w_v.dim() != 2
     ):
         return None
     M, K = int(x_k.shape[0]), int(x_k.shape[1])
+    if M < 0 or int(w_k.shape[1]) != K or int(w_v.shape[1]) != K:
+        return None
     if M > 16 and (not C32_ENABLED or not C32_DUAL_KV or M > C32_MAX_M):
         return None
     lib = _get_lib()
@@ -1166,10 +1394,14 @@ def bf11_dual_kv(
             return None
         if C32_MIN_N > 0 and N_each < C32_MIN_N:
             return None
+        if C32_DECODE_ONLY:
+            if not _is_strict_decode_capturing():
+                return None
         if not (_qualify_c32_one(w_k, M) and _qualify_c32_one(w_v, M)):
             return None
         if (
-            C32_CAPTURE_ONLY
+            not C32_DECODE_ONLY
+            and C32_CAPTURE_ONLY
             and not _C32_TORCH_EXACT.get((N_each, K, M), False)
             and not _is_full_decode_capturing()
         ):
@@ -1186,7 +1418,12 @@ def bf11_dual_kv(
                 need_p, need_s = _v5_c32_scratch_req(M, N_each, split, dual=True)
                 part_b, sem_b = _next_scratch(x_k.device, need_p, need_s)
                 p_ptr, s_ptr = part_b.data_ptr(), sem_b.data_ptr()
-            fn_dkv_c32 = lib.bf11_flip_dual_kv_v12_c32_fwd if (V12_ENABLED and V12_BM48 and _HAS_V12) else lib.bf11_flip_dual_kv_v5_c32_fwd
+            if V13_ENABLED and _HAS_V13:
+                fn_dkv_c32 = lib.bf11_flip_dual_kv_v13_c32_fwd
+            elif V12_ENABLED and V12_BM48 and _HAS_V12:
+                fn_dkv_c32 = lib.bf11_flip_dual_kv_v12_c32_fwd
+            else:
+                fn_dkv_c32 = lib.bf11_flip_dual_kv_v5_c32_fwd
             rc = fn_dkv_c32(
                 x_k.data_ptr(), x_v.data_ptr(),
                 sl0.data_ptr(), sl1.data_ptr(),
@@ -1485,20 +1722,25 @@ def can_bf11_dual_kv_dyn(
         or ek[8] not in (1, 4, 5)
     ):
         return False
+    if M > 16 and C32_DECODE_ONLY and not _is_strict_decode_capturing():
+        return False
     N_dyn, K = int(w_k_dyn.shape[0]), int(w_k_dyn.shape[1])
+    if int(w_k.shape[1]) != K:
+        return False
     q = _DYN_QUAL.get((N_dyn, K, M))
     if q is None and (N_dyn, K, M) not in _DYN_QUAL and not torch.cuda.is_current_stream_capturing():
         q = _qualify_dyn_one(w_k_dyn, M)
     if q is None:
         return False
-    if M > 16 and C32_CAPTURE_ONLY and not q[2] and not _is_full_decode_capturing():
+    if M > 16 and not C32_DECODE_ONLY and C32_CAPTURE_ONLY and not q[2] and not _is_full_decode_capturing():
         return False
     if M > 16:
         N_each = int(w_k.shape[0])
         if not (_qualify_c32_one(w_k, M) and _qualify_c32_one(w_v, M)):
             return False
         if (
-            C32_CAPTURE_ONLY
+            not C32_DECODE_ONLY
+            and C32_CAPTURE_ONLY
             and not _C32_TORCH_EXACT.get((N_each, K, M), False)
             and not _is_full_decode_capturing()
         ):
@@ -1521,6 +1763,8 @@ def bf11_dual_kv_dyn(
         not FUSE_DYN
         or not ENABLED
         or not USE_DUAL_KV
+        or not x_k.is_cuda
+        or not x_v.is_cuda
         or x_k.dim() != 2
         or x_v.dim() != 2
         or x_k.shape != x_v.shape
@@ -1528,6 +1772,10 @@ def bf11_dual_kv_dyn(
         or x_v.dtype != torch.bfloat16
         or x_k.stride(1) != 1
         or x_v.stride(1) != 1
+        or w_k is None
+        or w_v is None
+        or w_k.dim() != 2
+        or w_v.dim() != 2
         or w_k_dyn.shape != w_v_dyn.shape
         or w_k_dyn.dtype != torch.bfloat16
         or w_v_dyn.dtype != torch.bfloat16
@@ -1537,7 +1785,7 @@ def bf11_dual_kv_dyn(
         return None
     M, K = int(x_k.shape[0]), int(x_k.shape[1])
     N_dyn = int(w_k_dyn.shape[0])
-    if M <= 0 or N_dyn <= 0 or N_dyn > 4 or int(w_k_dyn.shape[1]) != K:
+    if M <= 0 or N_dyn <= 0 or N_dyn > 4 or int(w_k_dyn.shape[1]) != K or int(w_k.shape[1]) != K:
         return None
     if not can_bf11_dual_kv_dyn(M, w_k, w_v, w_k_dyn, w_v_dyn):
         return None
@@ -1568,10 +1816,13 @@ def bf11_dual_kv_dyn(
         return None
 
     if M > 16:
+        if C32_DECODE_ONLY and not _is_strict_decode_capturing():
+            return None
         if not (_qualify_c32_one(w_k, M) and _qualify_c32_one(w_v, M)):
             return None
         if (
-            C32_CAPTURE_ONLY
+            not C32_DECODE_ONLY
+            and C32_CAPTURE_ONLY
             and not _C32_TORCH_EXACT.get((N_each, K, M), False)
             and not _is_full_decode_capturing()
         ):
@@ -1637,3 +1888,285 @@ def bf11_dual_kv_dyn(
     if rc != 0:
         raise RuntimeError(f"bf11_flip_dual_kv_dyn_v9_c1_fwd failed with cudaError={rc}")
     return out_k, out_v, out_kd, out_vd
+
+
+def _reachable_decode_ms_from_schedule(max_m: int) -> list[int]:
+    """Compute every reachable decode M = B*(K+1) (plus K=0 M=1..32) up to ``max_m``."""
+    import json
+
+    raw = os.environ.get("SPEC_BATCH_SCHEDULE", "").strip()
+    sched = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and all(isinstance(r, (list, tuple)) and len(r) == 3 for r in parsed):
+                sched = [(int(r[0]), int(r[1]), int(r[2])) for r in parsed]
+        except Exception:
+            sched = None
+    if not sched:
+        sched = [(1, 4, 7), (5, 8, 5), (9, 24, 3), (25, 32, 3)]
+
+    ms: set[int] = set()
+    for b in range(1, 33):
+        if 1 <= b <= max_m:
+            ms.add(b)  # K=0 decode
+        k = 0
+        for lo, hi, kv in sched:
+            if lo <= b <= hi:
+                k = kv
+                break
+        m_val = b * (k + 1)
+        if 1 <= m_val <= max_m:
+            ms.add(m_val)
+    if V16_DYNK_BUCKETS or _V16_DYNK_EXTEND:
+        # Wave-V16 Track 1 Dynamic-K (K=7->11/15 at C=1..2 and M=16..64 at B=2..8)
+        for b in range(1, 9):
+            for k_ext in (7, 11, 15):
+                m_ext = b * (k_ext + 1)
+                if 1 <= m_ext <= max_m:
+                    ms.add(m_ext)
+    return sorted(ms)
+
+
+def audit_bf11_v16_dynk_synergy() -> dict:
+    """Verify Wave-V16 Dynamic-K (M=8, 12, 16 @ C=1 + M=16..64 @ B=2..8) BF11 scratch & bucket invariants."""
+    c1_dynk_ms = (8, 12, 16)
+    scratch_ok = True
+    scratch_details: list[dict] = []
+    for (n_dim, k_dim), (cfg_id, split) in _SHAPES.items():
+        if split == 1:
+            need_p = 0
+            need_s = 0
+        else:
+            _, _, bn = _CFGS[cfg_id]
+            n_tiles = (n_dim + bn - 1) // bn
+            n_pad_c1 = max(((n_dim + 31) // 32) * 32, n_tiles * bn)
+            mult = 2 if n_dim <= 256 else 1
+            need_p = mult * split * 16 * n_pad_c1
+            need_s = max(mult * ((n_dim + 7) // 8), mult * n_tiles * (2 if cfg_id == 4 else 4))
+        ok_shape = (need_p <= _MIN_PART_ELEMS) and (need_s <= _MIN_SEM_TILES)
+        if not ok_shape:
+            scratch_ok = False
+        scratch_details.append({
+            "shape": (n_dim, k_dim), "cfg_id": cfg_id, "split": split,
+            "need_part_m16": need_p, "min_part_elems": _MIN_PART_ELEMS,
+            "need_sem": need_s, "min_sem_tiles": _MIN_SEM_TILES, "ok": ok_shape,
+        })
+    canon = _C32_CANONICAL_MS if C32_EXACT_REF == "torch" else _C32_CANONICAL_MS_EXACT
+    canon_set = set(canon) | set(_C32_EXTRA_MS)
+    c28_dynk_ms = sorted({
+        m for b in range(2, 9) for k in (0, 3, 5, 6, 7, 11, 15)
+        for m in (b * (k + 1),) if 17 <= m <= C32_MAX_M
+    })
+    missing_c28 = [m for m in c28_dynk_ms if m not in canon_set]
+    return {
+        "ok": scratch_ok and len(missing_c28) == 0 and (not V13_ENABLED or C32_MAX_M <= 64 or V13_ALLOW_GT64),
+        "c1_dynk_ms": c1_dynk_ms,
+        "c28_dynk_ms": c28_dynk_ms,
+        "missing_c28": missing_c28,
+        "scratch_ok": scratch_ok,
+        "scratch_details": scratch_details,
+        "decode_only": bool(C32_DECODE_ONLY),
+        "c32_max_m": int(C32_MAX_M),
+        "v16_dynk_buckets": bool(V16_DYNK_BUCKETS),
+    }
+
+
+def _import_sibling_opt(pkg_names: tuple[str, ...]):
+    import importlib
+
+    pkg = __package__ or ""
+    for name in pkg_names:
+        try:
+            if pkg:
+                return importlib.import_module(f"{pkg}.{name}")
+        except Exception:
+            pass
+        try:
+            return importlib.import_module(name)
+        except Exception:
+            pass
+    return None
+
+
+def audit_moe_dense_invariants_v15(strict: bool | None = None) -> dict:
+    """Lightweight Wave-V15 startup self-check (`INKLING_MOE_DENSE_AUDIT_V15=1|strict`).
+
+    Verifies active MoE/BF11 libraries, asymmetric QUANT_FMA 0-ULP locks, decode-only
+    prefill isolation, M<=64 hard cap, and CUDA graph capture bucket completeness.
+    Zero CUDA syncs; runs in <1 ms at boot (or on explicit invocation).
+    """
+    global _AUDIT_V15_DONE
+    _AUDIT_V15_DONE = True
+    use_strict = AUDIT_V15_STRICT if strict is None else bool(strict)
+
+    checks: list[dict] = []
+    warnings_list: list[str] = []
+    failures: list[str] = []
+
+    def _rec(name: str, ok: bool, detail: str, *, severity: str = "fail") -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail, "severity": severity})
+        if not ok:
+            if severity == "warn":
+                warnings_list.append(f"{name}: {detail}")
+            else:
+                failures.append(f"{name}: {detail}")
+
+    # 1. BF11 V13 Decode-Only + Hard Cap + Library + Bucket Completeness
+    if ENABLED and C32_ENABLED:
+        _rec(
+            "bf11_decode_only",
+            bool(C32_DECODE_ONLY),
+            f"C32_DECODE_ONLY={int(C32_DECODE_ONLY)} (must be 1 to prevent M>16 prefill leak)",
+        )
+        if V13_ENABLED and not V13_ALLOW_GT64:
+            _rec(
+                "bf11_max_m_cap",
+                C32_MAX_M <= 64,
+                f"C32_MAX_M={C32_MAX_M} (expected <=64 under V13)",
+            )
+        if V13_ENABLED:
+            lib = _get_lib()
+            v13_ver = 0
+            if lib is not None and _HAS_V13:
+                try:
+                    v13_ver = int(lib.bf11_flip_v13_version())
+                except Exception:
+                    v13_ver = 0
+            _rec(
+                "bf11_v13_lib",
+                bool(lib is not None and _HAS_V13 and v13_ver >= 1300),
+                f"path={_LIB_PATH} has_v13={int(_HAS_V13)} ver={v13_ver}",
+                severity="warn" if not os.path.exists(_LIB_PATH) else "fail",
+            )
+        if FREE_RAW and (C32_DECODE_ONLY or C32_MAX_M < 128):
+            _rec(
+                "bf11_free_raw_safe",
+                bool(FREE_RAW_SAFE and not FREE_RAW_FORCE),
+                f"FREE_RAW=1 with C32_DECODE_ONLY={int(C32_DECODE_ONLY)} max_m={C32_MAX_M} safe={int(FREE_RAW_SAFE)}",
+                severity="warn",
+            )
+        canon = _C32_CANONICAL_MS if C32_EXACT_REF == "torch" else _C32_CANONICAL_MS_EXACT
+        canon_set = set(canon) | set(_C32_EXTRA_MS)
+        reach_c32 = [m for m in _reachable_decode_ms_from_schedule(C32_MAX_M) if 17 <= m <= C32_MAX_M]
+        missing_canon = [m for m in reach_c32 if m not in canon_set]
+        _rec(
+            "bf11_bucket_canonical_coverage",
+            len(missing_canon) == 0,
+            f"covered={len(reach_c32) - len(missing_canon)}/{len(reach_c32)} missing={missing_canon}",
+        )
+        if _C32_QUAL_OK and C32_QUALIFY:
+            packed_shapes = sorted({(k[0], k[1]) for k in _C32_QUAL_OK})
+            missing_qual = [
+                (sh, m)
+                for sh in packed_shapes
+                for m in reach_c32
+                if not _C32_QUAL_OK.get((sh[0], sh[1], m), False)
+            ]
+            _rec(
+                "bf11_bucket_qualified_coverage",
+                len(missing_qual) == 0,
+                f"shapes={len(packed_shapes)} missing_qual={len(missing_qual)}",
+                severity="warn" if C32_EXACT_REF == "torch" else "fail",
+            )
+
+    # 2. S8 MoE Asymmetric QUANT_FMA 0-ULP Lock (Router=1, W2=0)
+    s8_mod = _import_sibling_opt(("moe_s8_runtime",))
+    if s8_mod is not None and (
+        getattr(s8_mod, "S8_MASTER", False)
+        or getattr(s8_mod, "S8_ROUTER", False)
+        or getattr(s8_mod, "S8_ZERO_SCATTER", False)
+        or getattr(s8_mod, "S8_FUSE_SITU", False)
+        or getattr(s8_mod, "S8_FUSE_COMBINE", False)
+    ):
+        rt_fma = int(getattr(s8_mod, "S8_ROUTER_QUANT_FMA", -1))
+        w2_fma = int(getattr(s8_mod, "S8_W2_QUANT_FMA", -1))
+        _rec(
+            "s8_asymmetric_quant_fma",
+            rt_fma == 1 and w2_fma == 0,
+            f"S8_ROUTER_QUANT_FMA={rt_fma} (req 1), S8_W2_QUANT_FMA={w2_fma} (req 0)",
+        )
+        if getattr(s8_mod, "NVFP4_C1_V13", False) and hasattr(s8_mod, "get_nvfp4_version"):
+            try:
+                nv_c1_ver = int(s8_mod.get_nvfp4_version())
+            except Exception:
+                nv_c1_ver = 0
+            _rec(
+                "s8_nvfp4_c1_v13_ver",
+                nv_c1_ver >= 13,
+                f"nvfp4_c1_ver={nv_c1_ver} (req >=13)",
+                severity="warn" if nv_c1_ver == 0 else "fail",
+            )
+
+    # 3. C48/C32 MoE Asymmetric QUANT_FMA + Capture-Only Router + FC_MAX_M<=48
+    c32_mod = _import_sibling_opt(("moe_c32_runtime",))
+    if c32_mod is not None and getattr(c32_mod, "C32_MASTER", False):
+        c32_rt_fma = int(getattr(c32_mod, "ROUTER_C32_QUANT_FMA", -1))
+        c32_w2_fma = int(getattr(c32_mod, "MOE_V9_QUANT_FMA", -1))
+        _rec(
+            "c48_asymmetric_quant_fma",
+            c32_rt_fma == 1 and c32_w2_fma == 0,
+            f"ROUTER_C32_QUANT_FMA={c32_rt_fma} (req 1), MOE_V9_QUANT_FMA={c32_w2_fma} (req 0)",
+        )
+        if getattr(c32_mod, "C32_ROUTER_MODE", "") == "bf12":
+            cap_only = bool(getattr(c32_mod, "C32_ROUTER_BF12_CAPTURE_ONLY", False))
+            _rec(
+                "c48_router_bf12_capture_only",
+                cap_only,
+                f"C32_ROUTER_BF12_CAPTURE_ONLY={int(cap_only)} (req 1)",
+            )
+        if int(getattr(c32_mod, "C32_NVFP4_FC_MODE", -1)) == 2:
+            fc_max = int(getattr(c32_mod, "C32_NVFP4_FC_MAX_M", 0))
+            _rec(
+                "c48_nvfp4_fc_max_m",
+                fc_max <= 48,
+                f"C32_NVFP4_FC_MAX_M={fc_max} (req <=48 for L2-resident Panel-Major)",
+            )
+
+    # 4. Activation enable_fp_fusion=False & Linear Mixed-Chunk Protection
+    act_mod = _import_sibling_opt(("activation", "activation_ops"))
+    if act_mod is not None:
+        _rec(
+            "activation_fp_fusion_false",
+            bool(getattr(act_mod, "_SITU_ENABLE_FP_FUSION_FALSE", False)),
+            "swiglu_quantize Triton kernel enforces enable_fp_fusion=False (sub_rn)",
+        )
+    lin_mod = _import_sibling_opt(("linear",))
+    if lin_mod is not None and (
+        getattr(lin_mod, "_PF_DENSE_FP8", False) or getattr(lin_mod, "_PF_ROUTER_FP8", False)
+    ):
+        min_m = min(
+            int(getattr(lin_mod, "_PF_DENSE_FP8_MIN_M", 1024)),
+            int(getattr(lin_mod, "_PF_ROUTER_FP8_MIN_M", 1024)),
+        )
+        mixed_ok = bool(getattr(lin_mod, "_PF_MIXED_DECODE_BF16", False))
+        _rec(
+            "linear_pf_mixed_decode_bf16",
+            mixed_ok or min_m > 256,
+            f"INKLING_PF_MIXED_DECODE_BF16={int(mixed_ok)} min_m={min_m}",
+            severity="warn",
+        )
+
+    ok_all = len(failures) == 0
+    status = "PASS" if ok_all else "FAIL"
+    print(
+        f"[inkling-v15-audit] status={status} checks={len(checks)} "
+        f"passed={sum(1 for c in checks if c['ok'])} warnings={len(warnings_list)} "
+        f"failures={len(failures)}",
+        flush=True,
+    )
+    for w_msg in warnings_list:
+        print(f"[inkling-v15-audit] WARN {w_msg}", flush=True)
+    for f_msg in failures:
+        print(f"[inkling-v15-audit] FAIL {f_msg}", flush=True)
+    result = {
+        "ok": ok_all,
+        "checks": checks,
+        "warnings": warnings_list,
+        "failures": failures,
+    }
+    if use_strict and not ok_all:
+        raise RuntimeError(
+            "INKLING_MOE_DENSE_AUDIT_V15=strict failed: " + "; ".join(failures)
+        )
+    return result

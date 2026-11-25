@@ -51,6 +51,8 @@ _C48_MOE_TILE8 = os.environ.get("INKLING_C48_MOE_TILE8", "0").strip().lower() no
     "0", "", "off", "false", "no",
 )
 _C48_MOE_MAX_M = max(17, min(64, int(os.environ.get("INKLING_C48_MOE_MAX_M", "64") or 64)))
+# Opt-in Wave-V14 MX7-specific TILE=8 max M (-1 = inherit _C48_MOE_MAX_M -> 100% V13 invariant!):
+_MX7_C48_TILE8_MAX_M = int(os.environ.get("INKLING_MX7_C48_TILE8_MAX_M", "-1") or -1)
 
 
 @dataclass(frozen=True)
@@ -76,7 +78,12 @@ def expert_plan(
     if tile is None:
         tile = next(t for max_tokens, t in _TILES if tokens <= max_tokens)
         if tile == 16 and topk == 8 and num_experts == 384 and tokens <= 128:
-            if _C48_MOE_TILE8 and 17 <= tokens <= _C48_MOE_MAX_M:
+            _t8_max_m = (
+                min(64, _MX7_C48_TILE8_MAX_M)
+                if ((not nvfp4) and _MX7_C48_TILE8_MAX_M >= 0)
+                else _C48_MOE_MAX_M
+            )
+            if _C48_MOE_TILE8 and 17 <= tokens <= _t8_max_m:
                 try:
                     from . import moe_c32_runtime as _c32
                     if _c32.supports_c48_tile8(nvfp4=nvfp4):
@@ -1739,6 +1746,36 @@ def _config(tile: int, nvfp4: bool):
     return 64, 128, 64, 8, 3
 
 
+def _mx7_v14_prewarm(weight: torch.Tensor, weight_scale: torch.Tensor, projection: int) -> None:
+    """Eagerly transcode weight._inkling_mx7_v5_{compat,panel} during profile_run when Wave-V14 MX7
+    is opted in, ensuring CUDA graph capture hits Compat-Hybrid/Panel-V5 instead of falling back."""
+    v5_raw = os.environ.get("INKLING_MX7_V5", "").strip().lower()
+    if v5_raw in ("", "0", "off", "false", "no"):
+        return
+    v14_c48 = (
+        os.environ.get("INKLING_MX7_C48_V14", "0").strip().lower() not in ("0", "", "off", "false", "no")
+        or os.environ.get("INKLING_MX7_C48_V16", "0").strip().lower() not in ("0", "", "off", "false", "no")
+    )
+    v14_c1 = (
+        os.environ.get("INKLING_MX7_C1_V14", "0").strip().lower() not in ("0", "", "off", "false", "no")
+        or os.environ.get("INKLING_MX7_C1_V16", "0").strip().lower() not in ("0", "", "off", "false", "no")
+    )
+    if not (v14_c48 or v14_c1):
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    is_panel = v5_raw in ("2", "panel", "panel_v5", "panel-v5")
+    try:
+        if v14_c48:
+            from . import moe_c32_runtime as _c32
+            (_c32.get_mx7_v5_panel if is_panel else _c32.get_mx7_v5_compat)(weight, weight_scale, projection)
+        elif v14_c1:
+            from . import moe_s8_runtime as _s8
+            (_s8.get_mx7_v5_panel_s8 if is_panel else _s8.get_mx7_v5_compat_s8)(weight, weight_scale, projection)
+    except Exception:
+        pass
+
+
 def ensure_packed_for_pf_native(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -1762,6 +1799,7 @@ def ensure_packed_for_pf_native(
             # natively runs mx7_v5_prefill_native_w13 / w2 (incl. fused W2-Combine!) on MX7 slabs.
             if not torch.cuda.is_current_stream_capturing():
                 _mx7_get_packed(weight, weight_scale, projection, 0, 0)
+                _mx7_v14_prewarm(weight, weight_scale, projection)
             return
     if (
         nvfp4
@@ -1793,6 +1831,7 @@ def ensure_packed_for_pf_native(
             _scales_panel_kmajor(weight_scale, pb, kbg)
         if (not nvfp4) and _MX7_ENABLED and (not torch.cuda.is_current_stream_capturing()):
             _mx7_get_packed(weight, weight_scale, projection, pb, kb)
+            _mx7_v14_prewarm(weight, weight_scale, projection)
 
 
 def bmm(

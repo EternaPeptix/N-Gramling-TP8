@@ -71,7 +71,15 @@ _CACHE: dict[tuple[int, int, int], tuple] = {}
 def prepack(w: torch.Tensor) -> torch.Tensor | None:
     """Pack a bf16 [N, K] dense weight into 0-ULP BF12_EXACT slab format (outside graph capture).
     Returns the packed slabs tensor (for L2 prefetch), or None if not eligible."""
-    if not ENABLED or w is None or w.dtype != torch.bfloat16 or w.dim() != 2 or w.stride(1) != 1:
+    if (
+        not ENABLED
+        or w is None
+        or not w.is_cuda
+        or w.dtype != torch.bfloat16
+        or w.dim() != 2
+        or w.stride(1) != 1
+        or w.untyped_storage().size() == 0
+    ):
         return None
     if _get_lib() is None:
         return None
@@ -187,7 +195,17 @@ def bf12_linear(
     trig_reduce: bool = False,
 ) -> torch.Tensor | None:
     """Run 0-ULP BF12_EXACT v3 CUDA GEMM if w is prepacked and M <= MAX_M (default 64); else return None."""
-    if not ENABLED or x.dim() != 2 or x.shape[0] > MAX_M or x.dtype != torch.bfloat16 or x.stride(1) != 1:
+    if (
+        not ENABLED
+        or not x.is_cuda
+        or x.dim() != 2
+        or x.shape[0] < 0
+        or x.shape[0] > MAX_M
+        or x.dtype != torch.bfloat16
+        or x.stride(1) != 1
+        or w.dim() != 2
+        or int(w.shape[1]) != int(x.shape[1])
+    ):
         return None
     lib = _get_lib()
     if lib is None:
@@ -198,6 +216,14 @@ def bf12_linear(
     slabs, outliers, o_off, base, ks, n_active, cfg_id, split = entry
     M, K = int(x.shape[0]), int(x.shape[1])
     N = int(w.shape[0])
+    if out is not None and (
+        not out.is_cuda
+        or out.dim() != 2
+        or out.shape != (M, N)
+        or out.dtype != x.dtype
+        or out.stride(1) != 1
+    ):
+        return None
     if out is None:
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)
     if M == 0:

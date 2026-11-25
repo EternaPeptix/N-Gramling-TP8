@@ -28,8 +28,11 @@ Supported compressed modes (`T >= INKLING_PREFILL_SP_RS_MIN_T`, default 2048, fl
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+from dataclasses import dataclass
 import os
+import threading
 from typing import Any
 
 import torch
@@ -77,6 +80,12 @@ _FP8_RS_TRIED = False
 _RHD_COMM_LIB_PATH = os.environ.get(
     "INKLING_PF_RHD_COMM_LIB", "/rdma/libpf_rhd_comm_sm121.so"
 ).strip()
+_RHD_COMM_V13_LIB_PATH = os.environ.get(
+    "INKLING_PF_RHD_COMM_V13_LIB", "/rdma/libpf_rhd_comm_v13.so"
+).strip()
+_RHD_COMM_V11_LIB_PATH = os.environ.get(
+    "INKLING_PF_RHD_COMM_V11_LIB", "/rdma/libpf_rhd_comm_v11.so"
+).strip()
 _RHD_COMM_V5_LIB_PATH = os.environ.get(
     "INKLING_PF_RHD_COMM_V5_LIB", "/rdma/libpf_rhd_comm_v5.so"
 ).strip()
@@ -88,8 +97,76 @@ SP_LOWSM_WB_OUT = os.environ.get("INKLING_PREFILL_SP_LOWSM_WB_OUT", "0").strip()
 SP_RHD_LOWSM_TRANSPORT = os.environ.get("INKLING_PREFILL_SP_RHD_LOWSM_TRANSPORT", "").strip().lower()
 if SP_RHD_LOWSM_TRANSPORT not in ("", "pynccl_p2p", "sliced_p2p", "pair_subcomm", "pair_ag2"):
     SP_RHD_LOWSM_TRANSPORT = ""
+# Wave-V11 opt-in pipelined low-SM A2A & RHD controls (default OFF -> 0 behavioral change!)
+SP_A2A_PIPE = os.environ.get("INKLING_PREFILL_SP_A2A_PIPE", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
+SP_RHD_LOWSM_PIPE = os.environ.get("INKLING_PREFILL_SP_RHD_LOWSM_PIPE", "0").strip().lower() in (
+    "1", "on", "true", "yes",
+)
 _RHD_COMM_LIB: ctypes.CDLL | None = None
 _RHD_COMM_TRIED = False
+
+
+def _is_stream_capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _join_codec_stream(cur_s: Any, cod_s: Any, ev: Any) -> None:
+    """Safely join `cur_s` on `cod_s` so `cod_s` never races with fallback or freed scratch."""
+    try:
+        ev.record(cod_s)
+        cur_s.wait_event(ev)
+    except Exception:
+        try:
+            cod_s.synchronize()
+        except Exception:
+            pass
+
+
+@dataclass
+class PreQuantA2APartial:
+    """Pre-quantized 1-hop `A2A_INT8_g64` payload emitted directly from fused `wo_ud`
+    epilogue (`pf_wo_ud_fused_a2a_int8_v11_fwd`), eliminating both BF16 `attn_partial`
+    writes and the `a2a_quant_int8_g64_lowsm` kernel on `comm_stream`!"""
+
+    send_buf: torch.Tensor     # [world_size, peer_bytes] uint8
+    local_shard: torch.Tensor  # [S, H] bfloat16 (exact unquantized local shard!)
+    peer_bytes: int
+    scale_off: int
+    S: int
+    H: int
+    world_size: int
+    rank: int
+    is_fp8: bool = False
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        self.send_buf.record_stream(stream)
+        self.local_shard.record_stream(stream)
+
+
+_FUSED_WO_UD_A2A_TLS = threading.local()
+
+
+def get_fused_wo_ud_a2a_scope() -> tuple[int, int, int] | None:
+    """Return `(world_size, rank, S)` if inside a prefill fused `wo_ud -> A2A_INT8_g64`
+    scope, else `None` (always `None` for decode / capture / non-A2A RS!)."""
+    return getattr(_FUSED_WO_UD_A2A_TLS, "scope", None)
+
+
+@contextlib.contextmanager
+def fused_wo_ud_a2a_scope(world_size: int, rank: int, shard_rows: int):
+    """Enable fused `wo_ud -> A2A_INT8_g64` strictly for a single eager prefill
+    `layer.attention(...)` call whose consumer supports `PreQuantA2APartial`."""
+    prev = getattr(_FUSED_WO_UD_A2A_TLS, "scope", None)
+    _FUSED_WO_UD_A2A_TLS.scope = (int(world_size), int(rank), int(shard_rows))
+    try:
+        yield
+    finally:
+        _FUSED_WO_UD_A2A_TLS.scope = prev
 
 
 def _get_fp8_rs_lib() -> ctypes.CDLL | None:
@@ -195,13 +272,27 @@ def _get_rhd_comm_lib() -> ctypes.CDLL | None:
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         return None
     _RHD_COMM_TRIED = True
+    _explicit_v13 = os.environ.get("INKLING_PF_RHD_COMM_V13_LIB", "").strip()
+    _explicit_v11 = os.environ.get("INKLING_PF_RHD_COMM_V11_LIB", "").strip()
     _explicit_v5 = os.environ.get("INKLING_PF_RHD_COMM_V5_LIB", "").strip()
     _explicit_rhd = os.environ.get("INKLING_PF_RHD_COMM_LIB", "").strip()
     _here = os.path.dirname(os.path.abspath(__file__))
-    # Wave-V10 fix: `libpf_rhd_comm_v5.so` is a strict ABI superset of `libpf_rhd_comm_sm121.so`
-    # (all 13 legacy symbols + all 17 `*_lowsm_fwd` symbols); always prefer V5 over legacy!
+    # Wave-V13 precedence: `libpf_rhd_comm_v13.so` is a strict ABI superset of V11/V5/legacy
+    # (100% stream-capture guards + sliced A2A_INT8 pipe + DBO-throttled fused SConv+AR+FP8_AG!).
     _cand_paths = (
-        ((_explicit_v5,) if _explicit_v5 else ())
+        ((_explicit_v13,) if _explicit_v13 else ())
+        + (
+            _RHD_COMM_V13_LIB_PATH,
+            "/rdma/libpf_rhd_comm_v13.so",
+            os.path.join(_here, "libpf_rhd_comm_v13.so"),
+        )
+        + ((_explicit_v11,) if _explicit_v11 else ())
+        + (
+            _RHD_COMM_V11_LIB_PATH,
+            "/rdma/libpf_rhd_comm_v11.so",
+            os.path.join(_here, "libpf_rhd_comm_v11.so"),
+        )
+        + ((_explicit_v5,) if _explicit_v5 else ())
         + (
             _RHD_COMM_V5_LIB_PATH,
             "/rdma/libpf_rhd_comm_v5.so",
@@ -381,10 +472,61 @@ def _get_rhd_comm_lib() -> ctypes.CDLL | None:
                     fn.argtypes = _agd_lowsm_args
                     fn.restype = ctypes.c_int
 
+            _has_v11 = hasattr(lib, "pf_rhd_comm_v11_version")
+            if _has_v11:
+                lib.pf_rhd_comm_v11_version.argtypes = []
+                lib.pf_rhd_comm_v11_version.restype = ctypes.c_int
+                _a2a_q_slice_args = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                _a2a_d_slice_args = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                for fn_name in (
+                    "a2a_quant_int8_g64_slice_lowsm_fwd",
+                    "a2a_quant_fp8_g64_slice_lowsm_fwd",
+                ):
+                    fn = getattr(lib, fn_name)
+                    fn.argtypes = _a2a_q_slice_args
+                    fn.restype = ctypes.c_int
+                for fn_name in (
+                    "a2a_dequant_sum8_int8_g64_slice_lowsm_fwd",
+                    "a2a_dequant_sum8_fp8_g64_slice_lowsm_fwd",
+                ):
+                    fn = getattr(lib, fn_name)
+                    fn.argtypes = _a2a_d_slice_args
+                    fn.restype = ctypes.c_int
+                lib.fused_sconv_ar_fp8_ag_v11_fwd.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int64,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                lib.fused_sconv_ar_fp8_ag_v11_fwd.restype = ctypes.c_int
+
             _RHD_COMM_LIB = lib
             print(
                 f"[inkling-pf-rhd-comm] loaded native SM121a CUDA kernels: {_chosen_path} "
-                f"(v5_lowsm={int(_has_v5)}, lowsm_ctas={SP_LOWSM_CTAS}, wb_out={int(SP_LOWSM_WB_OUT)})",
+                f"(v5_lowsm={int(_has_v5)}, v11={int(_has_v11)}, lowsm_ctas={SP_LOWSM_CTAS}, wb_out={int(SP_LOWSM_WB_OUT)})",
                 flush=True,
             )
         except Exception as e:
@@ -1202,6 +1344,37 @@ if _TRITON_OK:
 _RS_SCRATCH: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
 _RHD_RS_SCRATCH: dict[int, dict[str, Any]] = {}
 _RHD_AG_SCRATCH: dict[tuple[int, str], torch.Tensor] = {}
+_A2A_PIPE_STATE: dict[int, dict[str, Any]] = {}
+
+
+def _get_a2a_pipe_state(
+    device: torch.device, world_size: int, peer_bytes_max: int
+) -> dict[str, Any]:
+    """Per-device 2-stage split-half A2A pipelining codec stream, events, and send scratch."""
+    dev_idx = device.index if device.index is not None else 0
+    st = _A2A_PIPE_STATE.get(dev_idx)
+    if st is None:
+        st = {
+            "codec_stream": torch.cuda.Stream(device=device, priority=-1),
+            "ev_start": torch.cuda.Event(),
+            "ev_q0": torch.cuda.Event(),
+            "ev_q1": torch.cuda.Event(),
+            "ev_c0": torch.cuda.Event(),
+            "ev_c1": torch.cuda.Event(),
+            "ev_d1": torch.cuda.Event(),
+        }
+        _A2A_PIPE_STATE[dev_idx] = st
+    need = world_size * peer_bytes_max
+    for name in ("send0", "recv0", "send1", "recv1"):
+        buf = st.get(name)
+        if buf is None or buf.numel() < need:
+            buf = torch.empty((need,), dtype=torch.uint8, device=device)
+            st[name] = buf
+    cur = torch.cuda.current_stream(device)
+    for name in ("send0", "recv0", "send1", "recv1"):
+        st[name].record_stream(cur)
+        st[name].record_stream(st["codec_stream"])
+    return st
 
 
 def _rhd_g64_packed_bytes(num_rows: int, hidden: int) -> tuple[int, int]:
@@ -1293,6 +1466,54 @@ def _get_scratch_pair(
     sbuf.record_stream(cur)
     rbuf.record_stream(cur)
     return sbuf, rbuf
+
+
+def release_prefill_scratch() -> int:
+    """Release ALL non-graphed SP ReduceScatter/AllGather prefill scratch tensors, drain
+    `codec_stream`s safely, and release DBO/SP scratch caches + pooled events."""
+    if _is_stream_capturing():
+        return 0
+    for st in _RHD_RS_SCRATCH.values():
+        cs = st.get("codec_stream")
+        if cs is not None:
+            try:
+                cs.synchronize()
+            except Exception:
+                pass
+    for st in _A2A_PIPE_STATE.values():
+        cs = st.get("codec_stream")
+        if cs is not None:
+            try:
+                cs.synchronize()
+            except Exception:
+                pass
+    freed = 0
+    for s_flat, r_flat in _RS_SCRATCH.values():
+        freed += int(s_flat.numel() * s_flat.element_size()) + int(r_flat.numel() * r_flat.element_size())
+    _RS_SCRATCH.clear()
+    for buf in _RHD_AG_SCRATCH.values():
+        freed += int(buf.numel() * buf.element_size())
+    _RHD_AG_SCRATCH.clear()
+    for buf in _RHD_AG2_SCRATCH.values():
+        freed += int(buf.numel() * buf.element_size())
+    _RHD_AG2_SCRATCH.clear()
+    for st in _RHD_RS_SCRATCH.values():
+        for k in ("send0", "recv0", "send1", "recv1", "keep1", "keep2"):
+            t_buf = st.pop(k, None)
+            if isinstance(t_buf, torch.Tensor):
+                freed += int(t_buf.numel() * t_buf.element_size())
+    for st in _A2A_PIPE_STATE.values():
+        for k in ("send0", "recv0", "send1", "recv1"):
+            t_buf = st.pop(k, None)
+            if isinstance(t_buf, torch.Tensor):
+                freed += int(t_buf.numel() * t_buf.element_size())
+    try:
+        from . import prefill_sp as _sp_mod
+
+        freed += int(_sp_mod.release_prefill_scratch())
+    except Exception:
+        pass
+    return freed
 
 
 # ---------------------------------------------------------------------------
@@ -1397,7 +1618,7 @@ def compressed_reduce_scatter_into(
     """
     if not partial.is_cuda or partial.dtype != torch.bfloat16:
         return False
-    if torch.cuda.is_current_stream_capturing():
+    if _is_stream_capturing():
         return False
     if partial.ndim != 2 or out_shard.ndim != 2 or out_shard.dtype != torch.bfloat16:
         return False
@@ -1429,6 +1650,7 @@ def compressed_reduce_scatter_into(
         peer_bytes = (scale_off + 2 * S * G + 127) & ~127
         send_buf, recv_buf = _get_scratch_pair(partial.device, world_size, peer_bytes, mode)
 
+        did_a2a = False
         if lib is not None:
             q_fn = (
                 lib.quant_bf16_to_fp8_g128_a2a_fwd
@@ -1454,6 +1676,7 @@ def compressed_reduce_scatter_into(
             )
             if rc1 == 0:
                 a2a(send_buf, recv_buf)
+                did_a2a = True
                 rc2 = d_fn(
                     recv_buf.data_ptr(),
                     partial.data_ptr(),
@@ -1472,23 +1695,28 @@ def compressed_reduce_scatter_into(
                     return True
 
         if not _TRITON_OK:
+            if did_a2a:
+                raise RuntimeError(
+                    f"dequant_sum8_{mode} CUDA failed after AllToAll and Triton fallback is unavailable"
+                )
             return False
         NG = 4
         grid_g = (G + NG - 1) // NG
-        _quant_g128_a2a_kernel[(world_size - 1, S, grid_g)](
-            partial,
-            send_buf,
-            partial.stride(0),
-            peer_bytes,
-            scale_off,
-            S,
-            H,
-            RANK=rank,
-            NG=NG,
-            IS_FP8=is_fp8,
-            num_warps=4,
-        )
-        a2a(send_buf, recv_buf)
+        if not did_a2a:
+            _quant_g128_a2a_kernel[(world_size - 1, S, grid_g)](
+                partial,
+                send_buf,
+                partial.stride(0),
+                peer_bytes,
+                scale_off,
+                S,
+                H,
+                RANK=rank,
+                NG=NG,
+                IS_FP8=is_fp8,
+                num_warps=4,
+            )
+            a2a(send_buf, recv_buf)
         _dequant_sum_g128_kernel[(S, grid_g)](
             recv_buf,
             partial,
@@ -1511,19 +1739,23 @@ def compressed_reduce_scatter_into(
     # Mode 1: INT8-col32 Column-Wise Compressed RS (1.0625 B/elem, outlier-immune)
     # -----------------------------------------------------------------------
     if mode == "int8_col":
+        did_a2a = False
+        cu_peer_bytes = 0
+        cu_scale_off = 0
+        cu_recv_buf: torch.Tensor | None = None
         if lib is not None and world_size in (2, 4, 8):
             G = (S + 31) // 32
-            scale_off = (S * H + 15) & ~15
-            peer_bytes = (scale_off + 2 * G * H + 127) & ~127
+            cu_scale_off = (S * H + 15) & ~15
+            cu_peer_bytes = (cu_scale_off + 2 * G * H + 127) & ~127
             send_buf, recv_buf = _get_scratch_pair(
-                partial.device, world_size, peer_bytes, "int8_col_cu"
+                partial.device, world_size, cu_peer_bytes, "int8_col_cu"
             )
             rc1 = lib.quant_bf16_to_int8_col32_a2a_fwd(
                 partial.data_ptr(),
                 send_buf.data_ptr(),
                 int(partial.stride(0)),
-                int(peer_bytes),
-                int(scale_off),
+                int(cu_peer_bytes),
+                int(cu_scale_off),
                 S,
                 H,
                 world_size,
@@ -1532,14 +1764,16 @@ def compressed_reduce_scatter_into(
             )
             if rc1 == 0:
                 a2a(send_buf, recv_buf)
+                did_a2a = True
+                cu_recv_buf = recv_buf
                 rc2 = lib.dequant_sum8_int8_col32_to_bf16_fwd(
                     recv_buf.data_ptr(),
                     partial.data_ptr(),
                     out_shard.data_ptr(),
                     int(partial.stride(0)),
                     int(out_shard.stride(0)),
-                    int(peer_bytes),
-                    int(scale_off),
+                    int(cu_peer_bytes),
+                    int(cu_scale_off),
                     S,
                     H,
                     world_size,
@@ -1550,25 +1784,34 @@ def compressed_reduce_scatter_into(
                     return True
 
         if not _TRITON_OK or S % 32 != 0 or H % 64 != 0:
+            if did_a2a:
+                raise RuntimeError(
+                    "dequant_sum8_int8_col32 CUDA failed after AllToAll and Triton fallback is ineligible"
+                )
             return False
         G = S // 32
-        scale_off = S * H
-        peer_bytes = scale_off + 2 * G * H
-        send_buf, recv_buf = _get_scratch_pair(partial.device, world_size, peer_bytes, "int8_col")
         BH = 64
-        _quant_int8_col32_kernel[(world_size - 1, G, H // BH)](
-            partial,
-            send_buf,
-            partial.stride(0),
-            peer_bytes,
-            scale_off,
-            S,
-            H,
-            RANK=rank,
-            BH=BH,
-            num_warps=4,
-        )
-        a2a(send_buf, recv_buf)
+        if did_a2a and cu_recv_buf is not None:
+            recv_buf = cu_recv_buf
+            peer_bytes = cu_peer_bytes
+            scale_off = cu_scale_off
+        else:
+            scale_off = S * H
+            peer_bytes = scale_off + 2 * G * H
+            send_buf, recv_buf = _get_scratch_pair(partial.device, world_size, peer_bytes, "int8_col")
+            _quant_int8_col32_kernel[(world_size - 1, G, H // BH)](
+                partial,
+                send_buf,
+                partial.stride(0),
+                peer_bytes,
+                scale_off,
+                S,
+                H,
+                RANK=rank,
+                BH=BH,
+                num_warps=4,
+            )
+            a2a(send_buf, recv_buf)
         _dequant_reduce_int8_col32_kernel[(G, H // BH)](
             recv_buf,
             partial,
@@ -1662,17 +1905,116 @@ def compressed_reduce_scatter_into(
         )
 
     # -----------------------------------------------------------------------
-    # Mode 4: v5 Low-SM 1-Hop Shift-Rotated AllToAll RS (`a2a_int8_lowsm` / `a2a_fp8_lowsm`)
-    #   - Only 1 quant stage (+3.5 dB higher SQNR), local 1/8 shard exact BF16,
+    # Mode 4: Low-SM 1-Hop Shift-Rotated AllToAll RS (`a2a_{int8,fp8}[_pipe]_lowsm`)
+    #   - Only 1 quant stage (+3.5 dB higher SQNR vs 3-hop RHD), local 1/8 shard exact BF16,
     #     deterministic `r = 0..W-1` FP32 sum, `<= 6` SMs & `< 0.5 MiB` L2!
+    #   - Wave-V11 `a2a_*_pipe_lowsm` (or `SP_A2A_PIPE=1`): overlaps half-1 quant behind
+    #     half-0 wire A2A AND half-0 dequant behind half-1 wire A2A (0-ULP vs unpipelined!).
     # -----------------------------------------------------------------------
-    if mode in ("a2a_int8_lowsm", "a2a_fp8_lowsm"):
+    if mode in (
+        "a2a_int8_lowsm",
+        "a2a_fp8_lowsm",
+        "a2a_int8_pipe_lowsm",
+        "a2a_fp8_pipe_lowsm",
+    ):
         if H % 128 != 0 or world_size not in (2, 4, 8):
             return False
         rhd_lib = _get_rhd_comm_lib()
         if rhd_lib is None or not hasattr(rhd_lib, "a2a_quant_int8_g64_lowsm_fwd"):
             return False
-        is_fp8 = mode == "a2a_fp8_lowsm"
+        is_fp8 = "fp8" in mode
+        eff_lowsm_ctas = (
+            max(min(int(lowsm_ctas), 48), 1)
+            if (lowsm_ctas is not None and int(lowsm_ctas) > 0)
+            else SP_LOWSM_CTAS
+        )
+        want_pipe = (
+            (mode.endswith("_pipe_lowsm") or SP_A2A_PIPE)
+            and S >= 4
+            and hasattr(rhd_lib, "a2a_quant_int8_g64_slice_lowsm_fwd")
+            and hasattr(rhd_lib, "a2a_dequant_sum8_int8_g64_slice_lowsm_fwd")
+        )
+        if want_pipe:
+            s0 = S // 2
+            s1 = S - s0
+            sc_off0, pb0 = _rhd_g64_packed_bytes(s0, H)
+            sc_off1, pb1 = _rhd_g64_packed_bytes(s1, H)
+            pst = _get_a2a_pipe_state(partial.device, world_size, max(pb0, pb1))
+            send0 = pst["send0"][: world_size * pb0].view(world_size, pb0)
+            recv0 = pst["recv0"][: world_size * pb0].view(world_size, pb0)
+            send1 = pst["send1"][: world_size * pb1].view(world_size, pb1)
+            recv1 = pst["recv1"][: world_size * pb1].view(world_size, pb1)
+            cur_s = torch.cuda.current_stream(partial.device)
+            cod_s = pst["codec_stream"]
+            cod_u64 = int(cod_s.cuda_stream)
+            q_sl = (
+                rhd_lib.a2a_quant_fp8_g64_slice_lowsm_fwd
+                if is_fp8
+                else rhd_lib.a2a_quant_int8_g64_slice_lowsm_fwd
+            )
+            d_sl = (
+                rhd_lib.a2a_dequant_sum8_fp8_g64_slice_lowsm_fwd
+                if is_fp8
+                else rhd_lib.a2a_dequant_sum8_int8_g64_slice_lowsm_fwd
+            )
+            partial.record_stream(cod_s)
+            out_shard.record_stream(cod_s)
+            pst["ev_start"].record(cur_s)
+            cod_s.wait_event(pst["ev_start"])
+            # Stage 0 quant on codec_stream
+            rc = q_sl(
+                partial.data_ptr(), send0.data_ptr(),
+                int(partial.stride(0)), int(pb0), int(sc_off0),
+                S, 0, s0, H, world_size, rank, int(eff_lowsm_ctas), cod_u64,
+            )
+            if rc != 0:
+                _join_codec_stream(cur_s, cod_s, pst["ev_d1"])
+                return False
+            pst["ev_q0"].record(cod_s)
+            # Stage 1 quant on codec_stream (overlaps A2A 0 on cur_s!)
+            rc = q_sl(
+                partial.data_ptr(), send1.data_ptr(),
+                int(partial.stride(0)), int(pb1), int(sc_off1),
+                S, s0, s1, H, world_size, rank, int(eff_lowsm_ctas), cod_u64,
+            )
+            if rc != 0:
+                _join_codec_stream(cur_s, cod_s, pst["ev_d1"])
+                return False
+            pst["ev_q1"].record(cod_s)
+            # Wire A2A 0 on cur_s (strictly single-stream NCCL!)
+            cur_s.wait_event(pst["ev_q0"])
+            a2a(send0, recv0)
+            pst["ev_c0"].record(cur_s)
+            # Dequant 0 on codec_stream (overlaps Wire A2A 1 on cur_s!)
+            cod_s.wait_event(pst["ev_c0"])
+            rc = d_sl(
+                recv0.data_ptr(), partial.data_ptr(), out_shard.data_ptr(),
+                int(partial.stride(0)), int(out_shard.stride(0)), int(rank * S),
+                int(pb0), int(sc_off0), S, 0, 0, s0, H, world_size, rank,
+                int(SP_LOWSM_WB_OUT), int(eff_lowsm_ctas), cod_u64,
+            )
+            if rc != 0:
+                _join_codec_stream(cur_s, cod_s, pst["ev_d1"])
+                raise RuntimeError(f"a2a_dequant_sum8 slice 0 failed after AllToAll: rc={rc}")
+            # Wire A2A 1 on cur_s
+            cur_s.wait_event(pst["ev_q1"])
+            a2a(send1, recv1)
+            pst["ev_c1"].record(cur_s)
+            # Dequant 1 on codec_stream
+            cod_s.wait_event(pst["ev_c1"])
+            rc = d_sl(
+                recv1.data_ptr(), partial.data_ptr(), out_shard.data_ptr(),
+                int(partial.stride(0)), int(out_shard.stride(0)), int(rank * S),
+                int(pb1), int(sc_off1), S, s0, 0, s1, H, world_size, rank,
+                int(SP_LOWSM_WB_OUT), int(eff_lowsm_ctas), cod_u64,
+            )
+            if rc != 0:
+                _join_codec_stream(cur_s, cod_s, pst["ev_d1"])
+                raise RuntimeError(f"a2a_dequant_sum8 slice 1 failed after AllToAll: rc={rc}")
+            pst["ev_d1"].record(cod_s)
+            cur_s.wait_event(pst["ev_d1"])
+            return True
+
         scale_off, peer_bytes = _rhd_g64_packed_bytes(S, H)
         send_buf, recv_buf = _get_scratch_pair(partial.device, world_size, peer_bytes, mode)
         q_fn = (
@@ -1684,11 +2026,6 @@ def compressed_reduce_scatter_into(
             rhd_lib.a2a_dequant_sum8_fp8_g64_lowsm_fwd
             if is_fp8
             else rhd_lib.a2a_dequant_sum8_int8_g64_lowsm_fwd
-        )
-        eff_lowsm_ctas = (
-            max(min(int(lowsm_ctas), 48), 1)
-            if (lowsm_ctas is not None and int(lowsm_ctas) > 0)
-            else SP_LOWSM_CTAS
         )
         rc1 = q_fn(
             partial.data_ptr(),
@@ -1725,6 +2062,326 @@ def compressed_reduce_scatter_into(
         return rc2 == 0
 
     return False
+
+
+def compressed_reduce_scatter_prequant_into(
+    pq: PreQuantA2APartial,
+    out_shard: torch.Tensor,
+    *,
+    all_to_all_fn: Any | None = None,
+    lowsm_ctas: int | None = None,
+) -> bool:
+    """Complete 1-hop A2A ReduceScatter from a fused `wo_ud` `PreQuantA2APartial`
+    (ZERO `a2a_quant` kernel on `comm_stream`!)."""
+    if _is_stream_capturing():
+        return False
+    rhd_lib = _get_rhd_comm_lib()
+    if rhd_lib is None or not hasattr(rhd_lib, "a2a_dequant_sum8_int8_g64_slice_lowsm_fwd"):
+        return False
+    a2a = _tp_all_to_all_peers if all_to_all_fn is None else all_to_all_fn
+    _, recv_buf = _get_scratch_pair(
+        pq.send_buf.device, pq.world_size, pq.peer_bytes, "a2a_prequant_v11"
+    )
+    a2a(pq.send_buf, recv_buf)
+    d_sl = (
+        rhd_lib.a2a_dequant_sum8_fp8_g64_slice_lowsm_fwd
+        if pq.is_fp8
+        else rhd_lib.a2a_dequant_sum8_int8_g64_slice_lowsm_fwd
+    )
+    eff_ctas = (
+        max(min(int(lowsm_ctas), 48), 1)
+        if (lowsm_ctas is not None and int(lowsm_ctas) > 0)
+        else SP_LOWSM_CTAS
+    )
+    stream = int(torch.cuda.current_stream(pq.send_buf.device).cuda_stream)
+    rc = d_sl(
+        recv_buf.data_ptr(),
+        pq.local_shard.data_ptr(),
+        out_shard.data_ptr(),
+        int(pq.local_shard.stride(0)),
+        int(out_shard.stride(0)),
+        0,
+        int(pq.peer_bytes),
+        int(pq.scale_off),
+        pq.S,
+        0,
+        0,
+        pq.S,
+        pq.H,
+        pq.world_size,
+        pq.rank,
+        int(SP_LOWSM_WB_OUT),
+        int(eff_ctas),
+        stream,
+    )
+    return rc == 0
+
+
+def compressed_a2a_wire_and_last3_into(
+    partial: torch.Tensor | PreQuantA2APartial,
+    out_shard: torch.Tensor,
+    *,
+    mode: str,
+    world_size: int,
+    rank: int,
+    halo_rows: int = 3,
+    all_to_all_fn: Any | None = None,
+    lowsm_ctas: int | None = None,
+) -> dict[str, Any] | None:
+    """NIC-Pure Interleaved Stage 1 (runs on `comm_stream`):
+    Executes ONLY A2A wire (+ 2-stage quant if `partial` is BF16; ZERO quant if `partial` is
+    `PreQuantA2APartial`!) and dequants ONLY the final `halo_rows` (`3` rows = ~1.5 us) into
+    `out_shard[S-halo_rows:S]` so `ring_shift_into` can complete immediately!
+    Returns a descriptor for `finish_a2a_dequant_rest(...)` to run `[0, S-halo_rows)` on
+    `compute_stream` overlapped behind the next NIC collective!"""
+    if _is_stream_capturing():
+        return None
+    rhd_lib = _get_rhd_comm_lib()
+    if rhd_lib is None or not hasattr(rhd_lib, "a2a_dequant_sum8_int8_g64_slice_lowsm_fwd"):
+        return None
+    if world_size not in (2, 4, 8):
+        return None
+    a2a = _tp_all_to_all_peers if all_to_all_fn is None else all_to_all_fn
+    eff_ctas = (
+        max(min(int(lowsm_ctas), 48), 1)
+        if (lowsm_ctas is not None and int(lowsm_ctas) > 0)
+        else SP_LOWSM_CTAS
+    )
+    if isinstance(partial, PreQuantA2APartial):
+        S, H = partial.S, partial.H
+        if S <= halo_rows:
+            return None
+        recv_buf = torch.empty(
+            (world_size, partial.peer_bytes), dtype=torch.uint8, device=out_shard.device
+        )
+        a2a(partial.send_buf, recv_buf)
+        d_sl = (
+            rhd_lib.a2a_dequant_sum8_fp8_g64_slice_lowsm_fwd
+            if partial.is_fp8
+            else rhd_lib.a2a_dequant_sum8_int8_g64_slice_lowsm_fwd
+        )
+        stream = int(torch.cuda.current_stream(out_shard.device).cuda_stream)
+        rc = d_sl(
+            recv_buf.data_ptr(), partial.local_shard.data_ptr(), out_shard.data_ptr(),
+            int(partial.local_shard.stride(0)), int(out_shard.stride(0)), 0,
+            int(partial.peer_bytes), int(partial.scale_off),
+            S, S - halo_rows, S - halo_rows, halo_rows, H, world_size, rank,
+            1, min(halo_rows, eff_ctas), stream,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"a2a_dequant_sum8_g64_slice_lowsm_fwd (prequant halo) failed after AllToAll: rc={rc}"
+            )
+        return {
+            "is_fp8": partial.is_fp8,
+            "self_x": partial.local_shard,
+            "self_row_base": 0,
+            "out_shard": out_shard,
+            "S": S,
+            "H": H,
+            "world_size": world_size,
+            "rank": rank,
+            "chunks": [(recv_buf, partial.peer_bytes, partial.scale_off, 0, 0, S - halo_rows)],
+        }
+
+    if (
+        mode not in ("a2a_int8_lowsm", "a2a_fp8_lowsm", "a2a_int8_pipe_lowsm", "a2a_fp8_pipe_lowsm")
+        or not partial.is_cuda
+        or partial.dtype != torch.bfloat16
+        or partial.ndim != 2
+    ):
+        return None
+    T, H = int(partial.shape[0]), int(partial.shape[1])
+    if T < SP_RS_MIN_T or T % world_size != 0 or H % 128 != 0:
+        return None
+    S = T // world_size
+    if S <= halo_rows + 2:
+        return None
+    s0 = S // 2
+    s1 = S - s0
+    if s1 < halo_rows:
+        return None
+    is_fp8 = "fp8" in mode
+    q_sl = (
+        rhd_lib.a2a_quant_fp8_g64_slice_lowsm_fwd
+        if is_fp8
+        else rhd_lib.a2a_quant_int8_g64_slice_lowsm_fwd
+    )
+    d_sl = (
+        rhd_lib.a2a_dequant_sum8_fp8_g64_slice_lowsm_fwd
+        if is_fp8
+        else rhd_lib.a2a_dequant_sum8_int8_g64_slice_lowsm_fwd
+    )
+    partial_c = partial.contiguous()
+    sc_off0, pb0 = _rhd_g64_packed_bytes(s0, H)
+    sc_off1, pb1 = _rhd_g64_packed_bytes(s1, H)
+    pst = _get_a2a_pipe_state(partial_c.device, world_size, max(pb0, pb1))
+    send0 = pst["send0"][: world_size * pb0].view(world_size, pb0)
+    send1 = pst["send1"][: world_size * pb1].view(world_size, pb1)
+    # Fresh CachingAllocator recv buffers -> zero race with next collective on comm_stream!
+    recv0 = torch.empty((world_size, pb0), dtype=torch.uint8, device=partial_c.device)
+    recv1 = torch.empty((world_size, pb1), dtype=torch.uint8, device=partial_c.device)
+    cur_s = torch.cuda.current_stream(partial_c.device)
+    cod_s = pst["codec_stream"]
+    cod_u64 = int(cod_s.cuda_stream)
+    cur_u64 = int(cur_s.cuda_stream)
+    partial_c.record_stream(cod_s)
+    pst["ev_start"].record(cur_s)
+    cod_s.wait_event(pst["ev_start"])
+    rc = q_sl(
+        partial_c.data_ptr(), send0.data_ptr(),
+        int(partial_c.stride(0)), int(pb0), int(sc_off0),
+        S, 0, s0, H, world_size, rank, int(eff_ctas), cod_u64,
+    )
+    if rc != 0:
+        _join_codec_stream(cur_s, cod_s, pst["ev_d1"])
+        return None
+    pst["ev_q0"].record(cod_s)
+    rc = q_sl(
+        partial_c.data_ptr(), send1.data_ptr(),
+        int(partial_c.stride(0)), int(pb1), int(sc_off1),
+        S, s0, s1, H, world_size, rank, int(eff_ctas), cod_u64,
+    )
+    if rc != 0:
+        _join_codec_stream(cur_s, cod_s, pst["ev_d1"])
+        return None
+    pst["ev_q1"].record(cod_s)
+    cur_s.wait_event(pst["ev_q0"])
+    a2a(send0, recv0)
+    cur_s.wait_event(pst["ev_q1"])
+    a2a(send1, recv1)
+    # Dequant ONLY last `halo_rows` of `recv1` (~1.5 us) for immediate ring_shift_into!
+    rc = d_sl(
+        recv1.data_ptr(), partial_c.data_ptr(), out_shard.data_ptr(),
+        int(partial_c.stride(0)), int(out_shard.stride(0)), int(rank * S),
+        int(pb1), int(sc_off1),
+        S, S - halo_rows, s1 - halo_rows, halo_rows, H, world_size, rank,
+        1, min(halo_rows, eff_ctas), cur_u64,
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"a2a_dequant_sum8_g64_slice_lowsm_fwd (wire halo) failed after AllToAll: rc={rc}"
+        )
+    chunks: list[tuple[torch.Tensor, int, int, int, int, int]] = [
+        (recv0, pb0, sc_off0, 0, 0, s0),
+    ]
+    if s1 > halo_rows:
+        chunks.append((recv1, pb1, sc_off1, s0, 0, s1 - halo_rows))
+    return {
+        "is_fp8": is_fp8,
+        "self_x": partial_c,
+        "self_row_base": int(rank * S),
+        "out_shard": out_shard,
+        "S": S,
+        "H": H,
+        "world_size": world_size,
+        "rank": rank,
+        "chunks": chunks,
+    }
+
+
+def finish_a2a_dequant_rest(
+    desc: dict[str, Any],
+    *,
+    max_ctas: int = 48,
+    wb_out: int = 1,
+) -> None:
+    """NIC-Pure Interleaved Stage 2 (runs on `compute_stream` at 48 SMs, 100% overlapped
+    behind the next NIC collective on `comm_stream`!): finishes rows `[0, S - halo_rows)`."""
+    rhd_lib = _get_rhd_comm_lib()
+    assert rhd_lib is not None
+    d_sl = (
+        rhd_lib.a2a_dequant_sum8_fp8_g64_slice_lowsm_fwd
+        if desc["is_fp8"]
+        else rhd_lib.a2a_dequant_sum8_int8_g64_slice_lowsm_fwd
+    )
+    self_x: torch.Tensor = desc["self_x"]
+    out_shard: torch.Tensor = desc["out_shard"]
+    cur_s = torch.cuda.current_stream(out_shard.device)
+    stream_u64 = int(cur_s.cuda_stream)
+    self_x.record_stream(cur_s)
+    for recv_buf, pb, sc_off, row_beg, recv_row_beg, row_cnt in desc["chunks"]:
+        recv_buf.record_stream(cur_s)
+        rc = d_sl(
+            recv_buf.data_ptr(),
+            self_x.data_ptr(),
+            out_shard.data_ptr(),
+            int(self_x.stride(0)),
+            int(out_shard.stride(0)),
+            int(desc["self_row_base"]),
+            int(pb),
+            int(sc_off),
+            int(desc["S"]),
+            int(row_beg),
+            int(recv_row_beg),
+            int(row_cnt),
+            int(desc["H"]),
+            int(desc["world_size"]),
+            int(desc["rank"]),
+            int(wb_out),
+            int(max_ctas),
+            stream_u64,
+        )
+        if rc != 0:
+            raise RuntimeError(f"a2a_dequant_sum8_g64_slice_lowsm_fwd failed: rc={rc}")
+
+
+def compressed_all_gather_prequant_fp8_dim0(
+    x_fp8_s: torch.Tensor,
+    x_scale_s: torch.Tensor,
+    *,
+    world_size: int | None = None,
+    all_gather_1d_fn: Any | None = None,
+    pynccl_group_ag_fn: Any | None = None,
+) -> torch.Tensor:
+    """Wave-V11 Zero-Quant Zero-Unpack Grouped FP8 AllGather from fused
+    `fused_sconv_ar_fp8_ag_v11_fwd` outputs `(x_fp8_s [S, H], x_scale_s [S, 1])`!
+    100% pure NIC wire (0 quant kernel, 0 unpack kernel, 0 BF16 round-trip!)."""
+    S, H = int(x_fp8_s.shape[0]), int(x_fp8_s.shape[1])
+    if world_size is None:
+        from vllm.distributed import get_tp_group
+
+        tp_grp = get_tp_group()
+        world_size = int(tp_grp.world_size)
+    else:
+        tp_grp = None
+    T = S * world_size
+    x_fp8_u8 = x_fp8_s.contiguous().view(torch.uint8)
+    x_sc_c = x_scale_s.contiguous().view(S, 1)
+
+    if pynccl_group_ag_fn is not None:
+        out_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_fp8_s.device)
+        out_scale = torch.empty((T, 1), dtype=torch.float32, device=x_fp8_s.device)
+        pynccl_group_ag_fn((out_fp8.view(torch.uint8), x_fp8_u8), (out_scale, x_sc_c))
+        out_fp8._inkling_fp8_scale = out_scale  # type: ignore[attr-defined]
+        return out_fp8
+
+    if tp_grp is None:
+        from vllm.distributed import get_tp_group
+
+        tp_grp = get_tp_group()
+    comm = getattr(tp_grp, "device_communicator", None)
+    pynccl = getattr(comm, "pynccl_comm", None) if comm is not None else None
+    if pynccl is not None and not getattr(pynccl, "disabled", False):
+        out_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_fp8_s.device)
+        out_scale = torch.empty((T, 1), dtype=torch.float32, device=x_fp8_s.device)
+        pynccl.group_start()
+        pynccl.all_gather(out_fp8.view(torch.uint8), x_fp8_u8)
+        pynccl.all_gather(out_scale, x_sc_c)
+        pynccl.group_end()
+        out_fp8._inkling_fp8_scale = out_scale  # type: ignore[attr-defined]
+        return out_fp8
+
+    if all_gather_1d_fn is not None:
+        out_fp8 = all_gather_1d_fn(x_fp8_u8).view(torch.float8_e4m3fn)
+        out_scale = all_gather_1d_fn(x_sc_c)
+    else:
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        out_fp8 = tensor_model_parallel_all_gather(x_fp8_u8, dim=0).view(torch.float8_e4m3fn)
+        out_scale = tensor_model_parallel_all_gather(x_sc_c, dim=0)
+    out_fp8._inkling_fp8_scale = out_scale  # type: ignore[attr-defined]
+    return out_fp8
 
 
 def _rhd_reduce_scatter_into(
@@ -1768,7 +2425,7 @@ def _rhd_reduce_scatter_into(
         (SP_RHD_PIPE if pipe is None else bool(pipe))
         and (lib is not None)
         and (world_size >= 4)
-        and (not use_lowsm_cu)
+        and ((not use_lowsm_cu) or SP_RHD_LOWSM_PIPE)
     )
     eff_ctas = max(int(max_ctas or SP_LOWSM_CTAS), 1)
     half0 = T // 2
@@ -1887,6 +2544,28 @@ def _rhd_reduce_scatter_into(
                 SEND_UPPER=send_upper, NG=NG, IS_FP8=is_fp8, num_warps=4,
             )
 
+    def _run_daq(
+        recv_u8: torch.Tensor, local_bf: torch.Tensor, next_send_u8: torch.Tensor,
+        local_off: int, r_sc_off: int, n_sc_off: int, M: int, s_u64: int,
+    ) -> None:
+        assert daq_fn is not None
+        if use_lowsm_cu:
+            rc = daq_fn(
+                recv_u8.data_ptr(), local_bf.data_ptr(), next_send_u8.data_ptr(),
+                int(local_bf.stride(0)), int(local_off), int(r_sc_off), int(n_sc_off),
+                int(M), H, eff_ctas, s_u64,
+            )
+            if rc != 0:
+                raise RuntimeError(f"rhd_dequant_add_quant_g64_lowsm_fwd failed: rc={rc}")
+        else:
+            rc = daq_fn(
+                recv_u8.data_ptr(), local_bf.data_ptr(), next_send_u8.data_ptr(),
+                int(local_bf.stride(0)), int(local_off), int(r_sc_off), int(n_sc_off),
+                int(M), H, s_u64,
+            )
+            if rc != 0:
+                raise RuntimeError(f"rhd_dequant_add_quant_g64_fwd failed: rc={rc}")
+
     def _run_dab(
         recv_u8: torch.Tensor, local_bf: torch.Tensor, out_bf: torch.Tensor,
         local_off: int, r_sc_off: int, M: int, wb_out: int, s_u64: int,
@@ -1942,55 +2621,58 @@ def _rhd_reduce_scatter_into(
         send1 = st["send1"][:sub_b]
         recv1 = st["recv1"][:sub_b]
         keep1 = st["keep1"][: sub_M * H].view(sub_M, H)
-        wb_k1 = 1 if (sub_M * H * 2 <= SP_RHD_WB_MAX_BYTES) else 0
+        wb_k1 = 0 if use_lowsm_cu else (1 if (sub_M * H * 2 <= SP_RHD_WB_MAX_BYTES) else 0)
+        wb_k2 = 0 if use_lowsm_cu else (1 if (S * H * 2 <= SP_RHD_WB_MAX_BYTES) else 0)
+        eff_wb_final = 0 if (use_lowsm_cu and wb_final == 0) else 1
 
         st["ev_start"].record(cur_stream)
         cs.wait_event(st["ev_start"])
 
-        # 1. Quantize sub-half A on codec_stream -> signal ev_qA
-        _run_quant(partial, send0_A, send0_off + sub_A_off, sub_sc_off, sub_M, cs_u64)
-        st["ev_qA"].record(cs)
+        try:
+            # 1. Quantize sub-half A on codec_stream -> signal ev_qA
+            _run_quant(partial, send0_A, send0_off + sub_A_off, sub_sc_off, sub_M, cs_u64)
+            st["ev_qA"].record(cs)
 
-        # 2. Quantize sub-half B on codec_stream (overlaps Step 0A wire!)
-        _run_quant(partial, send0_B, send0_off + sub_B_off, sub_sc_off, sub_M, cs_u64)
-        st["ev_qB"].record(cs)
+            # 2. Quantize sub-half B on codec_stream (overlaps Step 0A wire!)
+            _run_quant(partial, send0_B, send0_off + sub_B_off, sub_sc_off, sub_M, cs_u64)
+            st["ev_qB"].record(cs)
 
-        # 3. Step 0A wire on cur_stream -> signal ev_cA
-        partner0 = rank ^ bit0
-        cur_stream.wait_event(st["ev_qA"])
-        _pair_ex(send0_A, recv0_A, partner0, bit0)
-        st["ev_cA"].record(cur_stream)
+            # 3. Step 0A wire on cur_stream -> signal ev_cA
+            partner0 = rank ^ bit0
+            cur_stream.wait_event(st["ev_qA"])
+            _pair_ex(send0_A, recv0_A, partner0, bit0)
+            st["ev_cA"].record(cur_stream)
 
-        # 4. Immediately compute send1 from recv0_A + local0_A on codec_stream (overlaps Step 0B wire!)
-        cs.wait_event(st["ev_cA"])
-        rc = daq_fn(
-            recv0_A.data_ptr(), partial.data_ptr(), send1.data_ptr(),
-            int(partial.stride(0)), int(keep0_off + sub_A_off), int(sub_sc_off), int(sub_sc_off),
-            int(sub_M), H, cs_u64,
-        )
-        if rc != 0:
-            raise RuntimeError(f"rhd_dequant_add_quant_g64_fwd failed: rc={rc}")
-        st["ev_s1"].record(cs)
+            # 4. Immediately compute send1 from recv0_A + local0_A on codec_stream (overlaps Step 0B wire!)
+            cs.wait_event(st["ev_cA"])
+            _run_daq(
+                recv0_A, partial, send1,
+                keep0_off + sub_A_off, sub_sc_off, sub_sc_off, sub_M, cs_u64,
+            )
+            st["ev_s1"].record(cs)
 
-        # 5. Step 0B wire on cur_stream -> signal ev_cB
-        cur_stream.wait_event(st["ev_qB"])
-        _pair_ex(send0_B, recv0_B, partner0, bit0)
-        st["ev_cB"].record(cur_stream)
+            # 5. Step 0B wire on cur_stream -> signal ev_cB
+            cur_stream.wait_event(st["ev_qB"])
+            _pair_ex(send0_B, recv0_B, partner0, bit0)
+            st["ev_cB"].record(cur_stream)
 
-        # 6. Compute keep1 from recv0_B + local0_B on codec_stream (overlaps Step 1 wire!)
-        cs.wait_event(st["ev_cB"])
-        _run_dab(recv0_B, partial, keep1, keep0_off + sub_B_off, sub_sc_off, sub_M, wb_k1, cs_u64)
-        st["ev_k1"].record(cs)
+            # 6. Compute keep1 from recv0_B + local0_B on codec_stream (overlaps Step 1 wire!)
+            cs.wait_event(st["ev_cB"])
+            _run_dab(recv0_B, partial, keep1, keep0_off + sub_B_off, sub_sc_off, sub_M, wb_k1, cs_u64)
+            st["ev_k1"].record(cs)
 
-        # 7. Step 1 wire on cur_stream (starts immediately once send1 ready, ZERO gap!)
-        partner1 = rank ^ bit1
-        cur_stream.wait_event(st["ev_s1"])
-        _pair_ex(send1, recv1, partner1, bit1)
-        cur_stream.wait_event(st["ev_k1"])
+            # 7. Step 1 wire on cur_stream (starts immediately once send1 ready, ZERO gap!)
+            partner1 = rank ^ bit1
+            cur_stream.wait_event(st["ev_s1"])
+            _pair_ex(send1, recv1, partner1, bit1)
+            cur_stream.wait_event(st["ev_k1"])
+        except Exception:
+            _join_codec_stream(cur_stream, cs, st["ev_k1"])
+            raise
 
         if K == 2:
             # W == 4: Step 1 was final step!
-            _run_dab(recv1, keep1, out_shard, 0, sub_sc_off, S, 1, cur_stream_u64)
+            _run_dab(recv1, keep1, out_shard, 0, sub_sc_off, S, eff_wb_final, cur_stream_u64)
             return True
 
         # W == 8: fuse Step 1 -> Step 2 (`split_quant` -> Step 2 exchange -> final add!)
@@ -2003,10 +2685,10 @@ def _rhd_reduce_scatter_into(
         _run_split(
             recv1, keep1, send2, keep2,
             local_off=0, r_sc_off=sub_sc_off, n_sc_off=sc2_off,
-            N=S, send_upper=send_upper2, wb_keep=1, s_u64=cur_stream_u64,
+            N=S, send_upper=send_upper2, wb_keep=wb_k2, s_u64=cur_stream_u64,
         )
         _pair_ex(send2, recv2, rank ^ next_bit, next_bit)
-        _run_dab(recv2, keep2, out_shard, 0, sc2_off, S, 1, cur_stream_u64)
+        _run_dab(recv2, keep2, out_shard, 0, sc2_off, S, eff_wb_final, cur_stream_u64)
         return True
 
     # -----------------------------------------------------------------------
@@ -2096,7 +2778,7 @@ def compressed_all_gather_dim0(
         return None
     if not shard.is_cuda or shard.dtype != torch.bfloat16 or shard.ndim != 2:
         return None
-    if torch.cuda.is_current_stream_capturing():
+    if _is_stream_capturing():
         return None
 
     if world_size is None or rank is None:
@@ -2238,7 +2920,7 @@ def compressed_all_gather_dim0(
         if is_lowsm and has_lowsm_cu and lib is not None:
             rc1 = lib.rhd_ag_quant_fp8_rowwise_lowsm_fwd(
                 shard_c.data_ptr(), ag_buf[rank].data_ptr(),
-                int(shard_c.stride(0)), int(scale_off), S, H, int(SP_LOWSM_CTAS), stream_u64,
+                int(shard_c.stride(0)), int(scale_off), S, H, int(eff_ag_ctas), stream_u64,
             )
             if rc1 != 0:
                 return None
@@ -2248,7 +2930,7 @@ def compressed_all_gather_dim0(
             rc2 = lib.rhd_ag_unpack_fp8_rowwise_lowsm_fwd(
                 ag_buf.data_ptr(), out_fp8.data_ptr(), out_scale.data_ptr(),
                 int(shard_bytes), int(scale_off), int(out_fp8.stride(0)),
-                S, H, world_size, int(SP_LOWSM_WB_OUT), int(SP_LOWSM_CTAS), stream_u64,
+                S, H, world_size, int(SP_LOWSM_WB_OUT), int(eff_ag_ctas), stream_u64,
             )
             if rc2 != 0:
                 return None
@@ -2310,7 +2992,7 @@ def compressed_all_gather_dim0(
         d_fn = lib.rhd_ag_dequant_fp8_g64_lowsm_fwd if is_fp8 else lib.rhd_ag_dequant_int8_g64_lowsm_fwd
         rc1 = q_fn(
             shard_c.data_ptr(), ag_buf[rank].data_ptr(),
-            int(shard_c.stride(0)), 0, int(scale_off), S, H, int(SP_LOWSM_CTAS), stream_u64,
+            int(shard_c.stride(0)), 0, int(scale_off), S, H, int(eff_ag_ctas), stream_u64,
         )
         if rc1 != 0:
             return None
@@ -2318,7 +3000,7 @@ def compressed_all_gather_dim0(
         rc2 = d_fn(
             ag_buf.data_ptr(), out_bf16.data_ptr(),
             int(shard_bytes), int(scale_off), int(out_bf16.stride(0)),
-            S, H, world_size, int(SP_LOWSM_WB_OUT), int(SP_LOWSM_CTAS), stream_u64,
+            S, H, world_size, int(SP_LOWSM_WB_OUT), int(eff_ag_ctas), stream_u64,
         )
         if rc2 != 0:
             return None

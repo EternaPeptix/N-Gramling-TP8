@@ -1,0 +1,14 @@
+# Wave-V15 Periodic Watchdog Timer (Runs independent health/recovery probe every 30s)
+[Unit]
+Description=Inkling-2-Small TP8 Wave-V15 Periodic 8-Node Health Watchdog Timer
+Documentation=file://@V15_INSTALL_DIR@/REPORT.md
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=false
+Unit=inkling-tp8-v15-watchdog.service
+
+[Install]
+WantedBy=timers.target

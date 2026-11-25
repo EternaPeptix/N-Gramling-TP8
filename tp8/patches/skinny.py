@@ -109,10 +109,11 @@ def _config(M, N, K):
 
 
 def supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    return (x.dim() == 2 and x.shape[0] <= 32 and x.dtype == torch.bfloat16
-            and weight.dtype == torch.bfloat16 and x.stride(1) == 1
-            and weight.stride(1) == 1 and x.shape[1] == weight.shape[1]
-            and x.shape[1] >= 256)
+    return (x.is_cuda and weight.is_cuda and x.dim() == 2 and weight.dim() == 2
+            and 0 <= x.shape[0] <= 32 and weight.shape[0] > 0
+            and x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+            and x.stride(1) == 1 and weight.stride(1) == 1
+            and x.shape[1] == weight.shape[1] and x.shape[1] >= 256)
 
 
 def skinny_linear(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None,
@@ -124,9 +125,14 @@ def skinny_linear(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | Non
     kernel) start early."""
     M, K = x.shape
     N = weight.shape[0]
+    if M > 32:
+        raise ValueError(f"skinny_linear supports M <= 32, got M={M}")
     if out is None:
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    if M == 0:
+    else:
+        if out.dim() != 2 or out.shape != (M, N) or out.stride(1) != 1:
+            raise ValueError(f"skinny_linear invalid out shape/stride: {tuple(out.shape)} stride={out.stride()}")
+    if M == 0 or N == 0:
         return out
     if _OV is not None:
         bm, bn, bk, split, nw, ns = _OV

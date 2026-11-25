@@ -78,6 +78,32 @@ _DRAFT_U4_V9_SHAPES_RAW = os.environ.get("INKLING_DRAFT_U4_V9_SHAPES", "all").st
 _DRAFT_U4_V9_MIN_M = max(1, int(os.environ.get("INKLING_DRAFT_U4_V9_MIN_M", "1") or "1"))
 _DRAFT_U4_V9_LIB = None
 _DRAFT_U4_V9_TRIED = False
+# Wave-V14: Opt-in fix for V9 prealloc_stream_scratch (default OFF = 0; always active when V14=1).
+_DRAFT_U4_V9_PREALLOC = os.environ.get("INKLING_DRAFT_U4_V9_PREALLOC", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+
+# Wave-V14: Native SM121a Ultra-Low-Latency M=1..64 FP16-Exact 4-Bit Panel GEMM (default OFF = 0).
+# Tier-1 (M=1..4 zero-SMEM SIMT), Tier-2 (M=5..8 BM=8 ldmatrix.x2 FP16-TC), Tier-3 (M=9..64 MT=1..4 FP16-TC).
+# Zero BF16 scale/zp truncation (0-ULP weight dequant match to Triton), pipelined SCP/ZPP preload, 1-barrier loop,
+# and coherent single-launch split-K finalize across all 27 drafter GEMMs (incl. M=1..8!).
+_DRAFT_U4_CUDA_V14 = os.environ.get("INKLING_DRAFT_U4_CUDA_V14", "0").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_DRAFT_U4_V14_LIB_PATH = os.environ.get(
+    "INKLING_DRAFT_U4_V14_LIB", "/rdma/libdrafter_u4_c18_v14.so"
+)
+_DRAFT_U4_V14_SHAPES_RAW = os.environ.get("INKLING_DRAFT_U4_V14_SHAPES", "all").strip().lower()
+_DRAFT_U4_V14_MIN_M = max(1, int(os.environ.get("INKLING_DRAFT_U4_V14_MIN_M", "1") or "1"))
+_DRAFT_U4_V14_MAX_M = min(64, max(1, int(os.environ.get("INKLING_DRAFT_U4_V14_MAX_M", "64") or "64")))
+_DRAFT_U4_V14_M18_MODE = int(os.environ.get("INKLING_DRAFT_U4_V14_M18_MODE", "0") or "0")
+_DRAFT_U4_V14_BN64_MIN_M = max(1, int(os.environ.get("INKLING_DRAFT_U4_V14_BN64_MIN_M", "17") or "17"))
+_DRAFT_U4_V14_QUALIFY = os.environ.get("INKLING_DRAFT_U4_V14_QUALIFY", "1").strip().lower() not in (
+    "0", "", "off", "false", "no"
+)
+_DRAFT_U4_V14_LIB = None
+_DRAFT_U4_V14_TRIED = False
+_DRAFT_U4_V14_QUAL: dict[int, bool] = {}
 
 # Wave-V9 Path B: GB10 48-SM Triton config tuning + coherent .cg FUSE_SPLIT (default OFF = 0).
 _U4_V9_CFG = os.environ.get("INKLING_U4_V9_CFG", "0").strip().lower() not in (
@@ -103,8 +129,7 @@ _V9_SHAPE_TAGS = {
 }
 
 
-def _v9_shape_enabled(n: int, k: int) -> bool:
-    sel = _DRAFT_U4_V9_SHAPES_RAW
+def _shape_filter_enabled(sel: str, n: int, k: int) -> bool:
     if not sel or sel == "all":
         return True
     tag = _V9_SHAPE_TAGS.get((int(n), int(k)), f"{int(n)}x{int(k)}")
@@ -116,6 +141,142 @@ def _v9_shape_enabled(n: int, k: int) -> bool:
     if "trunk" in parts and tag != "draft_head":
         return True
     return tag in parts or f"{int(n)}x{int(k)}" in parts
+
+
+def _v9_shape_enabled(n: int, k: int) -> bool:
+    return _shape_filter_enabled(_DRAFT_U4_V9_SHAPES_RAW, n, k)
+
+
+def _v14_shape_enabled(n: int, k: int) -> bool:
+    return _shape_filter_enabled(_DRAFT_U4_V14_SHAPES_RAW, n, k)
+
+
+def _get_draft_u4_v14_lib():
+    global _DRAFT_U4_V14_LIB, _DRAFT_U4_V14_TRIED
+    if not _DRAFT_U4_V14_TRIED:
+        _DRAFT_U4_V14_TRIED = True
+        if _DRAFT_U4_CUDA_V14 and os.path.isfile(_DRAFT_U4_V14_LIB_PATH):
+            try:
+                import ctypes
+                c_vp = ctypes.c_void_p
+                c_i = ctypes.c_int
+                c_i64 = ctypes.c_int64
+                c_u64 = ctypes.c_uint64
+                lib = ctypes.CDLL(_DRAFT_U4_V14_LIB_PATH)
+                lib.drafter_u4_c18_v14_version.argtypes = []
+                lib.drafter_u4_c18_v14_version.restype = c_i
+                lib.drafter_u4_c18_v14_fwd.argtypes = [
+                    c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp,
+                    c_i, c_i, c_i, c_i, c_i, c_i, c_i, c_i,
+                    c_i64, c_i64, c_i64,
+                    c_i, c_i, c_i, c_i, c_i, c_i, c_i, c_i, c_i, c_i, c_u64,
+                ]
+                lib.drafter_u4_c18_v14_fwd.restype = c_i
+                if lib.drafter_u4_c18_v14_version() == 14:
+                    _DRAFT_U4_V14_LIB = lib
+                    print(
+                        f"[inkling-draft-u4-v14] loaded {_DRAFT_U4_V14_LIB_PATH} "
+                        f"(SM121a FP16-exact M={_DRAFT_U4_V14_MIN_M}..{_DRAFT_U4_V14_MAX_M}, "
+                        f"m18_mode={_DRAFT_U4_V14_M18_MODE}, bn64_min_m={_DRAFT_U4_V14_BN64_MIN_M}, "
+                        f"shapes={_DRAFT_U4_V14_SHAPES_RAW})",
+                        flush=True,
+                    )
+            except (OSError, AttributeError):
+                _DRAFT_U4_V14_LIB = None
+    return _DRAFT_U4_V14_LIB
+
+
+@torch.no_grad()
+def qualify_draft_u4_v14(device: torch.device) -> bool:
+    """Fail-closed startup fidelity & split-K SEM self-reset check for libdrafter_u4_c18_v14.so."""
+    if not _DRAFT_U4_CUDA_V14 or device.type != "cuda":
+        return False
+    d = _dev_idx(device)
+    if d in _DRAFT_U4_V14_QUAL:
+        return _DRAFT_U4_V14_QUAL[d]
+    if not _DRAFT_U4_V14_QUALIFY:
+        _DRAFT_U4_V14_QUAL[d] = True
+        return True
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    lib = _get_draft_u4_v14_lib()
+    if lib is None:
+        _DRAFT_U4_V14_QUAL[d] = False
+        return False
+    prealloc_stream_scratch(device)
+    ok = True
+    try:
+        gen = torch.Generator(device=device)
+        gen.manual_seed(14014)
+        stream = int(torch.cuda.current_stream(device).cuda_stream)
+        for m_t, n_t, k_t, sp_t, sym_t, silu_t, out_f32_t in (
+            (1, 64, 512, 1, False, False, False),
+            (4, 64, 512, 2, False, False, False),
+            (7, 64, 512, 2, False, False, True),
+            (8, 64, 512, 1, False, True, False),
+            (16, 64, 512, 2, True, False, False),
+        ):
+            w = (torch.randn((n_t, k_t), device=device, generator=gen) * 0.25).to(torch.bfloat16)
+            wp, scp, zpp, meta = quantize_u4_panel(w, group_size=32, symmetric=sym_t, interleave_silu=silu_t)
+            _, _, bn_q, bk_q, g_q, _, _, _, _, _ = meta
+            x = (torch.randn((m_t, k_t), device=device, generator=gen) * 0.25).to(torch.bfloat16)
+            bias = (torch.randn((n_t,), device=device, generator=gen) * 0.1).float() if out_f32_t else None
+            out_n = (n_t // 2) if silu_t else n_t
+            out_dt = torch.float32 if out_f32_t else torch.bfloat16
+            out_v14 = torch.empty((m_t, out_n), dtype=out_dt, device=device)
+            eff_bn = 16 if bn_q == 16 else 32
+            n_sub = triton.cdiv(n_t, eff_bn)
+            part = torch.empty((n_sub * sp_t * 16 * eff_bn,), dtype=torch.float32, device=device) if sp_t > 1 else None
+            sem = torch.zeros((n_sub,), dtype=torch.int32, device=device) if sp_t > 1 else None
+            rc = lib.drafter_u4_c18_v14_fwd(
+                x.data_ptr(), 0, wp.data_ptr(), scp.data_ptr(),
+                0 if sym_t else zpp.data_ptr(),
+                bias.data_ptr() if bias is not None else 0,
+                part.data_ptr() if part is not None else 0,
+                sem.data_ptr() if sem is not None else 0,
+                out_v14.data_ptr(),
+                m_t, n_t, k_t, bn_q, eff_bn, bk_q, g_q, sp_t,
+                int(x.stride(0)), 0, int(out_v14.stride(0)),
+                1 if sym_t else 0, 1 if silu_t else 0, 1 if out_f32_t else 0,
+                0, 1, 0, 1 if bias is not None else 0, 1 if out_f32_t else 0,
+                0, int(_DRAFT_U4_V14_M18_MODE), stream,
+            )
+            if rc != 0:
+                ok = False
+                break
+            if sem is not None and int(sem.abs().sum().item()) != 0:
+                ok = False
+                break
+            # Compare against Triton reference on identical quantized panel
+            out_ref = torch.empty((m_t, out_n), dtype=out_dt, device=device)
+            ks_r = triton.cdiv(triton.cdiv(k_t, sp_t), bk_q) * bk_q
+            sp_r = triton.cdiv(k_t, ks_r)
+            part_r = out_ref if sp_r == 1 else torch.empty((sp_r, m_t, n_t), dtype=torch.float32, device=device)
+            _u4_panel_kernel[(triton.cdiv(n_t, bn_q), sp_r)](
+                x, x, wp, scp, scp if sym_t else zpp,
+                bias if bias is not None else out_ref, part_r, out_ref, out_ref,
+                m_t, n_t, k_t, x.stride(0), 0, out_ref.stride(0), ks_r, 1, 0,
+                BM=16, BN=bn_q, BK=bk_q, G=g_q, DIRECT=(sp_r == 1), HAS_BIAS=(bias is not None),
+                SYM_I4=sym_t, FUSE_SILU=silu_t, FUSE_RNN=False, SPLIT=sp_r, FUSE_SPLIT=False,
+                PDL=False, FUSE_RNN_BATCH=False, num_warps=4, num_stages=2,
+            )
+            if sp_r > 1:
+                mn_r = m_t * n_t
+                if bias is not None:
+                    _reduce_bias_kernel[(triton.cdiv(mn_r, 1024),)](part_r, bias, out_ref, mn_r, out_ref.stride(0), n_t, S=sp_r, BLOCK=1024, PDL=False, num_warps=4)
+                else:
+                    _reduce_kernel[(triton.cdiv(mn_r, 1024),)](part_r, out_ref, mn_r, out_ref.stride(0), n_t, S=sp_r, BLOCK=1024, PDL=False, num_warps=4)
+            diff = float((out_v14.float() - out_ref.float()).abs().max().item())
+            if diff > 5e-2 or not torch.isfinite(out_v14).all():
+                ok = False
+                break
+        torch.cuda.synchronize(device)
+    except Exception as _q14_err:
+        print(f"[inkling-draft-u4-v14] qualify dev={d} WARNING: {_q14_err!r}", flush=True)
+        ok = False
+    _DRAFT_U4_V14_QUAL[d] = ok
+    print(f"[inkling-draft-u4-v14] qualify dev={d}: ok={int(ok)}", flush=True)
+    return ok
 
 
 def _get_draft_u4_v9_lib():
@@ -260,9 +421,16 @@ def prealloc_stream_scratch(
     """Pre-allocate fused split-K (PART, SEM) scratch outside CUDA graph capture.
     Pass stream=None for the main/capture bank (bank 0); pass a dedicated side stream
     to register and pre-allocate a disjoint bank (>= 1) for that stream."""
-    if not (_U4_FUSE_REDUCE or _DRAFT_U4_CUDA_V5 or _DRAFT_U4_CUDA_V7) or device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+    _want_scratch = (
+        _U4_FUSE_REDUCE
+        or _DRAFT_U4_CUDA_V5
+        or _DRAFT_U4_CUDA_V7
+        or _DRAFT_U4_CUDA_V14
+        or (_DRAFT_U4_CUDA_V9 and _DRAFT_U4_V9_PREALLOC)
+    )
+    if not _want_scratch or device.type != "cuda" or torch.cuda.is_current_stream_capturing():
         return 0
-    if _DRAFT_U4_CUDA_V7:
+    if _DRAFT_U4_CUDA_V7 or _DRAFT_U4_CUDA_V14 or (_DRAFT_U4_CUDA_V9 and _DRAFT_U4_V9_PREALLOC):
         min_part_elems = max(int(min_part_elems), 262144)
     d = _dev_idx(device)
     if stream is None:
@@ -1054,6 +1222,88 @@ def skinny_u4_panel_linear(
     fuse_rnn = x2 is not None
     fuse_rnn_batch = bool(fuse_rnn and n_reqs > 1 and k_steps > 0)
     sx2 = 0 if (not fuse_rnn or x2.shape[0] == 1) else x2.stride(0)
+    if (
+        _DRAFT_U4_CUDA_V14
+        and _DRAFT_U4_V14_MIN_M <= M <= _DRAFT_U4_V14_MAX_M
+        and x.dtype == torch.bfloat16
+        and (not fuse_rnn or x2.dtype == torch.bfloat16)
+        and (not has_bias or (bias.dtype in (torch.bfloat16, torch.float32) and bias.is_contiguous()))
+        and out.dtype in (torch.bfloat16, torch.float32)
+        and bn in (16, 32, 64)
+        and bk in (128, 256)
+        and g in (32, 64)
+        and not (fuse_silu and out.dtype == torch.float32)
+        and not (bn == 16 and (fuse_silu or out.dtype == torch.float32))
+        and _v14_shape_enabled(N, K)
+    ):
+        lib_v14 = _get_draft_u4_v14_lib()
+        if lib_v14 is not None and _DRAFT_U4_V14_QUAL.get(_dev_idx(x.device), not _DRAFT_U4_V14_QUALIFY):
+            mt_v14 = (M + 15) // 16
+            out_f32_v14 = 1 if out.dtype == torch.float32 else 0
+            use_t1_v14 = (M <= 4) and (_DRAFT_U4_V14_M18_MODE in (0, 2))
+            use_t2_v14 = (M <= 8) and (not use_t1_v14) and (_DRAFT_U4_V14_M18_MODE != 3)
+            if bn == 16:
+                eff_bn_v14 = 16
+            elif (
+                bn == 64
+                and not fuse_silu
+                and not out_f32_v14
+                and not use_t1_v14
+                and M >= _DRAFT_U4_V14_BN64_MIN_M
+                and N >= 8192
+                and (use_t2_v14 or mt_v14 >= 2)
+            ):
+                eff_bn_v14 = 64
+            else:
+                eff_bn_v14 = 32
+            ks_v14 = triton.cdiv(triton.cdiv(K, split), bk) * bk
+            split_v14 = triton.cdiv(K, ks_v14)
+            n_sub_v14 = triton.cdiv(N, eff_bn_v14)
+            if use_t1_v14:
+                bm_tile_v14 = 1 if M == 1 else (2 if M == 2 else 4)
+            elif use_t2_v14:
+                bm_tile_v14 = 8
+            else:
+                bm_tile_v14 = mt_v14 * 16
+            p_ptr_v14, s_ptr_v14 = 0, 0
+            ok_v14 = True
+            if split_v14 > 1:
+                scr_v14 = _next_fuse_scratch(
+                    x.device, n_sub_v14 * split_v14 * bm_tile_v14 * eff_bn_v14, n_sub_v14
+                )
+                if scr_v14 is None:
+                    ok_v14 = False
+                else:
+                    p_ptr_v14, s_ptr_v14 = scr_v14[0].data_ptr(), scr_v14[1].data_ptr()
+            if ok_v14:
+                rnn_mode_v14 = 2 if fuse_rnn_batch else (1 if fuse_rnn else 0)
+                bias_f32_v14 = 1 if (has_bias and bias.dtype == torch.float32) else 0
+                rc_v14 = lib_v14.drafter_u4_c18_v14_fwd(
+                    x.data_ptr(),
+                    x2.data_ptr() if fuse_rnn else 0,
+                    wp.data_ptr(),
+                    scp.data_ptr(),
+                    0 if sym_i4 else zpp.data_ptr(),
+                    bias.data_ptr() if has_bias else 0,
+                    p_ptr_v14,
+                    s_ptr_v14,
+                    out.data_ptr(),
+                    int(M), int(N), int(K),
+                    int(bn), int(eff_bn_v14), int(bk), int(g), int(split_v14),
+                    int(x.stride(0)), int(sx2), int(out.stride(0)),
+                    1 if sym_i4 else 0,
+                    1 if fuse_silu else 0,
+                    int(out_f32_v14),
+                    int(rnn_mode_v14),
+                    int(n_reqs), int(k_steps),
+                    1 if has_bias else 0,
+                    int(bias_f32_v14),
+                    1 if use_pdl else 0,
+                    int(_DRAFT_U4_V14_M18_MODE),
+                    int(torch.cuda.current_stream(x.device).cuda_stream),
+                )
+                if rc_v14 == 0:
+                    return out
     if (
         _DRAFT_U4_CUDA_V9
         and _DRAFT_U4_V9_MIN_M <= M <= 64

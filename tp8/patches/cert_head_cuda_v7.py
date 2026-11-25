@@ -33,9 +33,31 @@ try:
 except ImportError:  # Local Mac verification runs without PyTorch
     torch = None  # type: ignore[assignment]
 
-ENABLED = os.environ.get("INKLING_CERT_HEAD_V7", "0").strip().lower() in ("1", "true", "on", "yes")
-_LIB_PATH = os.environ.get("INKLING_CERT_V7_LIB", "/rdma/libcert_head_fast_v7.so")
-MAX_M = max(16, min(128, int(os.environ.get("INKLING_CERT_HEAD_V7_MAX_M", "16") or 16)))
+V14_ENABLED = os.environ.get("INKLING_CERT_HEAD_V14", "0").strip().lower() in ("1", "true", "on", "yes")
+_V14_MAX_M_RAW = os.environ.get("INKLING_CERT_HEAD_V14_MAX_M", "").strip()
+V14_MAX_M = max(16, min(128, int(_V14_MAX_M_RAW or "64")))
+ENABLED = (
+    os.environ.get("INKLING_CERT_HEAD_V7", "0").strip().lower() in ("1", "true", "on", "yes")
+    or V14_ENABLED
+)
+_LIB_PATH = (
+    os.environ.get("INKLING_CERT_V14_LIB")
+    or os.environ.get("INKLING_CERT_V7_LIB", "/rdma/libcert_head_fast_v14.so")
+) if V14_ENABLED else os.environ.get("INKLING_CERT_V7_LIB", "/rdma/libcert_head_fast_v7.so")
+MAX_M = (
+    V14_MAX_M
+    if (V14_ENABLED and _V14_MAX_M_RAW != "")
+    else max(
+        16,
+        min(
+            128,
+            int(
+                os.environ.get("INKLING_CERT_HEAD_V7_MAX_M", "64" if V14_ENABLED else "16")
+                or ("64" if V14_ENABLED else "16")
+            ),
+        ),
+    )
+)
 _QUALIFY_REF = os.environ.get("INKLING_CERT_V9_QUALIFY_REF", "torch").strip().lower()  # torch (default) | b1_exact
 _CFG_ID = int(os.environ.get("INKLING_CERT_V7_CFG", "0"))  # 0: BN=64 W=4 SUB=2 (default); 1: BN=32 W=4; 2: BN=16 W=2
 _REF_GRID = int(os.environ.get("INKLING_CERT_V7_REF_GRID", "96"))
@@ -48,6 +70,52 @@ _DELEGATE_C32 = os.environ.get(
     "INKLING_CERT_V7_DELEGATE_C32",
     "0" if _FREE_PACKED_DEFAULT else "1",
 ).strip().lower() not in ("0", "", "off", "false", "no")
+# Wave-V16 opt-in temp > 0 & n=4 shared-prefix direct-logit bypass (default OFF = 0, 100% 0-ULP safe).
+TEMP_DIRECT_V16 = os.environ.get("INKLING_CERT_HEAD_TEMP_DIRECT_V16", "0").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+_TEMP_DIRECT_STEP_ACTIVE = False
+_TEMP_DIRECT_L2PF_HINT = False
+_TEMP_DIRECT_SHARED_PREFIX_N = 1
+_TEMP_DIRECT_BYPASS_STEPS = 0
+_TEMP_DIRECT_SHARED_PREFIX_STEPS = 0
+
+
+def set_temp_direct_step(
+    active: bool, shared_prefix_n: int = 1, update_l2pf_hint: bool = True
+) -> None:
+    """Mark current decode step as temp > 0 (zero host syncs): skips CertHead screening & redirects L2PF."""
+    global _TEMP_DIRECT_STEP_ACTIVE, _TEMP_DIRECT_L2PF_HINT, _TEMP_DIRECT_SHARED_PREFIX_N
+    global _TEMP_DIRECT_BYPASS_STEPS, _TEMP_DIRECT_SHARED_PREFIX_STEPS
+    act = bool(active)
+    _TEMP_DIRECT_STEP_ACTIVE = act
+    if update_l2pf_hint:
+        _TEMP_DIRECT_L2PF_HINT = act
+    sp_n = max(1, int(shared_prefix_n))
+    _TEMP_DIRECT_SHARED_PREFIX_N = sp_n
+    if act and TEMP_DIRECT_V16:
+        _TEMP_DIRECT_BYPASS_STEPS += 1
+        if sp_n > 1:
+            _TEMP_DIRECT_SHARED_PREFIX_STEPS += 1
+
+
+def is_temp_direct_active() -> bool:
+    return bool(TEMP_DIRECT_V16 and _TEMP_DIRECT_STEP_ACTIVE)
+
+
+def is_temp_direct_l2pf_bypass() -> bool:
+    return bool(TEMP_DIRECT_V16 and (_TEMP_DIRECT_STEP_ACTIVE or _TEMP_DIRECT_L2PF_HINT))
+
+
+def get_temp_direct_stats() -> dict[str, int | bool]:
+    return {
+        "enabled": bool(TEMP_DIRECT_V16),
+        "step_active": bool(_TEMP_DIRECT_STEP_ACTIVE),
+        "l2pf_hint": bool(_TEMP_DIRECT_L2PF_HINT),
+        "last_shared_prefix_n": int(_TEMP_DIRECT_SHARED_PREFIX_N),
+        "bypass_steps": int(_TEMP_DIRECT_BYPASS_STEPS),
+        "shared_prefix_steps": int(_TEMP_DIRECT_SHARED_PREFIX_STEPS),
+    }
 
 MS_MULTS = np.array([0.375, 0.5625, 0.75, 1.0], dtype=np.float32)
 
@@ -83,6 +151,7 @@ _CFGS = {
 _LIB = None
 _HAS_C48 = False
 _HAS_V9 = False
+_HAS_V14 = False
 _LIB_VER = 0
 _LIB_C48_MAX_M = 16
 _LIB_LOCK = threading.Lock()
@@ -398,9 +467,17 @@ class CudaCertTableV7:
     cfg_id: int
     cacc2: float
 
-    def l2pf_segments(self):
-        """Multi-segment L2PF descriptor for Layer-47 MoE AR overlap (fits inside 10 MB head budget)."""
-        return (self.nv1, self.rt1, self.big_s, (self.ms_u4, 655360), self.slabs_u4)
+    def l2pf_segments(self, num_tokens: int | None = None, g2: bool = True):
+        """Multi-segment L2PF descriptor for Layer-47 MoE AR overlap (compatible with l2pf._cuda_head_segments).
+
+        Returns 5-tuple `(nv1, rt1, (big_s, bs_cap), (ms_u4, ms_cap), slabs_u4)` when `g2=True` so
+        `l2pf.py`'s C32/C48 scale-cap logic recognizes BOTH `(big_s, cap)` and `(ms_u4, cap)` cleanly.
+        """
+        if not g2:
+            return self.slabs_u4
+        if num_tokens is not None and int(num_tokens) > 16:
+            return (self.nv1, self.rt1, (self.big_s, 262144), (self.ms_u4, 1048576), self.slabs_u4)
+        return (self.nv1, self.rt1, (self.big_s, 131072), (self.ms_u4, 524288), self.slabs_u4)
 
 
 @dataclass
@@ -423,10 +500,11 @@ class CudaCertStateV7:
     nlive_full: object
     mask1: object = None
     mask1_128: object = None
+    alive_bm: object = None
 
 
 def _load_lib():
-    global _LIB, _HAS_C48, _HAS_V9, _LIB_VER, _LIB_C48_MAX_M
+    global _LIB, _HAS_C48, _HAS_V9, _HAS_V14, _LIB_VER, _LIB_C48_MAX_M
     if _LIB is not None:
         return _LIB
     with _LIB_LOCK:
@@ -500,6 +578,41 @@ def _load_lib():
                 lib.cert_head_v9_post_refine.restype = ctypes.c_int
                 _HAS_V9 = True
 
+            if hasattr(lib, "cert_head_v14_pre_screen") and hasattr(lib, "cert_head_v14_post_refine"):
+                lib.cert_head_v14_pre_screen.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_uint64,
+                ]
+                lib.cert_head_v14_pre_screen.restype = ctypes.c_int
+
+                lib.cert_head_v14_post_refine.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_uint64,
+                ]
+                lib.cert_head_v14_post_refine.restype = ctypes.c_int
+                _HAS_V14 = True
+
             if hasattr(lib, "cert_head_v9_max_m"):
                 lib.cert_head_v9_max_m.argtypes = []
                 lib.cert_head_v9_max_m.restype = ctypes.c_int
@@ -519,7 +632,11 @@ def _load_lib():
                 ctypes.c_uint64,
             ]
             lib.cert_head_v7_exact_all.restype = ctypes.c_int
-            if hasattr(lib, "cert_head_v12_version"):
+            if hasattr(lib, "cert_head_v14_version"):
+                lib.cert_head_v14_version.argtypes = []
+                lib.cert_head_v14_version.restype = ctypes.c_int
+                _LIB_VER = int(lib.cert_head_v14_version())
+            elif hasattr(lib, "cert_head_v12_version"):
                 lib.cert_head_v12_version.argtypes = []
                 lib.cert_head_v12_version.restype = ctypes.c_int
                 _LIB_VER = int(lib.cert_head_v12_version())
@@ -534,10 +651,59 @@ def _load_lib():
 
 
 def lib_max_m() -> int:
-    """Return effective max_m supported by both env (`INKLING_CERT_HEAD_V7_MAX_M`) and loaded `.so`."""
+    """Return effective max_m supported by both env (`INKLING_CERT_HEAD_V7_MAX_M` / `V14_MAX_M`) and loaded `.so`."""
     if _load_lib() is None:
         return 16
-    return min(MAX_M, _LIB_C48_MAX_M) if (_HAS_V9 or _HAS_C48) else 16
+    return min(MAX_M, _LIB_C48_MAX_M) if (_HAS_V14 or _HAS_V9 or _HAS_C48) else 16
+
+
+def get_l2pf_head_slabs(num_tokens: int | None = None, g2: bool = True):
+    """Clean L2PF slab query helper for `l2pf.py` across M=2..128 (supports V7/V12/V14 Stage-1 slabs).
+
+    Returns the active multi-segment 5-tuple `(nv1, rt1, (big_s, cap), (ms_u4, cap), slabs_u4)` (or
+    `slabs_u4` when `g2=False`) if the active CertHead table is qualified for `num_tokens`, else `None`.
+    """
+    if not ENABLED or is_temp_direct_l2pf_bypass():
+        return None
+    ad = _ACTIVE_ADAPTER
+    if ad is None or getattr(ad, "tbl", None) is None:
+        return None
+    if num_tokens is not None:
+        m = int(num_tokens)
+        if m < 2 or m > int(ad.max_m) or not bool(ad.m_ok.get(m, False)):
+            return None
+    return ad.tbl.l2pf_segments(num_tokens=num_tokens, g2=g2)
+
+
+def register_l2pf_head_slabs(tbl: CudaCertTableV7 | None = None, l2pf_mod=None) -> bool:
+    """Register active CertHead V7/V12/V14 Stage-1 slabs with `l2pf` and prewarm M=8..active_max_m."""
+    t = tbl if tbl is not None else (getattr(_ACTIVE_ADAPTER, "tbl", None) if _ACTIVE_ADAPTER is not None else None)
+    if t is None:
+        return False
+    if torch is not None and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return False
+    if l2pf_mod is None:
+        try:
+            from . import l2pf as l2pf_mod
+        except Exception:
+            try:
+                import l2pf as l2pf_mod  # type: ignore
+            except Exception:
+                return False
+    if not hasattr(l2pf_mod, "set_cuda_head_slabs"):
+        return False
+    use_g2 = bool(getattr(l2pf_mod, "G2", True))
+    segs = t.l2pf_segments(num_tokens=None, g2=use_g2)
+    l2pf_mod.set_cuda_head_slabs(segs)
+    if hasattr(l2pf_mod, "prewarm"):
+        l2pf_mod.prewarm(segs, kind="head")
+        max_m = active_max_m_global()
+        if max_m > 16:
+            segs_hi = t.l2pf_segments(num_tokens=max_m, g2=use_g2)
+            for m_pw in (28, 32, 48, 64, 128):
+                if m_pw <= max_m:
+                    l2pf_mod.prewarm(segs_hi, kind="head", num_tokens=m_pw)
+    return True
 
 
 def active_max_m_global() -> int:
@@ -549,7 +715,10 @@ def active_max_m_global() -> int:
 
 def is_m_qualified_global(M: int) -> bool:
     """True iff `M` actually passed `m_ok[M]` qualification on the active CertHead v7/v9/v12 adapter.
-    Prevents `l2pf.get_head_weight(M)` from prefetching unused v7 slabs when `M > 16` fell back!"""
+    Prevents `l2pf.get_head_weight(M)` from prefetching unused v7 slabs when `M > 16` fell back
+    or when a `temp > 0` direct-logit batch is active (`INKLING_CERT_HEAD_TEMP_DIRECT_V16=1`)!"""
+    if is_temp_direct_l2pf_bypass():
+        return False
     if not ENABLED or _load_lib() is None or M < 2:
         return False
     ad = _ACTIVE_ADAPTER
@@ -583,6 +752,9 @@ def active_summary_global() -> dict | None:
         "ok_gt16": len(ok_gt16),
         "bad_gt16": bad_gt16,
         "s1_mb": s1_mb,
+        "v14_enabled": bool(V14_ENABLED and _HAS_V14),
+        "v14_max_m": int(V14_MAX_M),
+        "temp_direct_v16": bool(TEMP_DIRECT_V16),
     }
 
 
@@ -843,7 +1015,8 @@ def alloc_state_v7(M: int, V: int, K: int, world_size: int, device) -> CudaCertS
         out_pair=torch.empty((m_cap, 4), dtype=torch.float32, device=device),
         nlive_full=torch.tensor([M], dtype=torch.int32, device=device),
         mask1=torch.empty((V,), dtype=torch.int64, device=device),
-        mask1_128=torch.empty((V, 2), dtype=torch.int64, device=device) if (M > 64 or _HAS_V9) else None,
+        mask1_128=torch.empty((V, 2), dtype=torch.int64, device=device) if (M > 64 or _HAS_V9 or _HAS_V14) else None,
+        alive_bm=torch.zeros(((V + 31) // 32,), dtype=torch.uint32, device=device) if (V14_ENABLED or _HAS_V14) else None,
     )
 
 
@@ -887,32 +1060,67 @@ def certified_local_pairs_v7(
     nl_buf = n_live_buf if n_live_buf is not None else state.nlive_full
     stream = int(torch.cuda.current_stream(x.device).cuda_stream)
 
-    rc = lib.cert_head_v7_pre_screen(
-        int(x.data_ptr()),
-        _encode_logits_idx_ptr(logits_idx),
-        int(table.slabs_u4.data_ptr()),
-        int(table.ms_u4.data_ptr()),
-        int(table.big_s.data_ptr()),
-        int(table.rt1.data_ptr()),
-        int(table.nv1.data_ptr()),
-        int(state.x_pad.data_ptr()),
-        int(state.xn.data_ptr()),
-        int(state.bad.data_ptr()),
-        int(state.s1_out.data_ptr()),
-        int(state.hi.data_ptr()),
-        int(state.thr_u.data_ptr()),
-        int(state.cnt1.data_ptr()),
-        int(state.cnt2.data_ptr()),
-        int(state.best.data_ptr()),
-        int(state.arrive.data_ptr()),
-        int(nl_buf.data_ptr()),
-        M, table.V, vreal, table.K, int(x.stride(0)),
-        table.cfg_id, 1 if pdl else 0,
-        table.cacc2, _INFL_X, _X_ABS, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
-        stream,
+    inv_cap = _inv_cap_of_v7(cap)
+    use_v14 = bool(
+        V14_ENABLED
+        and _HAS_V14
+        and getattr(state, "alive_bm", None) is not None
+        and getattr(state, "mask1_128", None) is not None
     )
+    if use_v14:
+        rc = lib.cert_head_v14_pre_screen(
+            int(x.data_ptr()),
+            _encode_logits_idx_ptr(logits_idx),
+            int(table.slabs_u4.data_ptr()),
+            int(table.ms_u4.data_ptr()),
+            int(table.big_s.data_ptr()),
+            int(table.rt1.data_ptr()),
+            int(table.nv1.data_ptr()),
+            int(state.x_pad.data_ptr()),
+            int(state.xn.data_ptr()),
+            int(state.bad.data_ptr()),
+            int(state.s1_out.data_ptr()),
+            int(state.hi.data_ptr()),
+            int(state.thr_u.data_ptr()),
+            int(state.cnt1.data_ptr()),
+            int(state.cnt2.data_ptr()),
+            int(state.best.data_ptr()),
+            int(state.arrive.data_ptr()),
+            int(state.alive_bm.data_ptr()),
+            int(nl_buf.data_ptr()),
+            M, table.V, vreal, table.K, int(x.stride(0)),
+            table.cfg_id, 1 if pdl else 0,
+            table.cacc2, _INFL_X, _X_ABS, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+            inv_cap, float(cap), float(slack),
+            stream,
+        )
+    else:
+        rc = lib.cert_head_v7_pre_screen(
+            int(x.data_ptr()),
+            _encode_logits_idx_ptr(logits_idx),
+            int(table.slabs_u4.data_ptr()),
+            int(table.ms_u4.data_ptr()),
+            int(table.big_s.data_ptr()),
+            int(table.rt1.data_ptr()),
+            int(table.nv1.data_ptr()),
+            int(state.x_pad.data_ptr()),
+            int(state.xn.data_ptr()),
+            int(state.bad.data_ptr()),
+            int(state.s1_out.data_ptr()),
+            int(state.hi.data_ptr()),
+            int(state.thr_u.data_ptr()),
+            int(state.cnt1.data_ptr()),
+            int(state.cnt2.data_ptr()),
+            int(state.best.data_ptr()),
+            int(state.arrive.data_ptr()),
+            int(nl_buf.data_ptr()),
+            M, table.V, vreal, table.K, int(x.stride(0)),
+            table.cfg_id, 1 if pdl else 0,
+            table.cacc2, _INFL_X, _X_ABS, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+            stream,
+        )
     if rc != 0:
-        raise RuntimeError(f"cert_head_v7_pre_screen failed: cudaError={rc}")
+        raise RuntimeError(f"cert_head_{'v14' if use_v14 else 'v7'}_pre_screen failed: cudaError={rc}")
 
     if ag_thr_fn is not None and world_size > 1:
         ag_thr_fn(state.thr_u, state.thr_ag)
@@ -924,8 +1132,38 @@ def certified_local_pairs_v7(
         ws = 1
         tstride = M
 
-    inv_cap = _inv_cap_of_v7(cap)
-    if _HAS_V9 and getattr(state, "mask1_128", None) is not None:
+    if use_v14:
+        rc = lib.cert_head_v14_post_refine(
+            int(state.x_pad.data_ptr()),
+            int(w_bf16.data_ptr()),
+            int(table.lsb1_row.data_ptr()),
+            int(table.ms_row.data_ptr()),
+            int(table.big_s_row.data_ptr()),
+            int(state.s1_out.data_ptr()),
+            int(table.rt2.data_ptr()),
+            int(table.nv2.data_ptr()),
+            int(state.xn.data_ptr()),
+            int(state.hi.data_ptr()),
+            thr_ag_ptr,
+            int(state.bad.data_ptr()),
+            int(state.alive_bm.data_ptr()),
+            int(state.t_glob.data_ptr()),
+            int(state.idx1.data_ptr()),
+            int(state.mask1_128.data_ptr()),
+            int(state.cnt1.data_ptr()),
+            int(state.idx2.data_ptr()),
+            int(state.cnt2.data_ptr()),
+            int(state.best.data_ptr()),
+            int(state.arrive.data_ptr()),
+            int(state.out_pair.data_ptr()),
+            int(nl_buf.data_ptr()),
+            M, table.V, vreal, vstart, table.K, int(w_bf16.stride(0)),
+            ws, tstride, _REF_GRID, 1 if pdl else 0,
+            table.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+            inv_cap, cap, slack,
+            stream,
+        )
+    elif _HAS_V9 and getattr(state, "mask1_128", None) is not None:
         rc = lib.cert_head_v9_post_refine(
             int(state.x_pad.data_ptr()),
             int(w_bf16.data_ptr()),
@@ -1141,10 +1379,15 @@ class CudaCertStateV7Adapter:
             bad_gt16 = [m for m in bad if m > 16]
             if not bad_le16:
                 _ACTIVE_ADAPTER = self
+                if V14_ENABLED:
+                    try:
+                        register_l2pf_head_slabs(self.tbl)
+                    except Exception:
+                        pass
             if os.environ.get("INKLING_CERT_VERBOSE", "1") != "0":
-                _ver_tag = _LIB_VER or (9 if _HAS_V9 else 7)
+                _ver_tag = _LIB_VER or (14 if _HAS_V14 else (9 if _HAS_V9 else 7))
                 print(
-                    f"[cert-v{_ver_tag}] C48 qualify (ref={_QUALIFY_REF}) M=2..{lim}: "
+                    f"[cert-v{_ver_tag}] C48 qualify (ref={_QUALIFY_REF}, v14={int(V14_ENABLED and _HAS_V14)}) M=2..{lim}: "
                     f"ok={lim - 1 - len(bad)}/{lim - 1} "
                     f"(bad_le16={bad_le16}, bad_gt16={bad_gt16})",
                     flush=True,
@@ -1152,9 +1395,57 @@ class CudaCertStateV7Adapter:
             return bad_le16
         if not bad:
             _ACTIVE_ADAPTER = self
+            if V14_ENABLED:
+                try:
+                    register_l2pf_head_slabs(self.tbl)
+                except Exception:
+                    pass
         return bad
 
+    def direct_logits_handoff(
+        self,
+        x,
+        out_dtype=None,
+        shared_prefix_groups: tuple[int, ...] | list[int] | None = None,
+    ):
+        """Zero-sync direct BF16/FP32 lm_head handoff for `temp > 0` batches (0 CertHead screening,
+        avoids redundant `.contiguous()` copies when `x.stride(1) == 1`, supports `n=4` shared-prefix dedup)."""
+        assert torch is not None
+        x_in = x if (x.dtype == torch.bfloat16 and x.stride(1) == 1) else x.to(torch.bfloat16).contiguous()
+        if (
+            TEMP_DIRECT_V16
+            and shared_prefix_groups is not None
+            and x_in.dim() == 2
+            and len(shared_prefix_groups) == int(x_in.shape[0])
+            and len(shared_prefix_groups) > 1
+        ):
+            first_idx: dict[int, int] = {}
+            uniq_rows: list[int] = []
+            gather_idx: list[int] = []
+            for row_i, g_id in enumerate(shared_prefix_groups):
+                u_pos = first_idx.get(g_id)
+                if u_pos is None:
+                    u_pos = len(uniq_rows)
+                    first_idx[g_id] = u_pos
+                    uniq_rows.append(row_i)
+                gather_idx.append(u_pos)
+            if 0 < len(uniq_rows) < len(shared_prefix_groups):
+                idx_u = torch.tensor(uniq_rows, dtype=torch.int64, device=x_in.device)
+                idx_g = torch.tensor(gather_idx, dtype=torch.int64, device=x_in.device)
+                x_u = x_in.index_select(0, idx_u)
+                out_u = (
+                    torch.mm(x_u, self.W.t(), out_dtype=out_dtype)
+                    if out_dtype is not None
+                    else torch.mm(x_u, self.W.t())
+                )
+                return out_u.index_select(0, idx_g)
+        if out_dtype is not None:
+            return torch.mm(x_in, self.W.t(), out_dtype=out_dtype)
+        return torch.mm(x_in, self.W.t())
+
     def local_pairs(self, x, nlive=None, logits_idx=None, pdl: bool = _USE_PDL):
+        if TEMP_DIRECT_V16 and _TEMP_DIRECT_STEP_ACTIVE:
+            return None
         M = int(logits_idx.shape[0]) if logits_idx is not None else int(x.shape[0])
         if M > self.max_m and self._c32_state is not None and logits_idx is None:
             try:
@@ -1177,32 +1468,66 @@ class CudaCertStateV7Adapter:
         stream = int(torch.cuda.current_stream(x.device).cuda_stream)
         t = self.tbl
         st = self.state
-        rc = lib.cert_head_v7_pre_screen(
-            int(x.data_ptr()),
-            _encode_logits_idx_ptr(logits_idx),
-            int(t.slabs_u4.data_ptr()),
-            int(t.ms_u4.data_ptr()),
-            int(t.big_s.data_ptr()),
-            int(t.rt1.data_ptr()),
-            int(t.nv1.data_ptr()),
-            int(st.x_pad.data_ptr()),
-            int(st.xn.data_ptr()),
-            int(st.bad.data_ptr()),
-            int(st.s1_out.data_ptr()),
-            int(st.hi.data_ptr()),
-            int(st.thr_u.data_ptr()),
-            int(st.cnt1.data_ptr()),
-            int(st.cnt2.data_ptr()),
-            int(st.best.data_ptr()),
-            int(st.arrive.data_ptr()),
-            int(nl_buf.data_ptr()),
-            M, t.V, self.vreal, t.K, int(x.stride(0)),
-            t.cfg_id, 1 if pdl else 0,
-            t.cacc2, _INFL_X, _X_ABS, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
-            stream,
+        use_v14 = bool(
+            V14_ENABLED
+            and _HAS_V14
+            and getattr(st, "alive_bm", None) is not None
+            and getattr(st, "mask1_128", None) is not None
         )
+        if use_v14:
+            rc = lib.cert_head_v14_pre_screen(
+                int(x.data_ptr()),
+                _encode_logits_idx_ptr(logits_idx),
+                int(t.slabs_u4.data_ptr()),
+                int(t.ms_u4.data_ptr()),
+                int(t.big_s.data_ptr()),
+                int(t.rt1.data_ptr()),
+                int(t.nv1.data_ptr()),
+                int(st.x_pad.data_ptr()),
+                int(st.xn.data_ptr()),
+                int(st.bad.data_ptr()),
+                int(st.s1_out.data_ptr()),
+                int(st.hi.data_ptr()),
+                int(st.thr_u.data_ptr()),
+                int(st.cnt1.data_ptr()),
+                int(st.cnt2.data_ptr()),
+                int(st.best.data_ptr()),
+                int(st.arrive.data_ptr()),
+                int(st.alive_bm.data_ptr()),
+                int(nl_buf.data_ptr()),
+                M, t.V, self.vreal, t.K, int(x.stride(0)),
+                t.cfg_id, 1 if pdl else 0,
+                t.cacc2, _INFL_X, _X_ABS, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+                self.inv_cap, self.cap, self.slack,
+                stream,
+            )
+        else:
+            rc = lib.cert_head_v7_pre_screen(
+                int(x.data_ptr()),
+                _encode_logits_idx_ptr(logits_idx),
+                int(t.slabs_u4.data_ptr()),
+                int(t.ms_u4.data_ptr()),
+                int(t.big_s.data_ptr()),
+                int(t.rt1.data_ptr()),
+                int(t.nv1.data_ptr()),
+                int(st.x_pad.data_ptr()),
+                int(st.xn.data_ptr()),
+                int(st.bad.data_ptr()),
+                int(st.s1_out.data_ptr()),
+                int(st.hi.data_ptr()),
+                int(st.thr_u.data_ptr()),
+                int(st.cnt1.data_ptr()),
+                int(st.cnt2.data_ptr()),
+                int(st.best.data_ptr()),
+                int(st.arrive.data_ptr()),
+                int(nl_buf.data_ptr()),
+                M, t.V, self.vreal, t.K, int(x.stride(0)),
+                t.cfg_id, 1 if pdl else 0,
+                t.cacc2, _INFL_X, _X_ABS, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+                stream,
+            )
         if rc != 0:
-            raise RuntimeError(f"cert_head_v7_pre_screen failed: cudaError={rc}")
+            raise RuntimeError(f"cert_head_{'v14' if use_v14 else 'v7'}_pre_screen failed: cudaError={rc}")
 
         if self.world_size > 1:
             thr_stride = ((M + 3) // 4) * 4
@@ -1216,7 +1541,38 @@ class CudaCertStateV7Adapter:
             thr_ag_ptr = int(st.thr_u.data_ptr())
             ws = 1
 
-        if _HAS_V9 and getattr(st, "mask1_128", None) is not None:
+        if use_v14:
+            rc = lib.cert_head_v14_post_refine(
+                int(st.x_pad.data_ptr()),
+                int(self.W.data_ptr()),
+                int(t.lsb1_row.data_ptr()),
+                int(t.ms_row.data_ptr()),
+                int(t.big_s_row.data_ptr()),
+                int(st.s1_out.data_ptr()),
+                int(t.rt2.data_ptr()),
+                int(t.nv2.data_ptr()),
+                int(st.xn.data_ptr()),
+                int(st.hi.data_ptr()),
+                thr_ag_ptr,
+                int(st.bad.data_ptr()),
+                int(st.alive_bm.data_ptr()),
+                int(st.t_glob.data_ptr()),
+                int(st.idx1.data_ptr()),
+                int(st.mask1_128.data_ptr()),
+                int(st.cnt1.data_ptr()),
+                int(st.idx2.data_ptr()),
+                int(st.cnt2.data_ptr()),
+                int(st.best.data_ptr()),
+                int(st.arrive.data_ptr()),
+                int(st.out_pair.data_ptr()),
+                int(nl_buf.data_ptr()),
+                M, t.V, self.vreal, self.vstart, t.K, int(self.W.stride(0)),
+                ws, thr_stride, _REF_GRID, 1 if pdl else 0,
+                t.cacc2, _INFL_Q, _INFL_B, _SLOP_REL, _SLOP_ABS,
+                self.inv_cap, self.cap, self.slack,
+                stream,
+            )
+        elif _HAS_V9 and getattr(st, "mask1_128", None) is not None:
             rc = lib.cert_head_v9_post_refine(
                 int(st.x_pad.data_ptr()),
                 int(self.W.data_ptr()),

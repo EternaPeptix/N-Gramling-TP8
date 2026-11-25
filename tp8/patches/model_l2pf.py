@@ -92,6 +92,11 @@ from .prefill_sp import (
     SP_ZERO_SYNC,
     DBO_INTERLEAVE,
     DBO_INTERLEAVE_LOCAL_ONLY,
+    DBO_NIC_PURE_INTERLEAVE,
+    PF_WO_UD_FUSED_A2A,
+    SP_AG_MODE,
+    SP_FUSED_SCONV_FP8_AG,
+    SP_RS_MODE,
     DeferredConvSyncPlan,
     GlobalKVReplWeights,
     PrefillAROverlap,
@@ -102,6 +107,7 @@ from .prefill_sp import (
     patch_forward_attn_metadata,
     patch_prefill_pad_context,
     run_sharded_sconv_attn_res,
+    run_sharded_sconv_attn_res_v11,
     scatter_remote_conv_cache,
     sync_deferred_conv_caches,
 )
@@ -500,6 +506,17 @@ class Inkling2Model(nn.Module):
                     n_rg += 1
             if n_rg:
                 print(f"[inkling-router-bf12] prepacked {n_rg} gate weights (2.65 MB/layer)", flush=True)
+            if (
+                getattr(router_bf12, "ROUTER_BF11", False)
+                and getattr(router_bf12, "ROUTER_L2PF_V16", False)
+                and hasattr(router_bf12, "prepack_bf11")
+            ):
+                n_rg11 = 0
+                for layer in self.layers:
+                    if router_bf12.prepack_bf11(layer.mlp.gate.weight) is not None:
+                        n_rg11 += 1
+                if n_rg11:
+                    print(f"[inkling-router-bf11] prepacked {n_rg11} gate weights (2.43 MB/layer)", flush=True)
             if getattr(router_bf12, "FREE_RAW", False) and hasattr(router_bf12, "free_raw_weight"):
                 _fp8_mode_r = "off"
                 try:
@@ -569,15 +586,23 @@ class Inkling2Model(nn.Module):
         # Layer i's MoE all-reduce prefetches layer i+1's live qkvr weight; last layer prefetches cert_head/lm_head.
         _dense_pf = skinny_bf11.l2pf_tensor if skinny_bf11.ENABLED else skinny_bf12.l2pf_tensor
         _c32_prewarm_ms = (
-            (18, 24, 30, 32, 36, 42, 48, 56, 64, 128, 256)
-            if (
-                _L2PF_C28_PREWARM
-                or _L2PF_B2_MOE_W13
-                or getattr(l2pf, "C28_ADAPTIVE", False)
-                or getattr(l2pf, "C28_QKVR_TAIL", False)
-                or getattr(l2pf, "C28_WO", False)
+            (18, 21, 24, 28, 30, 32, 36, 40, 42, 48, 56, 64, 96, 128, 256)
+            if (getattr(l2pf, "L2PF_V16", False) or getattr(l2pf, "HEAD_V16", False) or getattr(l2pf, "C28_V16", False))
+            else (
+                (18, 21, 24, 28, 30, 32, 36, 42, 48, 56, 64, 128, 256)
+                if (getattr(l2pf, "C28_V14", False) or getattr(l2pf, "HEAD_V14", False))
+                else (
+                    (18, 24, 30, 32, 36, 42, 48, 56, 64, 128, 256)
+                    if (
+                        _L2PF_C28_PREWARM
+                        or _L2PF_B2_MOE_W13
+                        or getattr(l2pf, "C28_ADAPTIVE", False)
+                        or getattr(l2pf, "C28_QKVR_TAIL", False)
+                        or getattr(l2pf, "C28_WO", False)
+                    )
+                    else (32, 64, 128, 256)
+                )
             )
-            else (32, 64, 128, 256)
         )
         for a, b in zip(self.layers[:-1], self.layers[1:]):
             wq = b.attn.qkvr.weight if b.is_local else b.attn.qkvr.weight[: sum(b.attn.q_side_splits)]
@@ -588,6 +613,9 @@ class Inkling2Model(nn.Module):
             a._l2pf_next_wo_raw = _next_wo_raw
             a._l2pf_next_wo = _dense_pf(_next_wo_raw)
             l2pf.prewarm(pf_w, kind="moe")
+            if getattr(l2pf, "C28_V16", False):
+                for _m_c2 in (8, 10, 12, 14, 16):
+                    l2pf.prewarm(pf_w, kind="moe", num_tokens=_m_c2)
             if l2pf.C32:
                 for _m in _c32_prewarm_ms:
                     if _m <= l2pf.C32_MAX_M:
@@ -600,6 +628,12 @@ class Inkling2Model(nn.Module):
             gw_pf = router_bf12.l2pf_tensor(layer.mlp.gate.weight) if router_bf12.ENABLED else layer.mlp.gate.weight
             layer._l2pf_gate_w = gw_pf
             l2pf.prewarm(gw_pf, kind="gate")
+            if getattr(l2pf, "C28_V16", False):
+                for _m_c2 in (8, 10, 12, 14, 16):
+                    l2pf.prewarm(l2pf.resolve_gate_target(layer, _m_c2), kind="gate", num_tokens=_m_c2)
+            elif getattr(l2pf, "C28_V14", False) and getattr(l2pf, "C28_V14_C2", False):
+                for _m_c2 in (10, 12, 14, 16):
+                    l2pf.prewarm(l2pf.resolve_gate_target(layer, _m_c2), kind="gate", num_tokens=_m_c2)
             if _L2PF_B2_MOE_W13 and hasattr(l2pf, "moe_w13_segments"):
                 _b2_segs = l2pf.moe_w13_segments(layer.mlp.experts, 16)
                 layer._l2pf_b2_gate_w13 = (gw_pf, *_b2_segs) if _b2_segs else gw_pf
@@ -620,6 +654,12 @@ class Inkling2Model(nn.Module):
                                 l2pf.prewarm(layer.attn.wo_ud.weight, kind="attn", num_tokens=_m)
         l2pf.prewarm(l2pf.get_head_weight(num_tokens=8), kind="head")
         l2pf.prewarm(l2pf.get_head_weight(num_tokens=1), kind="head")
+        if getattr(l2pf, "HEAD_V16", False):
+            for _m_h in (8, 10, 12, 14, 16, 24, 28, 32, 36, 42, 48, 64, 96, 128):
+                l2pf.prewarm(l2pf.get_head_weight(num_tokens=_m_h), kind="head", num_tokens=_m_h)
+        elif getattr(l2pf, "C28_V14", False) and getattr(l2pf, "C28_V14_C2", False) and getattr(l2pf, "HEAD_V14", False):
+            for _m_c2 in (10, 12, 14, 16):
+                l2pf.prewarm(l2pf.get_head_weight(num_tokens=_m_c2), kind="head", num_tokens=_m_c2)
         if l2pf.C32:
             for _m in _c32_prewarm_ms:
                 if _m <= l2pf.C32_MAX_M:
@@ -681,7 +721,71 @@ class Inkling2Model(nn.Module):
         except Exception:
             pass
         if not torch.cuda.is_current_stream_capturing():
+            if os.environ.get("INKLING_PREWARM_FP8_BEFORE_KV", "0").strip().lower() in ("1", "on", "true", "yes"):
+                try:
+                    from .ops import linear as _lin_pw
+
+                    want_dense = bool(getattr(_lin_pw, "_PF_DENSE_FP8", False))
+                    want_router = bool(getattr(_lin_pw, "_PF_ROUTER_FP8", False))
+                    if want_dense or want_router:
+                        _dev_pw = self.layers[0].attn.qkvr.weight.device
+                        _mode_pw, _ = _lin_pw._probe_fp8_cap(_dev_pw)
+                        if _mode_pw != "off":
+                            _n_pw = 0
+                            for _ly in self.layers:
+                                if want_dense:
+                                    _at = getattr(_ly, "attn", None)
+                                    if _at is not None:
+                                        _wq = getattr(getattr(_at, "qkvr", None), "weight", None)
+                                        if (
+                                            isinstance(_wq, torch.Tensor)
+                                            and _wq.is_cuda
+                                            and _wq.dtype == torch.bfloat16
+                                            and _wq.ndim == 2
+                                            and _wq.untyped_storage().size() > 0
+                                        ):
+                                            _wq_u = (
+                                                _wq[: sum(_at.q_side_splits)]
+                                                if (not bool(getattr(_ly, "is_local", True)) and hasattr(_at, "q_side_splits"))
+                                                else _wq
+                                            )
+                                            _lin_pw._get_cached_w_fp8(_wq_u, _mode_pw)
+                                            _n_pw += 1
+                                        _wwo = getattr(getattr(_at, "wo_ud", None), "weight", None)
+                                        if (
+                                            isinstance(_wwo, torch.Tensor)
+                                            and _wwo.is_cuda
+                                            and _wwo.dtype == torch.bfloat16
+                                            and _wwo.ndim == 2
+                                            and _wwo.untyped_storage().size() > 0
+                                        ):
+                                            _lin_pw._get_cached_w_fp8(_wwo, _mode_pw)
+                                            _n_pw += 1
+                                if want_router:
+                                    _wg = getattr(getattr(getattr(_ly, "mlp", None), "gate", None), "weight", None)
+                                    if (
+                                        isinstance(_wg, torch.Tensor)
+                                        and _wg.is_cuda
+                                        and _wg.dtype == torch.bfloat16
+                                        and _wg.ndim == 2
+                                        and (_wg.untyped_storage().size() > 0 or getattr(_wg, "_inkling_router_bf12", None) is not None)
+                                    ):
+                                        _lin_pw._get_cached_w_fp8(_wg, _mode_pw)
+                                        _n_pw += 1
+                            if _n_pw:
+                                print(
+                                    f"[inkling-uma-v13] prewarmed {_n_pw} FP8 weights BEFORE KV sizing",
+                                    flush=True,
+                                )
+                except Exception:
+                    pass
             torch.cuda.empty_cache()
+            try:
+                from .ops import host_pin as _hp_uma
+
+                _hp_uma.reclaim_host_uma(empty_cuda=False, tag="post_link_l2pf")
+            except Exception:
+                pass
         self._l2pf_linked = True
 
     def __init__(
@@ -1155,13 +1259,16 @@ class Inkling2Model(nn.Module):
                 if not getattr(self, "_l2pf_linked", False):
                     self._l2pf_link()
                 if l2pf.GATE and num_tokens <= 16:
-                    if _L2PF_B2_MOE_W13 and num_tokens >= 9:
+                    if (getattr(l2pf, "C28_V16", False) or (getattr(l2pf, "C28_V14", False) and getattr(l2pf, "C28_V14_C2", False))) and num_tokens >= 10:
+                        l2pf.fork(l2pf.resolve_gate_target(layer, num_tokens), kind="gate", num_tokens=num_tokens)
+                    elif _L2PF_B2_MOE_W13 and num_tokens >= 9:
                         _b2_tgt = getattr(layer, "_l2pf_b2_gate_w13", None)
                         if _b2_tgt is None:
                             _b2_tgt = getattr(layer, "_l2pf_gate_w", layer.mlp.gate.weight)
                         l2pf.fork(_b2_tgt, max_bytes=_L2PF_B2_MOE_W13_BYTES, kind="gate")
                     else:
-                        l2pf.fork(getattr(layer, "_l2pf_gate_w", layer.mlp.gate.weight), kind="gate")
+                        _gw_c1 = l2pf.resolve_gate_target(layer, num_tokens) if getattr(l2pf, "L2PF_V16", False) else getattr(layer, "_l2pf_gate_w", layer.mlp.gate.weight)
+                        l2pf.fork(_gw_c1, kind="gate")
                 elif l2pf.C32 and l2pf.GATE and 17 <= num_tokens <= l2pf.C32_MAX_M:
                     l2pf.fork(l2pf.resolve_gate_target(layer, num_tokens), kind="gate", num_tokens=num_tokens)
                 attn_out = torch.empty_like(partial)
@@ -1221,9 +1328,17 @@ class Inkling2Model(nn.Module):
                     if num_tokens <= 16:
                         _nxt_pf = getattr(_exp, "l2pf_next", None)
                         if _nxt_pf is not None:
-                            l2pf.fork(_nxt_pf, kind="moe")
+                            if getattr(l2pf, "C28_V16", False) and num_tokens >= 10:
+                                l2pf.fork(_nxt_pf, kind="moe", num_tokens=num_tokens)
+                            else:
+                                l2pf.fork(_nxt_pf, kind="moe")
                         elif getattr(_exp, "l2pf_last", False):
-                            l2pf.fork(l2pf.get_head_weight(num_tokens), kind="head")
+                            if getattr(l2pf, "HEAD_V16", False) and num_tokens >= 8:
+                                l2pf.fork(l2pf.get_head_weight(num_tokens), kind="head", num_tokens=num_tokens)
+                            elif getattr(l2pf, "C28_V14", False) and getattr(l2pf, "C28_V14_C2", False) and getattr(l2pf, "HEAD_V14", False) and num_tokens >= 10:
+                                l2pf.fork(l2pf.get_head_weight(num_tokens), kind="head", num_tokens=num_tokens)
+                            else:
+                                l2pf.fork(l2pf.get_head_weight(num_tokens), kind="head")
                     elif l2pf.C32 and num_tokens <= l2pf.C32_MAX_M:
                         _nxt_pf = l2pf.resolve_dense_next(_exp, num_tokens)
                         if _nxt_pf is not None:
@@ -1689,15 +1804,41 @@ class Inkling2Model(nn.Module):
                 partial_a = stack_a[num_blocks]
                 partial_b = stack_b[num_blocks]
 
+                half1_rs_cur = (
+                    (SP_RS_HALF1_MODE or None)
+                    if layer.is_local
+                    else (SP_RS_HALF1_GLOBAL_MODE or None)
+                )
+                _eff_rs_a = half1_rs_cur if half1_rs_cur else SP_RS_MODE
+                _eff_rs_b = half2_rs_ovr if half2_rs_ovr else SP_RS_MODE
+                _use_fused_woud_a = bool(
+                    PF_WO_UD_FUSED_A2A
+                    and _eff_rs_a in ("a2a_int8_lowsm", "a2a_int8_pipe_lowsm")
+                    and (plan_a.shard_size % 128) == 0
+                )
+                _use_fused_woud_b = bool(
+                    PF_WO_UD_FUSED_A2A
+                    and _eff_rs_b in ("a2a_int8_lowsm", "a2a_int8_pipe_lowsm")
+                    and (plan_b.shard_size % 128) == 0
+                )
                 # 1. Layer i Attn(A) on compute_stream (overlaps Layer_{i-1} MoE(B) RS/SP chain!)
                 with patch_forward_attn_metadata(meta_a, slice_a, num_tokens):
-                    attn_partial_a = layer.attention(pos_a, inputs_a, tau_a)
+                    if _use_fused_woud_a:
+                        from . import prefill_sp_rs as _sp_rs_w
 
-                if DBO_INTERLEAVE and pending_b_moe_interleave is not None:
-                    # Hybrid NIC-First Interleaved Half 1 (layers 1..47):
-                    #   comm_stream:    | RS(MoE_{i-1},B) | RS(Attn_i,A) | AG(MoE_{i-1},B) | AG(Attn_i,A) |
-                    #   compute_stream: | Attn_i(A)       | SC(MoE_B)    | SC(Attn_A)      | Attn_i(B)    |
-                    # Keeps NICs 100% back-to-back with ZERO sconv+AttnRes stall on comm_stream!
+                        with _sp_rs_w.fused_wo_ud_a2a_scope(
+                            pf_sp.world_size, pf_sp.rank, plan_a.shard_size
+                        ):
+                            attn_partial_a = layer.attention(pos_a, inputs_a, tau_a)
+                    else:
+                        attn_partial_a = layer.attention(pos_a, inputs_a, tau_a)
+
+                _want_interleave_cur = (DBO_INTERLEAVE or DBO_NIC_PURE_INTERLEAVE)
+                if _want_interleave_cur and pending_b_moe_interleave is not None:
+                    # Hybrid / Wave-V11 NIC-Pure Interleaved Half 1 (layers 1..47):
+                    #   comm_stream:    | RS_wire(MoE_B) | RS_wire(Attn_A) | AG_wire(MoE_B) | AG_wire(Attn_A) |
+                    #   compute_stream: | Attn_i(A)      | Deq+SC_FP8(B)   | Deq+SC_FP8(A)  | Attn_i(B)       |
+                    # Keeps NICs 100% back-to-back with ZERO dequant or sconv+AttnRes stall on comm_stream!
                     (
                         h_prev_b_rs,
                         prev_b_sconv,
@@ -1714,22 +1855,47 @@ class Inkling2Model(nn.Module):
                     pending_b_moe_interleave = None
 
                     # 2a. Enqueue RS+halo(Attn_i, A) immediately behind RS+halo(MoE_{i-1}, B)
-                    half1_rs_cur = (
-                        (SP_RS_HALF1_MODE or None)
-                        if layer.is_local
-                        else (SP_RS_HALF1_GLOBAL_MODE or None)
-                    )
                     with patch_forward_attn_metadata(meta_a, slice_a, num_tokens):
-                        h_attn_a_rs = dbo.launch_sp_rs_halo_only(
-                            pf_sp, attn_partial_a, layer.attn_sconv, plan_a, compute_stream,
-                            rs_mode_override=half1_rs_cur,
-                            lowsm_ctas_override=half1_lowsm_ctas,
-                        )
+                        if DBO_NIC_PURE_INTERLEAVE:
+                            h_attn_a_rs = dbo.launch_sp_rs_wire_halo_only(
+                                pf_sp, attn_partial_a, layer.attn_sconv, plan_a, compute_stream,
+                                rs_mode_override=half1_rs_cur,
+                                lowsm_ctas_override=half1_lowsm_ctas,
+                            )
+                        else:
+                            h_attn_a_rs = dbo.launch_sp_rs_halo_only(
+                                pf_sp, attn_partial_a, layer.attn_sconv, plan_a, compute_stream,
+                                rs_mode_override=half1_rs_cur,
+                                lowsm_ctas_override=half1_lowsm_ctas,
+                            )
 
-                    # 2b. Run sconv+AttnRes(MoE_{i-1}, B) on compute_stream (overlaps RS(Attn_i, A)!)
+                    _eff_h1_ag = half1_ag_ovr if half1_ag_ovr else SP_AG_MODE
+                    _want_fp8_b = bool(
+                        SP_FUSED_SCONV_FP8_AG
+                        and SP_FP8_AG
+                        and prev_b_ag_modes is not None
+                        and len(prev_b_ag_modes) >= 1
+                        and prev_b_ag_modes[0] == "direct"
+                        and _eff_h1_ag == "nccl_fp8_zcopy_lowsm"
+                    )
+                    _want_fp8_a = bool(
+                        SP_FUSED_SCONV_FP8_AG
+                        and SP_FP8_AG
+                        and moe_ag_modes is not None
+                        and len(moe_ag_modes) >= 1
+                        and moe_ag_modes[0] == "direct"
+                        and _eff_h1_ag == "nccl_fp8_zcopy_lowsm"
+                    )
+
+                    # 2b. Finish dequant[0:S-3] + sconv+AttnRes+FP8(MoE_{i-1}, B) on compute_stream (overlaps RS(Attn_i, A)!)
                     with patch_forward_attn_metadata(meta_b, slice_b, num_tokens):
                         x_prev_b_halo = h_prev_b_rs.wait(compute_stream)
-                        out_shard_prev_b = run_sharded_sconv_attn_res(
+                        _deq_b = getattr(h_prev_b_rs, "_v11_deq_desc", None)
+                        if _deq_b is not None:
+                            from . import prefill_sp_rs as _sp_rs_d
+
+                            _sp_rs_d.finish_a2a_dequant_rest(_deq_b, max_ctas=48, wb_out=1)
+                        out_shard_prev_b = run_sharded_sconv_attn_res_v11(
                             sconv_mod=prev_b_sconv,
                             x_with_halo=x_prev_b_halo,
                             plan=plan_b,
@@ -1741,6 +1907,8 @@ class Inkling2Model(nn.Module):
                             normalize_values=self.normalize_values,
                             conv_addend=prev_b_conv_addend,
                             conv_res=prev_b_conv_res,
+                            want_fp8_q0=_want_fp8_b,
+                            max_ctas=0,
                         )
                         h_prev_b_ag = dbo.launch_sp_gather_only(
                             pf_sp,
@@ -1753,10 +1921,15 @@ class Inkling2Model(nn.Module):
                             lowsm_ctas_override=half1_lowsm_ctas,
                         )
 
-                    # 2c. Run sconv+AttnRes(Attn_i, A) on compute_stream (overlaps AG(MoE_{i-1}, B)!)
+                    # 2c. Finish dequant[0:S-3] + sconv+AttnRes+FP8(Attn_i, A) on compute_stream (overlaps AG(MoE_{i-1}, B)!)
                     with patch_forward_attn_metadata(meta_a, slice_a, num_tokens):
                         x_attn_a_halo = h_attn_a_rs.wait(compute_stream)
-                        out_shard_attn_a = run_sharded_sconv_attn_res(
+                        _deq_a = getattr(h_attn_a_rs, "_v11_deq_desc", None)
+                        if _deq_a is not None:
+                            from . import prefill_sp_rs as _sp_rs_d
+
+                            _sp_rs_d.finish_a2a_dequant_rest(_deq_a, max_ctas=48, wb_out=1)
+                        out_shard_attn_a = run_sharded_sconv_attn_res_v11(
                             sconv_mod=layer.attn_sconv,
                             x_with_halo=x_attn_a_halo,
                             plan=plan_a,
@@ -1766,6 +1939,8 @@ class Inkling2Model(nn.Module):
                             queries=self.attn_res.mlp_queries[i],
                             norm=layer.mlp_norm,
                             normalize_values=self.normalize_values,
+                            want_fp8_q0=_want_fp8_a,
+                            max_ctas=0,
                         )
                         h_attn_a = dbo.launch_sp_gather_only(
                             pf_sp,
@@ -1791,11 +1966,6 @@ class Inkling2Model(nn.Module):
                             pending_aux_a = None
                 else:
                     # 2. Enqueue Attn(A) RS->sconv->AG on comm_stream (behind Layer_{i-1} MoE(B))
-                    half1_rs_cur = (
-                        (SP_RS_HALF1_MODE or None)
-                        if layer.is_local
-                        else (SP_RS_HALF1_GLOBAL_MODE or None)
-                    )
                     with patch_forward_attn_metadata(meta_a, slice_a, num_tokens):
                         h_attn_a = dbo.launch_sp_sublayer(
                             pf_sp,
@@ -1832,7 +2002,15 @@ class Inkling2Model(nn.Module):
 
                 # 4. Layer i Attn(B) on compute_stream (overlaps Attn(A) SP chain / AG!)
                 with patch_forward_attn_metadata(meta_b, slice_b, num_tokens):
-                    attn_partial_b = layer.attention(pos_b, inputs_b, tau_b)
+                    if _use_fused_woud_b:
+                        from . import prefill_sp_rs as _sp_rs_w
+
+                        with _sp_rs_w.fused_wo_ud_a2a_scope(
+                            pf_sp.world_size, pf_sp.rank, plan_b.shard_size
+                        ):
+                            attn_partial_b = layer.attention(pos_b, inputs_b, tau_b)
+                    else:
+                        attn_partial_b = layer.attention(pos_b, inputs_b, tau_b)
 
                 # 5. Enqueue Attn(B) RS->sconv->AG on comm_stream (Half-2: overlaps MoE(A)!)
                 with patch_forward_attn_metadata(meta_b, slice_b, num_tokens):
@@ -1927,17 +2105,24 @@ class Inkling2Model(nn.Module):
                     else (SP_RS_HALF1_GLOBAL_MODE or None)
                 )
                 use_interleave_nxt = (
-                    DBO_INTERLEAVE
+                    (DBO_INTERLEAVE or DBO_NIC_PURE_INTERLEAVE)
                     and (i + 1 < num_layers)
                     and (not DBO_INTERLEAVE_LOCAL_ONLY or nxt_is_local)
                 )
                 if use_interleave_nxt:
                     with patch_forward_attn_metadata(meta_b, slice_b, num_tokens):
-                        h_b_rs = dbo.launch_sp_rs_halo_only(
-                            pf_sp, moe_partial_b, layer.mlp_sconv, plan_b, compute_stream,
-                            rs_mode_override=half1_rs_nxt,
-                            lowsm_ctas_override=half1_lowsm_ctas,
-                        )
+                        if DBO_NIC_PURE_INTERLEAVE:
+                            h_b_rs = dbo.launch_sp_rs_wire_halo_only(
+                                pf_sp, moe_partial_b, layer.mlp_sconv, plan_b, compute_stream,
+                                rs_mode_override=half1_rs_nxt,
+                                lowsm_ctas_override=half1_lowsm_ctas,
+                            )
+                        else:
+                            h_b_rs = dbo.launch_sp_rs_halo_only(
+                                pf_sp, moe_partial_b, layer.mlp_sconv, plan_b, compute_stream,
+                                rs_mode_override=half1_rs_nxt,
+                                lowsm_ctas_override=half1_lowsm_ctas,
+                            )
                     pending_b_moe_interleave = (
                         h_b_rs,
                         layer.mlp_sconv,
@@ -2602,6 +2787,11 @@ class Inkling2ForConditionalGeneration(
         except Exception:
             pass
         torch.cuda.empty_cache()
+        try:
+            from .ops import host_pin as _hp_uma
+            _hp_uma.reclaim_host_uma(empty_cuda=False, tag="post_load_weights")
+        except Exception:
+            pass
         return loaded
 
     @torch.no_grad()

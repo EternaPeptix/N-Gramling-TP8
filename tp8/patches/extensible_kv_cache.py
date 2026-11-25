@@ -206,6 +206,8 @@ class ExtensibleKVCache:
         allocation (discarding contents): UCX cannot RDMA a range spanning
         several allocations.
         """
+        if num_blocks < 0:
+            raise ValueError(f"Invalid commit block count {num_blocks}.")
         num_blocks = min(num_blocks, self.capacity_blocks)
         sizes = [num_blocks * stride for stride in self.segment_strides]
         remap = (
@@ -304,6 +306,8 @@ class ExtensibleKVCache:
 
     def blocks_within(self, num_bytes: int) -> int:
         """Most blocks whose physical footprint fits in num_bytes."""
+        if num_bytes <= 0:
+            return 0
         num_blocks = min(num_bytes // self.bytes_per_block, self.capacity_blocks)
         while num_blocks > 0 and self.physical_bytes_for(num_blocks) > num_bytes:
             num_blocks -= 1
@@ -633,6 +637,12 @@ def measure_kv_cache_blocks(
     torch.accelerator.synchronize()
     gc.collect()
     torch.accelerator.empty_cache()
+    try:
+        from vllm.models.inkling2.ops import host_pin as _hp_uma
+
+        _hp_uma.reclaim_host_uma(empty_cuda=False, tag="pre_kv_measure")
+    except Exception:
+        pass
     free_memory = current_platform.free_device_memory(device)
     transient_peak = kv_cache.reserved_headroom_bytes
     measured = dict(

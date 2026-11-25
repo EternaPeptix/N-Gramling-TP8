@@ -1,0 +1,790 @@
+diff -ruN a/attn_common_v13.cuh b/attn_common_v13.cuh
+--- a/attn_common_v13.cuh	2026-11-25 02:32:17
++++ b/attn_common_v13.cuh	2026-11-25 02:32:17
+@@ -44,6 +44,12 @@
+ static constexpr int   B_COLS_FMT = 72;
+ static constexpr int   P_COLS     = 72;
+ static constexpr int   kFusedMt3SmemBytes = 49664;
++// Wave-V16 Double-Buffered 3-Slot Rotating cp.async KV Ring (Global S_MODE==2, S=48 @ 1M):
++//   3 x 16 KiB KV ring (49,152 B) + Q (MT*4096) + bp (2304) + Red8 (1280) + Max0 (256) <= 64 KiB!
++static constexpr int   kGlobalS48DbMt2SmemBytes = 61184;  // 59.75 KiB <= 64 KiB
++static constexpr int   kGlobalS48DbMt3SmemBytes = 65280;  // 63.75 KiB <= 64 KiB
++static_assert(kGlobalS48DbMt2SmemBytes <= 65536, "V16 Global S48 MT2 SMEM <= 64 KiB");
++static_assert(kGlobalS48DbMt3SmemBytes <= 65536, "V16 Global S48 MT3 SMEM <= 64 KiB");
+ 
+ // Split-TU internal launch parameter bundle (POD, host-only pass-through)
+ struct AttnLaunchParams {
+@@ -372,6 +378,221 @@
+     }
+ }
+ 
++
++// =========================================================================
++// Wave-V16 Direct-Indexed BN=64 Async KV Tile Issuers (Global S_MODE==2)
++//   - Aligned BS==256 fast path: ONE scalar __ldg(bt_row + (n0 >> 8)) per 64-token tile!
++//   - Zero shared KV_blk_slot dependency -> enables 3-slot rotating cp.async ring
++//     with 2 full 16 KiB KV tiles continuously in flight across 256-token page boundaries!
++//   - Strict L2::evict_first cache hint on streaming 1M KV blocks (preserves Q/OP/LP in L2!).
++// =========================================================================
++static __device__ __forceinline__ void issue_kv64_swiz_direct_v16_async(
++    const uint16_t* __restrict__ KV_base,
++    int64_t stride_b, int64_t stride_s,
++    const int32_t* __restrict__ bt_row,
++    int n0_tile, int s_end_live, int BS, int BS_shift,
++    uint32_t kv_sptr,
++    uint4* __restrict__ smem_kv4,
++    bool evict_first,
++    uint64_t l2_policy,
++    int tid
++) {
++    const bool fast_aligned = (BS == 256) && ((n0_tile & 63) == 0) && (n0_tile + 64 <= s_end_live);
++    if (fast_aligned) {
++        const int32_t pblk = __ldg(bt_row + (n0_tile >> 8));
++        const int slot0 = n0_tile & 255;
++        const int64_t blk_base = static_cast<int64_t>(pblk) * stride_b;
++        #pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const int idx = i * 128 + tid;
++            const int row = idx >> 4;
++            const int c = idx & 15;
++            const int swiz_c = c ^ (row & 7);
++            const int64_t roff = blk_base + static_cast<int64_t>(slot0 + row) * stride_s;
++            const uint32_t s_addr = kv_sptr + static_cast<uint32_t>(row * 256 + swiz_c * 16);
++            if (evict_first) {
++                cp_async_cg_16_evict_first(s_addr, KV_base + roff + c * 8, l2_policy);
++            } else {
++                cp_async_cg_16(s_addr, KV_base + roff + c * 8);
++            }
++        }
++    } else {
++        #pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const int idx = i * 128 + tid;
++            const int row = idx >> 4;
++            const int c = idx & 15;
++            const int swiz_c = c ^ (row & 7);
++            const int kpos = n0_tile + row;
++            if (kpos < s_end_live) {
++                const int lblk = (BS_shift >= 0) ? (kpos >> BS_shift) : (kpos / BS);
++                const int slot = (BS_shift >= 0) ? (kpos & ((1 << BS_shift) - 1)) : (kpos % BS);
++                const int32_t pblk = __ldg(bt_row + lblk);
++                const int64_t roff = static_cast<int64_t>(pblk) * stride_b + static_cast<int64_t>(slot) * stride_s;
++                const uint32_t s_addr = kv_sptr + static_cast<uint32_t>(row * 256 + swiz_c * 16);
++                if (evict_first) {
++                    cp_async_cg_16_evict_first(s_addr, KV_base + roff + c * 8, l2_policy);
++                } else {
++                    cp_async_cg_16(s_addr, KV_base + roff + c * 8);
++                }
++            } else {
++                smem_kv4[row * 16 + swiz_c] = make_uint4(0u, 0u, 0u, 0u);
++            }
++        }
++    }
++}
++
++static __device__ __forceinline__ void kv_bf12_issue_tile64_direct_v16_async(
++    const uint8_t* __restrict__ kv_half_base,
++    int64_t blk_stride_bytes,
++    const int32_t* __restrict__ bt_row,
++    int n0_tile, int s_end_live, int BS, int BS_shift,
++    uint32_t kv_sptr,
++    uint8_t* __restrict__ smem_kv_u8,
++    bool use_l2_hint,
++    uint64_t l2_policy,
++    int tid
++) {
++    const bool fast_aligned = (BS == 256) && ((n0_tile & 63) == 0) && (n0_tile + 64 <= s_end_live);
++    if (fast_aligned) {
++        const int32_t pblk = __ldg(bt_row + (n0_tile >> 8));
++        const int slot0 = n0_tile & 255;
++        const KvBf12HalfBlock* blk = kv_bf12_half_blk_const(kv_half_base, blk_stride_bytes, pblk);
++        #pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const int idx = i * 128 + tid;
++            const int row = idx >> 3;
++            const int c   = idx & 7;
++            const int swiz_c = kv_bf12_sm_stage_chunk(row, c);
++            const uint32_t s_addr = kv_sptr + static_cast<uint32_t>(KV_BF12_SM_OFF_B + row * 128 + swiz_c * 16);
++            const void* g_ptr = &blk->sm[slot0 + row][c * 16];
++            if (use_l2_hint) kv_bf12_cp_async_cg_16_l2_hint(s_addr, g_ptr, l2_policy);
++            else             kv_bf12_cp_async_cg_16(s_addr, g_ptr);
++        }
++        #pragma unroll
++        for (int i = 0; i < 2; ++i) {
++            const int idx = i * 128 + tid;
++            const int row = idx >> 2;
++            const int c   = idx & 3;
++            const int swiz_c = kv_bf12_e4_stage_chunk(row, c);
++            const uint32_t s_addr = kv_sptr + static_cast<uint32_t>(KV_BF12_E4_OFF_B + row * 64 + swiz_c * 16);
++            const void* g_ptr = &blk->e4[slot0 + row][c * 16];
++            if (use_l2_hint) kv_bf12_cp_async_cg_16_l2_hint(s_addr, g_ptr, l2_policy);
++            else             kv_bf12_cp_async_cg_16(s_addr, g_ptr);
++        }
++        if (tid < KV_BF12_TILE_BN) {
++            reinterpret_cast<int32_t*>(smem_kv_u8 + KV_BF12_BLKID_OFF_B)[tid] = pblk;
++        }
++        if (tid < (KV_BF12_TILE_BN >> 2)) {
++            const int r0 = tid << 2;
++            const uint32_t s_addr = kv_sptr + static_cast<uint32_t>(KV_BF12_META_OFF_B + r0 * 4);
++            const void* g_ptr = &blk->meta[slot0 + r0];
++            if (use_l2_hint) kv_bf12_cp_async_cg_16_l2_hint(s_addr, g_ptr, l2_policy);
++            else             kv_bf12_cp_async_cg_16(s_addr, g_ptr);
++        }
++    } else {
++        auto row_bs = [&](int row) -> int2 {
++            const int kpos = n0_tile + row;
++            if (kpos >= s_end_live) return make_int2(-1, 0);
++            const int lblk = (BS_shift >= 0) ? (kpos >> BS_shift) : (kpos / BS);
++            const int slot = (BS_shift >= 0) ? (kpos & ((1 << BS_shift) - 1)) : (kpos % BS);
++            return make_int2(__ldg(bt_row + lblk), slot);
++        };
++        #pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const int idx = i * 128 + tid;
++            const int row = idx >> 3;
++            const int c   = idx & 7;
++            const int2 bs = row_bs(row);
++            if (bs.x >= 0) {
++                const KvBf12HalfBlock* blk = kv_bf12_half_blk_const(kv_half_base, blk_stride_bytes, bs.x);
++                const int swiz_c = kv_bf12_sm_stage_chunk(row, c);
++                const uint32_t s_addr = kv_sptr + static_cast<uint32_t>(KV_BF12_SM_OFF_B + row * 128 + swiz_c * 16);
++                const void* g_ptr = &blk->sm[bs.y][c * 16];
++                if (use_l2_hint) kv_bf12_cp_async_cg_16_l2_hint(s_addr, g_ptr, l2_policy);
++                else             kv_bf12_cp_async_cg_16(s_addr, g_ptr);
++            }
++        }
++        #pragma unroll
++        for (int i = 0; i < 2; ++i) {
++            const int idx = i * 128 + tid;
++            const int row = idx >> 2;
++            const int c   = idx & 3;
++            const int2 bs = row_bs(row);
++            if (bs.x >= 0) {
++                const KvBf12HalfBlock* blk = kv_bf12_half_blk_const(kv_half_base, blk_stride_bytes, bs.x);
++                const int swiz_c = kv_bf12_e4_stage_chunk(row, c);
++                const uint32_t s_addr = kv_sptr + static_cast<uint32_t>(KV_BF12_E4_OFF_B + row * 64 + swiz_c * 16);
++                const void* g_ptr = &blk->e4[bs.y][c * 16];
++                if (use_l2_hint) kv_bf12_cp_async_cg_16_l2_hint(s_addr, g_ptr, l2_policy);
++                else             kv_bf12_cp_async_cg_16(s_addr, g_ptr);
++            }
++        }
++        if (tid < KV_BF12_TILE_BN) {
++            reinterpret_cast<int32_t*>(smem_kv_u8 + KV_BF12_BLKID_OFF_B)[tid] = row_bs(tid).x;
++        }
++        if (tid < (KV_BF12_TILE_BN >> 2)) {
++            const int r0 = tid << 2;
++            const int2 b0 = row_bs(r0 + 0), b1 = row_bs(r0 + 1), b2 = row_bs(r0 + 2), b3 = row_bs(r0 + 3);
++            const bool contig4 =
++                (b0.x >= 0) && ((b0.y & 3) == 0) &&
++                (b1.x == b0.x) && (b1.y == b0.y + 1) &&
++                (b2.x == b0.x) && (b2.y == b0.y + 2) &&
++                (b3.x == b0.x) && (b3.y == b0.y + 3);
++            if (contig4) {
++                const KvBf12HalfBlock* blk = kv_bf12_half_blk_const(kv_half_base, blk_stride_bytes, b0.x);
++                const uint32_t s_addr = kv_sptr + static_cast<uint32_t>(KV_BF12_META_OFF_B + r0 * 4);
++                const void* g_ptr = &blk->meta[b0.y];
++                if (use_l2_hint) kv_bf12_cp_async_cg_16_l2_hint(s_addr, g_ptr, l2_policy);
++                else             kv_bf12_cp_async_cg_16(s_addr, g_ptr);
++            } else {
++                uint32_t* smem_meta = reinterpret_cast<uint32_t*>(smem_kv_u8 + KV_BF12_META_OFF_B);
++                auto load_meta_one = [&](int row_idx, int2 bk) {
++                    if (bk.x >= 0) {
++                        const KvBf12HalfBlock* blk = kv_bf12_half_blk_const(kv_half_base, blk_stride_bytes, bk.x);
++                        const uint32_t s_addr = kv_sptr + static_cast<uint32_t>(KV_BF12_META_OFF_B + row_idx * 4);
++                        kv_bf12_cp_async_ca_4(s_addr, &blk->meta[bk.y]);
++                    } else {
++                        smem_meta[row_idx] = 0u;
++                    }
++                };
++                load_meta_one(r0 + 0, b0);
++                load_meta_one(r0 + 1, b1);
++                load_meta_one(r0 + 2, b2);
++                load_meta_one(r0 + 3, b3);
++            }
++        }
++    }
++}
++
++template <bool KV_BF12>
++static __device__ __forceinline__ void issue_kv64_direct_v16_async(
++    const uint16_t* __restrict__ KV_base,
++    const uint8_t*  __restrict__ KV_bf12_base,
++    int64_t stride_b, int64_t stride_s,
++    const int32_t* __restrict__ bt_row,
++    int n0_tile, int s_end_live, int BS, int BS_shift,
++    uint32_t kv_sptr,
++    uint4* __restrict__ smem_kv4,
++    bool evict_first,
++    uint64_t l2_policy,
++    int tid
++) {
++    if constexpr (KV_BF12) {
++        (void)KV_base; (void)stride_s;
++        kv_bf12_issue_tile64_direct_v16_async(
++            KV_bf12_base, stride_b, bt_row, n0_tile, s_end_live, BS, BS_shift,
++            kv_sptr, reinterpret_cast<uint8_t*>(smem_kv4), evict_first, l2_policy, tid
++        );
++    } else {
++        (void)KV_bf12_base;
++        issue_kv64_swiz_direct_v16_async(
++            KV_base, stride_b, stride_s, bt_row, n0_tile, s_end_live, BS, BS_shift,
++            kv_sptr, smem_kv4, evict_first, l2_policy, tid
++        );
++    }
++}
++
+ static __device__ __forceinline__ void clip_r_row_exact_8lane(
+     const uint16_t* __restrict__ r_ptr,
+     const uint16_t* __restrict__ r_scale_row,
+@@ -1572,13 +1793,17 @@
+ //   ZERO duplication of `issue_K`, `issue_V`, or `unpack(V)`!
+ //   Every `acc[0/1/2]` uses compile-time constant indexing -> 0 B stack / 0 B spills!
+ // =========================================================================
+-template <int MT_MAX, int MT_IDX>
++template <int MT_MAX, int MT_IDX, bool COMPACT_RED8 = false>
+ static __device__ __forceinline__ float (*fusedmt_global_max_slice(
+     void* red_smem_raw, float (*Max_smem)[8]
+ ))[8] {
+     if constexpr (MT_IDX == 0) {
+         (void)red_smem_raw;
+         return Max_smem;
++    } else if constexpr (COMPACT_RED8) {
++        (void)Max_smem;
++        auto Red8 = reinterpret_cast<float (*)[8]>(red_smem_raw);
++        return &Red8[24 + (MT_IDX - 1) * 8];
+     } else if constexpr (MT_MAX <= 2) {
+         (void)Max_smem;
+         auto Red17 = reinterpret_cast<float (*)[17]>(red_smem_raw);
+@@ -1590,12 +1815,12 @@
+     }
+ }
+ 
+-template <int MT_MAX, int MT_IDX>
++template <int MT_MAX, int MT_IDX, bool COMPACT_RED8 = false>
+ static __device__ __forceinline__ void fusedmt_global_red_write(
+     void* red_smem_raw, float a0, float a1, int wid, int grp, int tid
+ ) {
+     if (tid == 0) {
+-        if constexpr (MT_MAX <= 2) {
++        if constexpr (!COMPACT_RED8 && MT_MAX <= 2) {
+             auto Red17 = reinterpret_cast<float (*)[17]>(red_smem_raw);
+             Red17[MT_IDX * 4 + wid][grp]     = a0;
+             Red17[MT_IDX * 4 + wid][grp + 8] = a1;
+@@ -1607,11 +1832,11 @@
+     }
+ }
+ 
+-template <int MT_MAX, int MT_IDX>
++template <int MT_MAX, int MT_IDX, bool COMPACT_RED8 = false>
+ static __device__ __forceinline__ void fusedmt_global_red_read(
+     const void* red_smem_raw, int grp, float& sum_p0, float& sum_p1
+ ) {
+-    if constexpr (MT_MAX <= 2) {
++    if constexpr (!COMPACT_RED8 && MT_MAX <= 2) {
+         auto Red17 = reinterpret_cast<const float (*)[17]>(red_smem_raw);
+         constexpr int r = MT_IDX * 4;
+         sum_p0 = __fadd_rn(__fadd_rn(Red17[r + 0][grp],     Red17[r + 2][grp]),
+@@ -1669,7 +1894,7 @@
+ }
+ 
+ // Pure K-compute phase (NO `issue_K`, NO `wait_group`, NO `unpack(V)` -> 0 code duplication!)
+-template <int MT_MAX, int MT_IDX>
++template <int MT_MAX, int MT_IDX, bool USE_RING3 = false>
+ static __device__ __forceinline__ void fusedmt_global_k_compute_v13(
+     bool is_last_mt, int past,
+     int n0, int n_next, int s_end_live, int E, int BS, int BS_shift,
+@@ -1783,27 +2008,31 @@
+     m_w0 = fmaxf(m_w0, __shfl_xor_sync(0xFFFFFFFFu, m_w0, 1));
+     m_w1 = fmaxf(m_w1, __shfl_xor_sync(0xFFFFFFFFu, m_w1, 2));
+     m_w1 = fmaxf(m_w1, __shfl_xor_sync(0xFFFFFFFFu, m_w1, 1));
+-    float (*Max_sl)[8] = fusedmt_global_max_slice<MT_MAX, MT_IDX>(red_smem_raw, Max_smem);
++    float (*Max_sl)[8] = fusedmt_global_max_slice<MT_MAX, MT_IDX, USE_RING3>(red_smem_raw, Max_smem);
+     if (tid == 0) {
+         Max_sl[wid][grp]     = m_w0;
+         Max_sl[wid + 4][grp] = m_w1;
+     }
+ 
+-    if (is_last_mt && n_next < s_end_live && tid_all < 64) {
+-        int kpos = n_next + tid_all;
+-        if (kpos < s_end_live) {
+-            int lblk = (BS_shift >= 0) ? (kpos >> BS_shift) : (kpos / BS);
+-            int slot = (BS_shift >= 0) ? (kpos & ((1 << BS_shift) - 1)) : (kpos % BS);
+-            KV_blk_slot[tid_all] = make_int2(bt_row[lblk], slot);
+-        } else {
+-            KV_blk_slot[tid_all] = make_int2(-1, 0);
++    if constexpr (!USE_RING3) {
++        if (is_last_mt && n_next < s_end_live && tid_all < 64) {
++            int kpos = n_next + tid_all;
++            if (kpos < s_end_live) {
++                int lblk = (BS_shift >= 0) ? (kpos >> BS_shift) : (kpos / BS);
++                int slot = (BS_shift >= 0) ? (kpos & ((1 << BS_shift) - 1)) : (kpos % BS);
++                KV_blk_slot[tid_all] = make_int2(bt_row[lblk], slot);
++            } else {
++                KV_blk_slot[tid_all] = make_int2(-1, 0);
++            }
+         }
++    } else {
++        (void)is_last_mt; (void)n_next; (void)BS; (void)BS_shift; (void)bt_row; (void)KV_blk_slot; (void)tid_all;
+     }
+     __syncthreads();  // Max_sl ready; smem_bp dead; if !FIRST: prev Red ready; if LAST: smem_kv0 dead & KV_blk_slot ready!
+ 
+     if constexpr (!IS_FIRST_MT) {
+         float p_sp0, p_sp1;
+-        fusedmt_global_red_read<MT_MAX, MT_IDX - 1>(red_smem_raw, grp, p_sp0, p_sp1);
++        fusedmt_global_red_read<MT_MAX, MT_IDX - 1, USE_RING3>(red_smem_raw, grp, p_sp0, p_sp1);
+         prev_l0 = fma_rn_f32(prev_l0, prev_a0, p_sp0);
+         prev_l1 = fma_rn_f32(prev_l1, prev_a1, p_sp1);
+     }
+@@ -1833,7 +2062,7 @@
+ 
+     const float ra0 = __fadd_rn(reduce_chunk8_b0(p0_0, p1_0), reduce_chunk8_b0(p0_1, p1_1));
+     const float ra1 = __fadd_rn(reduce_chunk8_b0(p2_0, p3_0), reduce_chunk8_b0(p2_1, p3_1));
+-    fusedmt_global_red_write<MT_MAX, MT_IDX>(red_smem_raw, ra0, ra1, wid, grp, tid);
++    fusedmt_global_red_write<MT_MAX, MT_IDX, USE_RING3>(red_smem_raw, ra0, ra1, wid, grp, tid);
+ 
+     m_i0 = m_new0;
+     m_i1 = m_new1;
+@@ -1855,7 +2084,7 @@
+ //   - Supports full S=48 via S_MODE=2!
+ // =========================================================================
+ template <int WINDOW, int S_MODE, int MT_MAX, bool USE_PDL, bool KV_BF12>
+-__global__ void __launch_bounds__(128, 2)
++__global__ void __launch_bounds__(128, (WINDOW < 0 && S_MODE == 2 && MT_MAX >= 2) ? 1 : 2)
+ fused_decode_attn_otf_fusedmt_kernel_v13(
+     const uint16_t* __restrict__ Q,
+     const uint16_t* __restrict__ R,
+@@ -1967,17 +2196,22 @@
+         if (past + r_live < s_end_live) s_end_live = past + r_live;
+     }
+ 
+-    constexpr size_t RED_BYTES = (MT_MAX <= 2) ? (64 * 17 * sizeof(float)) : (64 * 8 * sizeof(float));
++    constexpr bool   USE_RING3 = (WINDOW < 0 && S_MODE == 2 && MT_MAX >= 2);
++    constexpr size_t KV_BYTES  = USE_RING3 ? 49152 : 32768;
++    constexpr size_t RED_BYTES = USE_RING3
++        ? (40 * 8 * sizeof(float))
++        : ((MT_MAX <= 2) ? (64 * 17 * sizeof(float)) : (64 * 8 * sizeof(float)));
+     extern __shared__ uint4 smem_raw_u4[];
+     uint8_t*  smem_raw     = reinterpret_cast<uint8_t*>(smem_raw_u4);
+     uint16_t* smem_kv0     = reinterpret_cast<uint16_t*>(smem_raw);
+     uint16_t* smem_kv1     = reinterpret_cast<uint16_t*>(smem_raw + 16384);
+-    uint16_t* smem_q       = reinterpret_cast<uint16_t*>(smem_raw + 32768);
+-    uint16_t* smem_bp      = reinterpret_cast<uint16_t*>(smem_raw + 32768 + MT_MAX * 4096);
+-    void*     red_smem_raw = reinterpret_cast<void*>(smem_raw + 32768 + MT_MAX * 4096 + 2304);
+-    float (*Max_smem)[8]   = reinterpret_cast<float (*)[8]>(smem_raw + 32768 + MT_MAX * 4096 + 2304 + RED_BYTES);
++    uint16_t* smem_kv2     = USE_RING3 ? reinterpret_cast<uint16_t*>(smem_raw + 32768) : smem_kv0;
++    uint16_t* smem_q       = reinterpret_cast<uint16_t*>(smem_raw + KV_BYTES);
++    uint16_t* smem_bp      = reinterpret_cast<uint16_t*>(smem_raw + KV_BYTES + MT_MAX * 4096);
++    void*     red_smem_raw = reinterpret_cast<void*>(smem_raw + KV_BYTES + MT_MAX * 4096 + 2304);
++    float (*Max_smem)[8]   = reinterpret_cast<float (*)[8]>(smem_raw + KV_BYTES + MT_MAX * 4096 + 2304 + RED_BYTES);
+ 
+-    alignas(16) __shared__ int2     KV_blk_slot[64];
++    alignas(16) __shared__ int2     KV_blk_slot[USE_RING3 ? 1 : 64];
+     alignas(16) __shared__ uint8_t  Row_iloc[MAX_ROWS];
+     alignas(16) __shared__ uint8_t  Row_g[MAX_ROWS];
+     alignas(16) __shared__ uint8_t  Row_ok[MAX_ROWS];
+@@ -1999,24 +2233,42 @@
+     const uint8_t* V_bf12_base = reinterpret_cast<const uint8_t*>(V) + static_cast<int64_t>(kvh) * sv_h;
+     const uint32_t kv0_sptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_kv0));
+     const uint32_t kv1_sptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_kv1));
++    const uint32_t kv2_sptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_kv2));
+     const uint32_t q_sptr   = static_cast<uint32_t>(__cvta_generic_to_shared(smem_q));
+     uint4* smem_kv0_4 = reinterpret_cast<uint4*>(smem_kv0);
+     uint4* smem_kv1_4 = reinterpret_cast<uint4*>(smem_kv1);
++    uint4* smem_kv2_4 = reinterpret_cast<uint4*>(smem_kv2);
+     uint4* smem_q_4   = reinterpret_cast<uint4*>(smem_q);
++    auto kv_ring_p    = [&](int idx) -> uint16_t* { return smem_kv0   + (idx << 13); };
++    auto kv_ring_sptr = [&](int idx) -> uint32_t  { return kv0_sptr   + (static_cast<uint32_t>(idx) << 14); };
++    auto kv_ring_4    = [&](int idx) -> uint4*    { return smem_kv0_4 + (idx << 10); };
++    if constexpr (!USE_RING3) { (void)kv_ring_p; (void)kv_ring_sptr; (void)kv_ring_4; }
+ 
+     const bool tile0_is_past = (!USE_PDL) && (s_beg < s_end_live) && ((s_beg + BN) <= past);
+     if (tile0_is_past) {
+-        if (tid_all < 64) {
+-            int kpos = s_beg + tid_all;
+-            int lblk = (BS_shift >= 0) ? (kpos >> BS_shift) : (kpos / BS);
+-            int slot = (BS_shift >= 0) ? (kpos & ((1 << BS_shift) - 1)) : (kpos % BS);
+-            KV_blk_slot[tid_all] = make_int2(bt_row[lblk], slot);
++        if constexpr (USE_RING3) {
++            __syncthreads();
++            issue_kv64_direct_v16_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, bt_row, s_beg, s_end_live, BS, BS_shift, kv_ring_sptr(0), kv_ring_4(0), evict_first, l2_policy, tid_all);
++            cp_async_commit();
++            issue_kv64_direct_v16_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, bt_row, s_beg, s_end_live, BS, BS_shift, kv_ring_sptr(1), kv_ring_4(1), evict_first, l2_policy, tid_all);
++            cp_async_commit();
++            if (s_beg + BN < s_end_live) {
++                issue_kv64_direct_v16_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, bt_row, s_beg + BN, s_end_live, BS, BS_shift, kv_ring_sptr(2), kv_ring_4(2), evict_first, l2_policy, tid_all);
++                cp_async_commit();
++            }
++        } else {
++            if (tid_all < 64) {
++                int kpos = s_beg + tid_all;
++                int lblk = (BS_shift >= 0) ? (kpos >> BS_shift) : (kpos / BS);
++                int slot = (BS_shift >= 0) ? (kpos & ((1 << BS_shift) - 1)) : (kpos % BS);
++                KV_blk_slot[tid_all] = make_int2(bt_row[lblk], slot);
++            }
++            __syncthreads();
++            issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, evict_first, l2_policy, tid_all);
++            cp_async_commit();
++            issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, evict_first, l2_policy, tid_all);
++            cp_async_commit();
+         }
+-        __syncthreads();
+-        issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, evict_first, l2_policy, tid_all);
+-        cp_async_commit();
+-        issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, evict_first, l2_policy, tid_all);
+-        cp_async_commit();
+     } else {
+         __syncthreads();
+     }
+@@ -2046,21 +2298,32 @@
+         }
+     } else {
+         if (!tile0_is_past) {
+-            if (tid_all < 64) {
+-                int kpos = s_beg + tid_all;
+-                if (kpos < s_end_live) {
+-                    int lblk = (BS_shift >= 0) ? (kpos >> BS_shift) : (kpos / BS);
+-                    int slot = (BS_shift >= 0) ? (kpos & ((1 << BS_shift) - 1)) : (kpos % BS);
+-                    KV_blk_slot[tid_all] = make_int2(bt_row[lblk], slot);
+-                } else {
+-                    KV_blk_slot[tid_all] = make_int2(-1, 0);
++            if constexpr (USE_RING3) {
++                issue_kv64_direct_v16_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, bt_row, s_beg, s_end_live, BS, BS_shift, kv_ring_sptr(0), kv_ring_4(0), evict_first, l2_policy, tid_all);
++                cp_async_commit();
++                issue_kv64_direct_v16_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, bt_row, s_beg, s_end_live, BS, BS_shift, kv_ring_sptr(1), kv_ring_4(1), evict_first, l2_policy, tid_all);
++                cp_async_commit();
++                if (s_beg + BN < s_end_live) {
++                    issue_kv64_direct_v16_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, bt_row, s_beg + BN, s_end_live, BS, BS_shift, kv_ring_sptr(2), kv_ring_4(2), evict_first, l2_policy, tid_all);
++                    cp_async_commit();
+                 }
++            } else {
++                if (tid_all < 64) {
++                    int kpos = s_beg + tid_all;
++                    if (kpos < s_end_live) {
++                        int lblk = (BS_shift >= 0) ? (kpos >> BS_shift) : (kpos / BS);
++                        int slot = (BS_shift >= 0) ? (kpos & ((1 << BS_shift) - 1)) : (kpos % BS);
++                        KV_blk_slot[tid_all] = make_int2(bt_row[lblk], slot);
++                    } else {
++                        KV_blk_slot[tid_all] = make_int2(-1, 0);
++                    }
++                }
++                __syncthreads();
++                issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, evict_first, l2_policy, tid_all);
++                cp_async_commit();
++                issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, evict_first, l2_policy, tid_all);
++                cp_async_commit();
+             }
+-            __syncthreads();
+-            issue_kv64_maybe_bf12_async<KV_BF12>(K_base, K_bf12_base, sk_b, sk_s, KV_blk_slot, kv0_sptr, smem_kv0_4, evict_first, l2_policy, tid_all);
+-            cp_async_commit();
+-            issue_kv64_maybe_bf12_async<KV_BF12>(V_base, V_bf12_base, sv_b, sv_s, KV_blk_slot, kv1_sptr, smem_kv1_4, evict_first, l2_policy, tid_all);
+-            cp_async_commit();
+         }
+ 
+         #pragma unroll
+@@ -2119,6 +2382,8 @@
+         const int qpos0_min = past + static_cast<int>(Row_iloc[0]);
+         const int qpos0_max = past + static_cast<int>(Row_iloc[15]);
+ 
++        int ring_k = 0, ring_v = 1, ring_n = 2;
++        if constexpr (!USE_RING3) { (void)ring_k; (void)ring_v; (void)ring_n; }
+         for (int n0 = s_beg; n0 < s_end_live; n0 += BN) {
+             const int d0_lo = qpos0_min - (n0 + BN - 1);
+             const int d0_hi = qpos0_max - n0;
+@@ -2129,15 +2394,158 @@
+                 );
+             }
+ 
+-            cp_async_wait_group<1>();
++            const int n_next = n0 + BN;
++            const bool has_next = (n_next < s_end_live);
++            if constexpr (USE_RING3) {
++                if (has_next) cp_async_wait_group<2>();
++                else          cp_async_wait_group<1>();
++            } else {
++                cp_async_wait_group<1>();
++            }
+             __syncthreads();
+             if constexpr (KV_BF12) {
+-                kv_bf12_unpack_tile64_inplace_swiz(smem_kv0, K_bf12_base, sk_b, KEmergRaw, tid_all);
++                kv_bf12_unpack_tile64_inplace_swiz(
++                    USE_RING3 ? kv_ring_p(ring_k) : smem_kv0, K_bf12_base, sk_b, KEmergRaw, tid_all
++                );
+             }
+ 
+-            const int n_next = n0 + BN;
++            if constexpr (USE_RING3) {
++                // Wave-V16 3-Slot Rotating Double-Buffered cp.async KV Ring (S=48 Global @ 1M!):
++                //   - Entry invariant: K(n0)@ring_k, V(n0)@ring_v, and [if has_next] K(n_next)@ring_n in flight!
++                //   - Keeps TWO full 16 KiB KV tiles continuously streaming over LPDDR5X behind QK/PV MMA,
++                //     seamlessly prefetching across 256-token KV page boundaries with 0-ULP identical math!
++                const int  n_next2   = n0 + 2 * BN;
++                const bool has_next2 = (n_next2 < s_end_live);
+ 
+-            if constexpr (WINDOW < 0 && MT_MAX >= 2) {
++                float dummy_l0 = 0.f, dummy_l1 = 0.f;
++                float a0_0 = 0.f, a1_0 = 0.f, a0_1 = 0.f, a1_1 = 0.f, a0_2 = 0.f, a1_2 = 0.f;
++                uint32_t pk0_0 = 0u, pk0_1 = 0u, pk0_2 = 0u, pk0_3 = 0u;
++                uint32_t pk1_0 = 0u, pk1_1 = 0u, pk1_2 = 0u, pk1_3 = 0u;
++                uint32_t pk2_0 = 0u, pk2_1 = 0u, pk2_2 = 0u, pk2_3 = 0u;
++                const uint32_t cur_k_sptr = kv_ring_sptr(ring_k);
++                const uint32_t cur_v_sptr = kv_ring_sptr(ring_v);
++
++                fusedmt_global_k_compute_v13<MT_MAX, 0, true>(
++                    actual_mt == 1, past, n0, n_next, s_end_live, E, BS, BS_shift, scale_log2,
++                    RelProjT, bt_row, q_sptr, cur_k_sptr, smem_bp, red_smem_raw, Max_smem,
++                    KV_blk_slot, Row_iloc, Row_ok,
++                    r_a[0][0], r_a[0][1], r_a[0][2], r_a[0][3],
++                    m_i0[0], m_i1[0], acc[0],
++                    dummy_l0, dummy_l1, 0.f, 0.f, a0_0, a1_0,
++                    pk0_0, pk0_1, pk0_2, pk0_3,
++                    tid_all, wid, lane, grp, tid, sub, r_in
++                );
++                if (actual_mt >= 2) {
++                    fusedmt_global_k_compute_v13<MT_MAX, 1, true>(
++                        actual_mt == 2, past, n0, n_next, s_end_live, E, BS, BS_shift, scale_log2,
++                        RelProjT, bt_row, q_sptr + 4096u, cur_k_sptr, smem_bp, red_smem_raw, Max_smem,
++                        KV_blk_slot, Row_iloc, Row_ok,
++                        r_a[1][0], r_a[1][1], r_a[1][2], r_a[1][3],
++                        m_i0[1], m_i1[1], acc[1],
++                        l_i0[0], l_i1[0], a0_0, a1_0, a0_1, a1_1,
++                        pk1_0, pk1_1, pk1_2, pk1_3,
++                        tid_all, wid, lane, grp, tid, sub, r_in
++                    );
++                }
++                if constexpr (MT_MAX == 3) {
++                    if (actual_mt == 3) {
++                        fusedmt_global_k_compute_v13<MT_MAX, 2, true>(
++                            true, past, n0, n_next, s_end_live, E, BS, BS_shift, scale_log2,
++                            RelProjT, bt_row, q_sptr + 8192u, cur_k_sptr, smem_bp, red_smem_raw, Max_smem,
++                            KV_blk_slot, Row_iloc, Row_ok,
++                            r_a[2][0], r_a[2][1], r_a[2][2], r_a[2][3],
++                            m_i0[2], m_i1[2], acc[2],
++                            l_i0[1], l_i1[1], a0_1, a1_1, a0_2, a1_2,
++                            pk2_0, pk2_1, pk2_2, pk2_3,
++                            tid_all, wid, lane, grp, tid, sub, r_in
++                        );
++                    }
++                }
++
++                // K(n0) in ring_k is now DEAD (past final Max barrier inside last k_compute!) ->
++                // immediately prefetch V(n_next) into ring_k while V(n0) & K(n_next) fly in parallel!
++                if (has_next) {
++                    issue_kv64_direct_v16_async<KV_BF12>(
++                        V_base, V_bf12_base, sv_b, sv_s, bt_row, n_next, s_end_live, BS, BS_shift,
++                        kv_ring_sptr(ring_k), kv_ring_4(ring_k), evict_first, l2_policy, tid_all
++                    );
++                    cp_async_commit();
++                }
++
++                if constexpr (MT_MAX == 3) {
++                    if (actual_mt == 3)      fusedmt_store_p_pack(smem_bp, pk2_0, pk2_1, pk2_2, pk2_3, wid, grp, tid);
++                    else if (actual_mt == 2) fusedmt_store_p_pack(smem_bp, pk1_0, pk1_1, pk1_2, pk1_3, wid, grp, tid);
++                    else                     fusedmt_store_p_pack(smem_bp, pk0_0, pk0_1, pk0_2, pk0_3, wid, grp, tid);
++                } else {
++                    if (actual_mt == 2)      fusedmt_store_p_pack(smem_bp, pk1_0, pk1_1, pk1_2, pk1_3, wid, grp, tid);
++                    else                     fusedmt_store_p_pack(smem_bp, pk0_0, pk0_1, pk0_2, pk0_3, wid, grp, tid);
++                }
++
++                if (has_next) cp_async_wait_group<2>();
++                else          cp_async_wait_group<0>();
++                __syncthreads();
++                if constexpr (KV_BF12) {
++                    kv_bf12_unpack_tile64_inplace_swiz(kv_ring_p(ring_v), V_bf12_base, sv_b, VEmergRaw, tid_all);
++                }
++
++                float last_sp0, last_sp1;
++                if constexpr (MT_MAX == 3) {
++                    if (actual_mt == 3) {
++                        fusedmt_global_red_read<MT_MAX, 2, true>(red_smem_raw, grp, last_sp0, last_sp1);
++                        l_i0[2] = fma_rn_f32(l_i0[2], a0_2, last_sp0);
++                        l_i1[2] = fma_rn_f32(l_i1[2], a1_2, last_sp1);
++                    } else if (actual_mt == 2) {
++                        fusedmt_global_red_read<MT_MAX, 1, true>(red_smem_raw, grp, last_sp0, last_sp1);
++                        l_i0[1] = fma_rn_f32(l_i0[1], a0_1, last_sp0);
++                        l_i1[1] = fma_rn_f32(l_i1[1], a1_1, last_sp1);
++                    } else {
++                        fusedmt_global_red_read<MT_MAX, 0, true>(red_smem_raw, grp, last_sp0, last_sp1);
++                        l_i0[0] = fma_rn_f32(l_i0[0], a0_0, last_sp0);
++                        l_i1[0] = fma_rn_f32(l_i1[0], a1_0, last_sp1);
++                    }
++                } else {
++                    if (actual_mt == 2) {
++                        fusedmt_global_red_read<MT_MAX, 1, true>(red_smem_raw, grp, last_sp0, last_sp1);
++                        l_i0[1] = fma_rn_f32(l_i0[1], a0_1, last_sp0);
++                        l_i1[1] = fma_rn_f32(l_i1[1], a1_1, last_sp1);
++                    } else {
++                        fusedmt_global_red_read<MT_MAX, 0, true>(red_smem_raw, grp, last_sp0, last_sp1);
++                        l_i0[0] = fma_rn_f32(l_i0[0], a0_0, last_sp0);
++                        l_i1[0] = fma_rn_f32(l_i1[0], a1_0, last_sp1);
++                    }
++                }
++
++                if constexpr (MT_MAX == 3) {
++                    if (actual_mt == 3) {
++                        fusedmt_global_v_mma(smem_bp, cur_v_sptr, acc[2], wid, grp, tid, sub, r_in);
++                        __syncthreads();
++                        fusedmt_store_p_pack(smem_bp, pk1_0, pk1_1, pk1_2, pk1_3, wid, grp, tid);
++                        __syncthreads();
++                    }
++                }
++                if (actual_mt >= 2) {
++                    fusedmt_global_v_mma(smem_bp, cur_v_sptr, acc[1], wid, grp, tid, sub, r_in);
++                    __syncthreads();
++                    fusedmt_store_p_pack(smem_bp, pk0_0, pk0_1, pk0_2, pk0_3, wid, grp, tid);
++                    __syncthreads();
++                }
++                fusedmt_global_v_mma(smem_bp, cur_v_sptr, acc[0], wid, grp, tid, sub, r_in);
++
++                // V(n0) in ring_v is done -> fence reads and prefetch K(n_next2) across 256-tok page boundary!
++                if (has_next2) {
++                    __syncthreads();
++                    issue_kv64_direct_v16_async<KV_BF12>(
++                        K_base, K_bf12_base, sk_b, sk_s, bt_row, n_next2, s_end_live, BS, BS_shift,
++                        kv_ring_sptr(ring_v), kv_ring_4(ring_v), evict_first, l2_policy, tid_all
++                    );
++                    cp_async_commit();
++                }
++
++                const int old_k = ring_k;
++                ring_k = ring_n;
++                ring_n = ring_v;
++                ring_v = old_k;
++            } else if constexpr (WINDOW < 0 && MT_MAX >= 2) {
+                 // Wave-V13 Factored Zero-Duplication Split-Phase Dual-Inflight Pipeline:
+                 //   ONLY 1 `issue_K`, 1 `unpack(V)`, 1 `issue_V`, and 1 `k_compute`/`v_mma` per mt!
+                 float dummy_l0 = 0.f, dummy_l1 = 0.f;
+diff -ruN a/attn_dispatch_v13.cu b/attn_dispatch_v13.cu
+--- a/attn_dispatch_v13.cu	2026-11-25 02:32:17
++++ b/attn_dispatch_v13.cu	2026-11-25 02:32:17
+@@ -176,16 +176,17 @@
+ }  // namespace
+ 
+ // =========================================================================
+-// EXPORTED C ABI SYMBOLS (24 symbols: 100% superset of V7..V13 + V14!)
++// EXPORTED C ABI SYMBOLS (26 symbols: 100% superset of V7..V14 + V16!)
+ // =========================================================================
+ 
+-extern "C" int fused_decode_attn_v7_version(void)  { return 14; }
+-extern "C" int fused_decode_attn_v8_version(void)  { return 14; }
+-extern "C" int fused_decode_attn_v9_version(void)  { return 14; }
+-extern "C" int fused_decode_attn_v10_version(void) { return 14; }
+-extern "C" int fused_decode_attn_v11_version(void) { return 14; }
+-extern "C" int fused_decode_attn_v13_version(void) { return 14; }
+-extern "C" int fused_decode_attn_v14_version(void) { return 14; }
++extern "C" int fused_decode_attn_v7_version(void)  { return 16; }
++extern "C" int fused_decode_attn_v8_version(void)  { return 16; }
++extern "C" int fused_decode_attn_v9_version(void)  { return 16; }
++extern "C" int fused_decode_attn_v10_version(void) { return 16; }
++extern "C" int fused_decode_attn_v11_version(void) { return 16; }
++extern "C" int fused_decode_attn_v13_version(void) { return 16; }
++extern "C" int fused_decode_attn_v14_version(void) { return 16; }
++extern "C" int fused_decode_attn_v16_version(void) { return 16; }
+ 
+ extern "C" int fused_decode_attn_v13_init_smem(void) {
+     if (g_v13_smem_inited) return 0;
+@@ -197,6 +198,7 @@
+     return 0;
+ }
+ 
++extern "C" int fused_decode_attn_v16_init_smem(void) { return fused_decode_attn_v13_init_smem(); }
+ extern "C" int fused_decode_attn_v14_init_smem(void) { return fused_decode_attn_v13_init_smem(); }
+ extern "C" int fused_decode_attn_v11_init_smem(void) { return fused_decode_attn_v13_init_smem(); }
+ extern "C" int fused_decode_attn_v10_init_smem(void) { return fused_decode_attn_v13_init_smem(); }
+diff -ruN a/attn_global_bf12_v13.cu b/attn_global_bf12_v13.cu
+--- a/attn_global_bf12_v13.cu	2026-11-24 19:43:43
++++ b/attn_global_bf12_v13.cu	2026-11-25 02:32:17
+@@ -14,8 +14,10 @@
+     if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 0, 3, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+     if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 1, 3, true,  true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+     if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 1, 3, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+-    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 3, true,  true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+-    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 3, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
++    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 2, true,  true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalS48DbMt2SmemBytes)) != cudaSuccess) return static_cast<int>(err);
++    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 2, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalS48DbMt2SmemBytes)) != cudaSuccess) return static_cast<int>(err);
++    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 3, true,  true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalS48DbMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
++    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 3, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalS48DbMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+     return 0;
+ }
+ 
+@@ -78,22 +80,28 @@
+     const int bs_shift = (p.BS > 0 && (p.BS & (p.BS - 1)) == 0) ? __builtin_ctz(p.BS) : -1;
+     dim3 grid(1, static_cast<unsigned>(p.num_reqs), static_cast<unsigned>(p.Hkv * p.num_splits));
+     dim3 block(128, 1, 1);
+-    const size_t red_bytes = (p.mtiles <= 2) ? (64 * 17 * sizeof(float)) : (64 * 8 * sizeof(float));
+-    const size_t smem_bytes = 32768 + static_cast<size_t>(p.mtiles) * 4096 + 2304 + red_bytes + 256;
++    const bool use_ring3 = (p.num_splits > 32 && p.num_splits <= 64 && p.mtiles >= 2);
++    const size_t red_bytes = use_ring3
++        ? (40 * 8 * sizeof(float))
++        : ((p.mtiles <= 2) ? (64 * 17 * sizeof(float)) : (64 * 8 * sizeof(float)));
++    const size_t smem_bytes = (use_ring3 ? 49152 : 32768) + static_cast<size_t>(p.mtiles) * 4096 + 2304 + red_bytes + 256;
+     const bool pdl = (p.use_pdl != 0);
+ 
+     #define LF_GBF12(SM, MT, PD) \
+         do { \
+-            if constexpr ((MT) >= 3) { \
++            if constexpr ((MT) >= 3 || ((SM) == 2 && (MT) >= 2)) { \
+                 static bool s_ok = false; \
+                 if (!smem_inited && !s_ok) { \
+                     cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone; \
+                     if (cudaStreamIsCapturing(stream, &cap_st) == cudaSuccess && cap_st != cudaStreamCaptureStatusNone) { \
+                         return -3; \
+                     } \
++                    constexpr int req_smem = ((SM) == 2) \
++                        ? (((MT) == 2) ? kGlobalS48DbMt2SmemBytes : kGlobalS48DbMt3SmemBytes) \
++                        : kFusedMt3SmemBytes; \
+                     cudaError_t ae = cudaFuncSetAttribute( \
+                         fused_decode_attn_otf_fusedmt_kernel_v13<-1, SM, MT, PD, true>, \
+-                        cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes); \
++                        cudaFuncAttributeMaxDynamicSharedMemorySize, req_smem); \
+                     if (ae != cudaSuccess) return static_cast<int>(ae); \
+                     s_ok = true; \
+                 } \
+diff -ruN a/attn_global_s48_v13.cu b/attn_global_s48_v13.cu
+--- a/attn_global_s48_v13.cu	2026-11-24 19:43:43
++++ b/attn_global_s48_v13.cu	2026-11-25 02:32:17
+@@ -14,8 +14,10 @@
+     if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 0, 3, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+     if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 1, 3, true,  false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+     if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 1, 3, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+-    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 3, true,  false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+-    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 3, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
++    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 2, true,  false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalS48DbMt2SmemBytes)) != cudaSuccess) return static_cast<int>(err);
++    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 2, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalS48DbMt2SmemBytes)) != cudaSuccess) return static_cast<int>(err);
++    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 3, true,  false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalS48DbMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
++    if ((err = cudaFuncSetAttribute(fused_decode_attn_otf_fusedmt_kernel_v13<-1, 2, 3, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalS48DbMt3SmemBytes)) != cudaSuccess) return static_cast<int>(err);
+     return 0;
+ }
+ 
+@@ -77,22 +79,28 @@
+     const int bs_shift = (p.BS > 0 && (p.BS & (p.BS - 1)) == 0) ? __builtin_ctz(p.BS) : -1;
+     dim3 grid(1, static_cast<unsigned>(p.num_reqs), static_cast<unsigned>(p.Hkv * p.num_splits));
+     dim3 block(128, 1, 1);
+-    const size_t red_bytes = (p.mtiles <= 2) ? (64 * 17 * sizeof(float)) : (64 * 8 * sizeof(float));
+-    const size_t smem_bytes = 32768 + static_cast<size_t>(p.mtiles) * 4096 + 2304 + red_bytes + 256;
++    const bool use_ring3 = (p.num_splits > 32 && p.num_splits <= 64 && p.mtiles >= 2);
++    const size_t red_bytes = use_ring3
++        ? (40 * 8 * sizeof(float))
++        : ((p.mtiles <= 2) ? (64 * 17 * sizeof(float)) : (64 * 8 * sizeof(float)));
++    const size_t smem_bytes = (use_ring3 ? 49152 : 32768) + static_cast<size_t>(p.mtiles) * 4096 + 2304 + red_bytes + 256;
+     const bool pdl = (p.use_pdl != 0);
+ 
+     #define LF_GBF16(SM, MT, PD) \
+         do { \
+-            if constexpr ((MT) >= 3) { \
++            if constexpr ((MT) >= 3 || ((SM) == 2 && (MT) >= 2)) { \
+                 static bool s_ok = false; \
+                 if (!smem_inited && !s_ok) { \
+                     cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone; \
+                     if (cudaStreamIsCapturing(stream, &cap_st) == cudaSuccess && cap_st != cudaStreamCaptureStatusNone) { \
+                         return -3; \
+                     } \
++                    constexpr int req_smem = ((SM) == 2) \
++                        ? (((MT) == 2) ? kGlobalS48DbMt2SmemBytes : kGlobalS48DbMt3SmemBytes) \
++                        : kFusedMt3SmemBytes; \
+                     cudaError_t ae = cudaFuncSetAttribute( \
+                         fused_decode_attn_otf_fusedmt_kernel_v13<-1, SM, MT, PD, false>, \
+-                        cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedMt3SmemBytes); \
++                        cudaFuncAttributeMaxDynamicSharedMemorySize, req_smem); \
+                     if (ae != cudaSuccess) return static_cast<int>(ae); \
+                     s_ok = true; \
+                 } \

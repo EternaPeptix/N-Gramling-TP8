@@ -47,11 +47,34 @@ class SamMatch:
 
 
 class PurePythonSAM:
-    """Reference O(1)-amortized Suffix Automaton with (last_pos, prev_pos) recency tracking."""
+    """Reference O(1)-amortized Suffix Automaton with (last_pos, prev_pos) recency tracking.
 
-    __slots__ = ("_len", "_link", "_last_pos", "_prev_pos", "_occ", "_next", "_last", "tokens", "_max_refresh")
+    Wave-V16: optional `ignore_token_ids` (e.g., multimodal `image_token_id` placeholders) skips
+    256-5,184+ repeated pad tokens and inserts at most ONE `-1` break sentinel per contiguous
+    ignored run so text before/after an image is never evicted and never forms fake cross-image n-grams.
+    """
 
-    def __init__(self, max_refresh_depth: int = 24):
+    __slots__ = (
+        "_len",
+        "_link",
+        "_last_pos",
+        "_prev_pos",
+        "_occ",
+        "_next",
+        "_last",
+        "tokens",
+        "_max_refresh",
+        "_max_tokens",
+        "_ignore_ids",
+        "_in_ignored_run",
+    )
+
+    def __init__(
+        self,
+        max_refresh_depth: int = 24,
+        max_tokens: int = 0,
+        ignore_token_ids: Sequence[int] | frozenset[int] = (),
+    ):
         self._len: list[int] = [0]
         self._link: list[int] = [-1]
         self._last_pos: list[int] = [-1]
@@ -61,6 +84,9 @@ class PurePythonSAM:
         self._last: int = 0
         self.tokens: list[int] = []
         self._max_refresh = max_refresh_depth
+        self._max_tokens = max(0, int(max_tokens))
+        self._ignore_ids: frozenset[int] = frozenset(int(t) for t in ignore_token_ids if int(t) >= 0)
+        self._in_ignored_run: bool = False
 
     def reset(self) -> None:
         self._len = [0]
@@ -71,15 +97,43 @@ class PurePythonSAM:
         self._next = [{}]
         self._last = 0
         self.tokens = []
+        self._in_ignored_run = False
+
+    def set_ignore_token_ids(self, ignore_token_ids: Sequence[int] | frozenset[int]) -> None:
+        self._ignore_ids = frozenset(int(t) for t in ignore_token_ids if int(t) >= 0)
 
     def __len__(self) -> int:
         return len(self.tokens)
 
     def extend_one(self, tok: int) -> None:
+        tok = int(tok)
         if tok < 0:
             return
+        if self._ignore_ids and tok in self._ignore_ids:
+            # Skip repeated multimodal placeholder tokens (e.g. 256-5,184 image_token_id pads)
+            # and place at most ONE -1 boundary sentinel so adjacent text segments never fuse.
+            if not self._in_ignored_run:
+                if self.tokens and self.tokens[-1] >= 0:
+                    self.tokens.append(-1)
+                self._last = 0
+                self._in_ignored_run = True
+            return
+        self._in_ignored_run = False
+        if self._max_tokens > 0 and len(self.tokens) >= self._max_tokens:
+            # Bounded-RAM sliding compaction when explicitly opted in via INKLING_SAM_CPU_MAX_TOKENS
+            keep = max(64, self._max_tokens // 2)
+            tail = self.tokens[-keep:]
+            self.reset()
+            for t in tail:
+                if t < 0:
+                    if not self._in_ignored_run and self.tokens and self.tokens[-1] >= 0:
+                        self.tokens.append(-1)
+                    self._last = 0
+                    self._in_ignored_run = True
+                else:
+                    self.extend_one(t)
         pos = len(self.tokens)
-        self.tokens.append(int(tok))
+        self.tokens.append(tok)
 
         cur = len(self._len)
         self._len.append(self._len[self._last] + 1)
@@ -148,11 +202,16 @@ class PurePythonSAM:
         link_tbl = self._link
         len_tbl = self._len
         for c in query:
-            nxt = nxt_tbl[v].get(int(c), -1)
+            ci = int(c)
+            if ci < 0 or (self._ignore_ids and ci in self._ignore_ids):
+                v = 0
+                l = 0
+                continue
+            nxt = nxt_tbl[v].get(ci, -1)
             while v != 0 and nxt == -1:
                 v = link_tbl[v]
                 l = len_tbl[v]
-                nxt = nxt_tbl[v].get(int(c), -1)
+                nxt = nxt_tbl[v].get(ci, -1)
             if nxt != -1:
                 v = nxt
                 l += 1
@@ -168,12 +227,19 @@ class PurePythonSAM:
                 hp = self._prev_pos[cur_v]
             if 0 <= hp < excl and hp + 1 < n_tok:
                 n_out = min(max_draft, n_tok - (hp + 1))
-                return SamMatch(
-                    tokens=self.tokens[hp + 1 : hp + 1 + n_out],
-                    match_len=cur_l,
-                    occ_count=self._occ[cur_v],
-                    hist_pos=hp,
-                )
+                out_toks: list[int] = []
+                for idx_o in range(hp + 1, hp + 1 + n_out):
+                    ot = self.tokens[idx_o]
+                    if ot < 0 or (self._ignore_ids and ot in self._ignore_ids):
+                        break
+                    out_toks.append(ot)
+                if out_toks:
+                    return SamMatch(
+                        tokens=out_toks,
+                        match_len=cur_l,
+                        occ_count=self._occ[cur_v],
+                        hist_pos=hp,
+                    )
             cur_v = link_tbl[cur_v]
             cur_l = len_tbl[cur_v] if cur_v > 0 else 0
         return SamMatch([], 0, 0, -1)
@@ -254,6 +320,50 @@ def _load_sam_c_lib() -> ctypes.CDLL | None:
     return _SAM_LIB
 
 
+DEFAULT_SAM_MAX_B = 4
+
+
+def sam_batch_eligible(num_reqs: int, max_b: int = DEFAULT_SAM_MAX_B, batch_on: bool = True) -> bool:
+    """O(1) batch-size gate for Zero-Tax GPU/CPU SAM (`INKLING_SAM_MAX_B`).
+
+    Returns True iff `1 <= num_reqs <= max_b` (and `num_reqs == 1` when `batch_on=False`).
+    Returns False with 0 allocations/kernel launches whenever `num_reqs > max_b` or `max_b <= 0`.
+    """
+    nr = int(num_reqs)
+    mb = int(max_b)
+    if nr <= 0 or mb <= 0 or nr > mb:
+        return False
+    return nr == 1 or bool(batch_on)
+
+
+def sam_lpc_needed(valid_lo: int, lpc_populated: bool = True) -> bool:
+    """True iff the Long-Prompt Continuation Cache (`LPC`) can contain tokens outside the L2 ring.
+
+    When `valid_lo <= 0` (prompt + generation fits 100% inside the per-slot ring) or `lpc_populated`
+    is False, probing the 13 MiB LPC table is strictly redundant and skipped at 0.00 us DRAM cost.
+    """
+    return bool(lpc_populated and int(valid_lo) > 0)
+
+
+def sam_shared_write_safe(num_reqs: int, shared_on: bool, serialized: bool = False) -> bool:
+    """True iff writing to the cross-request Shared Pool is 100% TP8-deterministic (zero CTA race)."""
+    if not shared_on:
+        return False
+    return int(num_reqs) == 1 or bool(serialized)
+
+
+def sam_lpc_gen_next(cur_gen: int) -> tuple[int, bool]:
+    """Advance per-slot 15-bit CPU LPC generation in `1..32767` (zero even/odd collisions).
+
+    Returns `(next_gen, wrapped)` where `wrapped=True` signals the caller to zero that slot's
+    private LPC key partition before reusing `next_gen=1` (once per 32,767 requests/slot).
+    GPU in-place preemption reserves the disjoint `32768..65535` namespace."""
+    nxt = int(cur_gen) + 1
+    if nxt < 1 or nxt > 32767:
+        return 1, True
+    return nxt, False
+
+
 def agreement_conf_floor(
     match_len: int,
     *,
@@ -274,10 +384,121 @@ def agreement_conf_floor(
     return float(min(cap, ml4_base + slope * min(match_len, 4)))
 
 
+_MM_PLACEHOLDER_ATTRS = (
+    "image_token_id",
+    "image_token_index",
+    "img_token_id",
+    "image_pad_token_id",
+    "video_token_id",
+    "audio_token_id",
+    "vision_pad_token_id",
+    "mm_token_id",
+)
+
+
+def parse_sam_ignore_token_ids(
+    raw: str | None = None,
+    hf_config: object | None = None,
+    *,
+    enabled: bool | None = None,
+) -> tuple[int, ...]:
+    """Extract deterministic sorted unique multimodal placeholder IDs to skip in GPU & CPU SAM.
+
+    Default-OFF safe: when `enabled` is False (default when `INKLING_SAM_IMAGE_SAFE_V16=0`),
+    returns `()` so baseline V15 behavior is 100% preserved.
+    """
+    if enabled is None:
+        enabled = os.environ.get("INKLING_SAM_IMAGE_SAFE_V16", "0").strip().lower() in (
+            "1", "on", "true", "yes"
+        )
+    if not enabled:
+        return ()
+    found: set[int] = set()
+    env_s = os.environ.get("INKLING_SAM_IGNORE_TOKEN_IDS", "") if raw is None else raw
+    for part in (env_s or "").replace(";", ",").replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+            if v >= 0:
+                found.add(v)
+        except ValueError:
+            pass
+    if hf_config is not None:
+        cfgs = [hf_config]
+        for sub in ("text_config", "vision_config", "mm_config", "multimodal_config"):
+            sc = getattr(hf_config, sub, None)
+            if sc is not None:
+                cfgs.append(sc)
+        for cfg in cfgs:
+            for attr in _MM_PLACEHOLDER_ATTRS:
+                val = getattr(cfg, attr, None)
+                if isinstance(val, (int, np.integer)) and not isinstance(val, bool):
+                    iv = int(val)
+                    if iv >= 0:
+                        found.add(iv)
+                elif isinstance(val, (list, tuple, set, frozenset)):
+                    for item in val:
+                        if isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+                            iv = int(item)
+                            if iv >= 0:
+                                found.add(iv)
+    return tuple(sorted(found))
+
+
+def sam_dyn_k_ext_budget(
+    *,
+    cur_pos: int,
+    max_model_len: int,
+    k_draft: int,
+    k_ext_cap: int,
+    p6_raw: float,
+    p6_cal: float,
+    surv_6: float,
+    match_len: int,
+    min_match: int = 4,
+    p6_thresh: float = 0.78,
+    surv_thresh: float = 0.35,
+    ext_surv_floor: float = 0.25,
+    exact_ml: int = 6,
+    k_ext_mid: int = 11,
+    k_ext_max: int = 15,
+    allow_ht2: bool = True,
+) -> int:
+    """Exact CPU/GPU single-source-of-truth for Same-Tile Dynamic Extended Depth `K=7 -> 11/15`.
+
+    Returns number of extended draft slots `0..k_ext_cap` permitted past `k_draft` (`7`),
+    strictly respecting `cur_pos + k_draft + ext < max_model_len` (0 OOB positions at 1M!).
+    """
+    if k_ext_cap <= 0 or k_draft <= 0:
+        return 0
+    if not (math.isfinite(p6_raw) and math.isfinite(p6_cal) and math.isfinite(surv_6)):
+        return 0
+    hi_conf_6 = (p6_raw >= p6_thresh) or (p6_cal >= p6_thresh)
+    if not ((surv_6 >= surv_thresh) or (hi_conf_6 and surv_6 >= ext_surv_floor)):
+        return 0
+    if match_len >= exact_ml and (surv_6 >= surv_thresh or hi_conf_6):
+        tier_cap = min(int(k_ext_cap), max(0, int(k_ext_max) - int(k_draft)))
+    elif match_len >= min_match or (allow_ht2 and match_len >= 3 and hi_conf_6 and surv_6 >= surv_thresh):
+        tier_cap = min(int(k_ext_cap), max(0, int(k_ext_mid) - int(k_draft)))
+    else:
+        return 0
+    # Strict max_model_len clamping: anchor at `cur_pos`, draft k at `cur_pos + 1 + k`.
+    # For `e in 0..ext-1`: `cur_pos + 1 + k_draft + e <= max_model_len - 1`.
+    rem_ctx = max(0, int(max_model_len) - 1 - (int(cur_pos) + int(k_draft)))
+    return max(0, min(tier_cap, rem_ctx))
+
+
 class FastSuffixAutomaton:
     """C99-accelerated Suffix Automaton (< 5 us/step) with seamless Pure-Python fallback."""
 
-    def __init__(self, init_cap: int = 4096, force_python: bool = False):
+    def __init__(
+        self,
+        init_cap: int = 4096,
+        force_python: bool = False,
+        ignore_token_ids: Sequence[int] | frozenset[int] | None = None,
+    ):
         env_cap = os.environ.get("INKLING_SAM_CPU_INIT_CAP", "").strip()
         if env_cap:
             try:
@@ -286,9 +507,21 @@ class FastSuffixAutomaton:
                 pass
         elif os.environ.get("INKLING_SAM_LONG_PROMPT", "0").strip().lower() in ("1", "on", "true", "yes"):
             init_cap = max(init_cap, 131072)
+        if ignore_token_ids is None:
+            ig = parse_sam_ignore_token_ids()
+        else:
+            ig = tuple(sorted({int(x) for x in ignore_token_ids if int(x) >= 0}))
+        self._ignore_ids_tuple: tuple[int, ...] = ig
+        self._ignore_ids: frozenset[int] = frozenset(ig)
         self._lib = None if force_python else _load_sam_c_lib()
-        self._handle = self._lib.sam_create(init_cap) if self._lib is not None else None
-        self._py = PurePythonSAM() if self._handle is None else None
+        _h = self._lib.sam_create(init_cap) if self._lib is not None else None
+        self._handle = _h if _h else None
+        _max_tok_raw = os.environ.get("INKLING_SAM_CPU_MAX_TOKENS", "0").strip()
+        try:
+            _max_tok = max(0, int(_max_tok_raw or "0"))
+        except ValueError:
+            _max_tok = 0
+        self._py = PurePythonSAM(max_tokens=_max_tok, ignore_token_ids=ig) if self._handle is None else None
         self._out_buf = (ctypes.c_int32 * 32)()
         self._ext_buf = (ctypes.c_int32 * 32)()
         self._ml = ctypes.c_int32(0)
@@ -298,6 +531,13 @@ class FastSuffixAutomaton:
     @property
     def is_c_accelerated(self) -> bool:
         return self._handle is not None
+
+    def set_ignore_token_ids(self, ignore_token_ids: Sequence[int] | frozenset[int]) -> None:
+        ig = tuple(sorted({int(x) for x in ignore_token_ids if int(x) >= 0}))
+        self._ignore_ids_tuple = ig
+        self._ignore_ids = frozenset(ig)
+        if self._py is not None:
+            self._py.set_ignore_token_ids(ig)
 
     def __del__(self) -> None:
         if getattr(self, "_handle", None) and getattr(self, "_lib", None):
@@ -325,13 +565,29 @@ class FastSuffixAutomaton:
             else:
                 arr = np.asarray(toks, dtype=np.int32)
             if arr.size > 0:
-                self._lib.sam_extend_batch(
-                    self._handle,
-                    arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-                    int(arr.size),
-                )
+                mask = arr >= 0
+                for ig in self._ignore_ids_tuple:
+                    mask &= arr != ig
+                if not bool(mask.all()):
+                    arr = np.ascontiguousarray(arr[mask], dtype=np.int32)
+                if arr.size > 0:
+                    self._lib.sam_extend_batch(
+                        self._handle,
+                        arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                        int(arr.size),
+                    )
         else:
             self._py.extend(toks)
+
+    def seed_prefix(self, prefix_tokens: Sequence[int] | np.ndarray, max_seed_tokens: int = 4096) -> int:
+        """Warm-start SAM from trailing `max_seed_tokens` of a prefix-cached Turn-2+ prompt."""
+        self.reset()
+        n = len(prefix_tokens)
+        if n <= 0 or max_seed_tokens <= 0:
+            return 0
+        tail = prefix_tokens[-int(max_seed_tokens) :] if n > max_seed_tokens else prefix_tokens
+        self.extend(tail)
+        return len(self)
 
     def query_tail_plus_ext(
         self,
@@ -340,10 +596,19 @@ class FastSuffixAutomaton:
         min_match_len: int = 4,
         max_draft: int = 8,
     ) -> SamMatch:
+        if max_draft <= 0 or tail_win <= 0 or len(self) < 2:
+            return SamMatch([], 0, 0, -1)
         if self._handle is not None:
             n_ext = min(len(ext), 32)
+            valid_ext = 0
+            ig_set = self._ignore_ids
             for i in range(n_ext):
-                self._ext_buf[i] = int(ext[i])
+                ti = int(ext[i])
+                if ti < 0 or (ig_set and ti in ig_set):
+                    break
+                self._ext_buf[valid_ext] = ti
+                valid_ext += 1
+            n_ext = valid_ext
             n_max = min(max_draft, 32)
             n_out = int(
                 self._lib.sam_query_tail_plus_ext(
@@ -361,8 +626,16 @@ class FastSuffixAutomaton:
             )
             if n_out <= 0:
                 return SamMatch([], 0, 0, -1)
+            out_toks: list[int] = []
+            for i in range(n_out):
+                ot = int(self._out_buf[i])
+                if ot < 0 or (ig_set and ot in ig_set):
+                    break
+                out_toks.append(ot)
+            if not out_toks:
+                return SamMatch([], 0, 0, -1)
             return SamMatch(
-                tokens=[int(self._out_buf[i]) for i in range(n_out)],
+                tokens=out_toks,
                 match_len=int(self._ml.value),
                 occ_count=int(self._occ.value),
                 hist_pos=int(self._hp.value),
@@ -393,8 +666,9 @@ class SuffixHybridAdvisor:
         ext_surv_thresh: float = 0.25,
         tail_win: int = 32,
         force_python: bool = False,
+        ignore_token_ids: Sequence[int] | frozenset[int] | None = None,
     ):
-        self.sam = FastSuffixAutomaton(force_python=force_python)
+        self.sam = FastSuffixAutomaton(force_python=force_python, ignore_token_ids=ignore_token_ids)
         self.min_branch_match = min_branch_match
         self.min_ext_match = min_ext_match
         self.min_boost_match = min_boost_match
@@ -406,6 +680,9 @@ class SuffixHybridAdvisor:
         self.sam.reset()
         self.sam.extend(prompt_tokens)
 
+    def seed_prefix(self, prefix_tokens: Sequence[int] | np.ndarray, max_seed_tokens: int = 4096) -> int:
+        return self.sam.seed_prefix(prefix_tokens, max_seed_tokens=max_seed_tokens)
+
     def ingest_accepted(self, accepted_tokens: Sequence[int] | np.ndarray) -> None:
         self.sam.extend(accepted_tokens)
 
@@ -416,14 +693,31 @@ class SuffixHybridAdvisor:
         *,
         conf_boost_floor: bool = False,
     ) -> dict:
-        """Compute all three hybrid signals in <= 2 SAM queries (< 10 us total)."""
+        """Compute all three hybrid signals in <= 2 SAM queries (< 10 us total).
+
+        V13 fast-path: skips both SAM queries in O(1) when the slot has fewer than
+        `min(min_branch_match, eff_min_boost)` ingested tokens or no draft tokens.
+        """
         k_base = len(dspark_tokens)
         eff_min_boost = 2 if conf_boost_floor else self.min_boost_match
+        min_need = min(self.min_branch_match, eff_min_boost)
+        if k_base <= 0 or len(self.sam) < min_need:
+            return {
+                "tail_match_len": 0,
+                "logit_boost": [0.0] * k_base,
+                "conf_floor": [0.0] * k_base,
+                "branch_depth": -1,
+                "branch_tokens": [],
+                "branch_hit_prob": 0.0,
+                "ext_tokens": [],
+                "ext_match_len": 0,
+                "ext_hit_prob": 0.0,
+            }
         # Query 1: Committed tail match (for agreement boost + parallel branch)
         m_tail = self.sam.query_tail_plus_ext(
             tail_win=self.tail_win,
             ext=(),
-            min_match_len=min(self.min_branch_match, eff_min_boost),
+            min_match_len=min_need,
             max_draft=max(k_base, 4),
         )
 
@@ -456,8 +750,12 @@ class SuffixHybridAdvisor:
 
         # Query 2: Tail extension past K=7 when survival at K-1 is high
         surv_end = 1.0
-        for ck in dspark_c:
-            surv_end *= ck
+        for ck in dspark_c[:k_base]:
+            cf = float(ck)
+            if not math.isfinite(cf):
+                surv_end = 0.0
+                break
+            surv_end *= max(0.0, min(1.0, cf))
         ext_tokens: list[int] = []
         ext_match_len = 0
         ext_hit_prob = 0.0
@@ -484,6 +782,22 @@ class SuffixHybridAdvisor:
             "ext_match_len": ext_match_len,
             "ext_hit_prob": ext_hit_prob,
         }
+
+    def advise_for_batch(
+        self,
+        num_reqs: int,
+        dspark_tokens: Sequence[int],
+        dspark_c: Sequence[float],
+        *,
+        max_b: int = DEFAULT_SAM_MAX_B,
+        batch_on: bool = True,
+        conf_boost_floor: bool = False,
+    ) -> dict | None:
+        """Zero-tax batch-gated wrapper around `advise()`: returns None in O(1) when
+        `num_reqs > max_b` so B=8/32 pays 0 SAM queries."""
+        if not sam_batch_eligible(num_reqs, max_b=max_b, batch_on=batch_on):
+            return None
+        return self.advise(dspark_tokens, dspark_c, conf_boost_floor=conf_boost_floor)
 
 
 def _bpe_like_tokenize(text: str) -> list[int]:

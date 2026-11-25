@@ -76,12 +76,13 @@ class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         assert isinstance(kv_cache_spec, SlidingWindowSpec)
-        # Persistent per-token buffers for CUDA graph capture.
+        # Persistent per-token buffers for CUDA graph capture (zero-initialized to
+        # guarantee clean state on empty/aborted/padded batches before first build).
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.seq_idx_buffer = torch.empty(
+        self.seq_idx_buffer = torch.zeros(
             max_num_tokens, dtype=torch.int32, device=device
         )
-        self.query_start_buffer = torch.empty(
+        self.query_start_buffer = torch.zeros(
             max_num_tokens, dtype=torch.int32, device=device
         )
 
@@ -96,23 +97,50 @@ class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]
         num_padded_tokens = common_attn_metadata.slot_mapping.shape[0]
         assert num_padded_tokens >= num_actual_tokens
 
-        # Per-token seq_idx (owning request) and query_start (first x-row of
-        # that request; the fused kernel uses it to tell same-forward taps,
-        # read from x, from pre-forward taps, read from cache) in one launch.
-        sconv_seq_metadata(
-            common_attn_metadata.query_start_loc,
-            num_reqs,
-            num_actual_tokens,
-            self.seq_idx_buffer,
-            self.query_start_buffer,
-            num_padded_tokens,
-        )
+        if num_padded_tokens == 0:
+            return InklingSconvMetadata(
+                block_table=common_attn_metadata.block_table_tensor,
+                slot_mapping=common_attn_metadata.slot_mapping[:0],
+                seq_idx=self.seq_idx_buffer[:0],
+                query_start=self.query_start_buffer[:0],
+            )
+
+        if num_padded_tokens <= int(self.seq_idx_buffer.shape[0]):
+            seq_buf = self.seq_idx_buffer
+            qs_buf = self.query_start_buffer
+        else:
+            seq_buf = torch.zeros(
+                num_padded_tokens,
+                dtype=torch.int32,
+                device=self.seq_idx_buffer.device,
+            )
+            qs_buf = torch.zeros(
+                num_padded_tokens,
+                dtype=torch.int32,
+                device=self.query_start_buffer.device,
+            )
+
+        if num_reqs <= 0:
+            seq_buf[:num_padded_tokens].zero_()
+            qs_buf[:num_padded_tokens].zero_()
+        else:
+            # Per-token seq_idx (owning request) and query_start (first x-row of
+            # that request; the fused kernel uses it to tell same-forward taps,
+            # read from x, from pre-forward taps, read from cache) in one launch.
+            sconv_seq_metadata(
+                common_attn_metadata.query_start_loc,
+                num_reqs,
+                num_actual_tokens,
+                seq_buf,
+                qs_buf,
+                num_padded_tokens,
+            )
 
         return InklingSconvMetadata(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[:num_padded_tokens],
-            seq_idx=self.seq_idx_buffer[:num_padded_tokens],
-            query_start=self.query_start_buffer[:num_padded_tokens],
+            seq_idx=seq_buf[:num_padded_tokens],
+            query_start=qs_buf[:num_padded_tokens],
         )
 
 

@@ -52,3 +52,7 @@ bf10_smem2sym.py /usr/local/lib/python3.12/dist-packages/vllm/models/inkling2/op
 tree_spec_runtime.py /usr/local/lib/python3.12/dist-packages/vllm/models/inkling2/ops/tree_spec_runtime.py
 suffix_hybrid.py /usr/local/lib/python3.12/dist-packages/vllm/models/inkling2/ops/suffix_hybrid.py
 moe_c32_runtime.py /usr/local/lib/python3.12/dist-packages/vllm/models/inkling2/ops/moe_c32_runtime.py
+sampling_params.py /usr/local/lib/python3.12/dist-packages/vllm/sampling_params.py
+inkling_renderer.py /usr/local/lib/python3.12/dist-packages/vllm/renderers/inkling.py
+inkling_parser.py /usr/local/lib/python3.12/dist-packages/vllm/parser/inkling.py
+inkling_sched.py /usr/local/lib/python3.12/dist-packages/inkling_sched.py

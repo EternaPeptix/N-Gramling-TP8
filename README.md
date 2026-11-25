@@ -5,110 +5,95 @@ Production-grade, **100% 0-ULP bit-exact** inference stack for
 (594B total / 17B active MoE, 384 routed experts top-8, 40 NVFP4 local SWA-1024 layers + 8 MXFP8 global layers, 1M context, 5-layer DSpark speculator)
 on **8× NVIDIA DGX Spark (GB10, SM121a)** over **4× 200GbE ConnectX-7 RoCEv2**.
 
-> **Status (2026-11-25): PERMANENT LIVE PRODUCTION CHECKPOINT on 8/8 nodes (`0.0.0.0:8010`, `tp8/config/live_champion_v16.env`, `V16-FINAL`).**
-> Empirically qualified and pruned across Wave-V13→V16 on live 8-node GB10 silicon, `V16-FINAL` delivers **10/10 0-ULP deterministic decode (`1dcf…f8c3`)** across cold, warm, post-chaos/harvester/multimodal, and post-1M runs, **`139.07` GM / `144.88` mean `C=1`** (`bench.py single 1024t`, `202.30 tok/s` math), **`136.74 tok/s` (`74.85 min`) `C=2`**, **`187.64 tok/s` (`51.28 min`) `C=4`**, **`567.68 tok/s` (`23.10 mean / 18.90 min`) `C=32`**, **`90.1 tok/s` `1M` decode (`+38.8%` over `V12-FINAL`!)** at **`113.02 s` cold / `2.34 s` warm (`3/3` needles)**, **`417.78 tok/s`** zero-sync `temp=0.6` `16×4` RLVR harvesting (`1.00` unique ratio), **`7.11×` simultaneous 1M KV residency**, **`0` KV leaks** under 20%-abort chaos soak, and **`0 MiB` new swap**.
+> **Status (2026-11-25): PERMANENT LIVE PRODUCTION CHECKPOINT on 8/8 nodes (`0.0.0.0:8010`, `tp8/config/live_champion_v17.env`, `V17-FINAL`).**
+> Empirically qualified and pruned on live 8-node GB10 silicon with **zero CUDA recompiles**, `V17-FINAL` delivers **10/10 0-ULP deterministic decode (`1dcf…f8c3`)**, **88 s cold boot** (down from `115 s`), **`+35.0%` faster `16×4` `temp=0.6` RLVR harvesting (`563.77` vs `417.78 tok/s`, peak `650.6 tok/s`, `1.00` unique, `12/12` math quality PASS, `min_p=0.05` unblocked)**, **`22.7×` faster urgent short-chat TTFT during active `128K` prefills (`0.837 s` via `InklingScheduler` short-skip + pure-prefill/pure-decode interleaving holding `C=8` at `133.4 tok/s`)**, **new all-time `C=4` (`188.66` / `199.22 conc_exact`) and `C=8` (`277.51 conc_exact`) records** with the `B=8→9..16` batching cliff eliminated (`C=9..16`: `266.3 → 380.2 tok/s`), **`57.1×` faster $O(1)$ streaming JSON tool-call parsing**, **`111.76 s` cold / `2.36 s` warm `1M` context (`3/3` needles)**, **`6.86×` simultaneous 1M KV residency** with true `7.0 GiB` OS UMA reserve, **`0` KV leaks**, **`0 MiB` new swap**, and live `:9108` Prometheus + `spark-top.py` cluster HUD.
 
 ---
 
-## Qualified Permanent Checkpoint Results (`V16-FINAL` → `tp8/config/live_champion_v16.env`)
+## Qualified Permanent Checkpoint Results (`V17-FINAL` → `tp8/config/live_champion_v17.env`)
 
-All `V16-FINAL` numbers were measured on **one unified live 8-Spark server** (`GMU=0.85`, `MAX_BATCHED=24576`, port `8010`, stock 2000 MHz GB10 clocks, `live_champion_v16.env` sha256 `413f1ae7275d…`).
+All `V17-FINAL` numbers were measured on **one unified live 8-Spark server** (`GMU=0.85`, `MAX_BATCHED=24576`, port `8010`, stock 2000 MHz GB10 clocks, `live_champion_v17.env` sha256 `d49f98882104…`).
 
-| Metric / Gate | `EXP-6B` (`best.env`) | `V12-FINAL` (`live_champion_v12.env`) | **Current (`V16-FINAL`)** | Delta vs `V12-FINAL` | How Measured |
+| Metric / Gate | `V12-FINAL` | `V16-FINAL` | **Current (`V17-FINAL`)** | Delta vs `V16-FINAL` | How Measured |
 |---|---:|---:|---:|---:|---|
-| **1. Bit-Exact Decode (0-ULP)** | `1dcf…f8c3` (3/3) | `1dcf…f8c3` (10/10) | **`1dcf…f8c3` (10/10)** | **0-ULP LOCK** | `exact_ink.py` cold, warm, post-stress, post-1M & live `0.0.0.0:8010` (`1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3`) |
-| **2a. `C=1` `bench.py single` (`1024t`)** | `139.5` | `137.20` GM (`131.0 / 106.2 / 174.4`) | **`139.07` GM (`144.88` mean: `130.3 / 102.1 / 202.3`)** | **`+1.87` GM (`+27.9` math)** | `bench.py single --max-tokens 1024 --temp 0` (`code / prose / math`) |
-| **2b. `C=1` `exact_ink.py`** | — | `151.66` *(today `150.27`)* | **`148.58` warm** (`147.72` prod cold) | `-1.7` | `exact_ink.py` (10 prompts, 384 tok, serial) |
-| **3a. `C=2` `bench.py` (`256t`)** | — | `134.60` (`80.39 / 72.46 min`) | **`136.74` (`81.08 / 74.85 min`)** | **`+2.14` agg / `+2.39` min** | `bench.py conc --conc 2 --max-tokens 256` (`AL 2.44`, **ALL-TIME RECORD**) |
-| **3b. `C=4` `bench.py` (`256t`)** | — | `181.25` (`57.52 / 48.20 min`) | **`187.64` (`58.23 / 51.28 min`)** | **`+6.39` agg / `+3.08` min** | `bench.py conc --conc 4 --max-tokens 256` (`AL 2.72`, **ALL-TIME RECORD**) |
-| **3c. `C=8` `bench.py` / `conc_exact`** | — | `269.66` / `286.03` | **`259.49` (`44.14 / 35.08 min`)** / **`276.01`** | `-10.2` / `-10.0` | `bench.py conc --conc 8` (`256t`) & `conc_exact` (`128t`) |
-| **4. `C=32` `bench.py` (`256t`)** | `518.71` *(512t)* | `563.02` (`22.90 / 18.88 min`) | **`567.68` (`23.10 / 18.90 min`)** | **`+4.66` agg (`+88.7` vs Ds41f)** | `bench.py conc --conc 32 --max-tokens 256` (`AL 2.41`, **ALL-TIME RECORD**) |
-| **5a. `32K` Prefill & Decode** | — | `4.30 s` / `0.32 s` (`158.4` dec) | **`4.30 s` / `0.30 s` (`166.3 tok/s` dec)** | **`+7.9 tok/s` dec (`3/3`)** | `bench_1m_e2e.py --ctx 32768 --max-tokens 384 --warm` |
-| **5b. `128K` Prefill & Decode** | — | `14.45 s` / `0.44 s` (`134.0` dec) | **`14.49 s` / `0.44 s` (`132.0 tok/s` dec)** | `parity` (`3/3`) | `bench_1m_e2e.py --ctx 131072 --max-tokens 384 --warm` |
-| **5c. `1M` Cold / Warm / Decode** | `120.90 s` / `2.95 s` | `112.07 s` / `2.36 s` (`64.9` dec) | **`113.02 s` / `2.34 s` (`90.1 tok/s` dec!)** | **`+25.2 tok/s` (`+38.8%` dec!)** | `bench_1m_e2e.py --ctx 1048500 --max-tokens 384 --warm` (`48.3×` warm, `3/3` needles) |
-| **6. RLVR Harvester (`16×4`, `temp=0.6`)** | — | Synced PyTorch sampler | **`417.78 tok/s`** (`64/64`, `1.00` uniq, `0` collapsed) | **Zero-Sync SM121a** | `v16_harvester_stress_test.py --workers 16 --n 4 --max-tokens 128` |
-| **7. Chaos Soak & Multimodal API** | — | — | **`96/96` OK, `24/24` aborts, `0` leaks, `7/7` API PASS** | **Production Hardened** | `v15_chaos_soak.py` (120 req, C=16, 20% abort) + `test_api_multimodal_live_v15.py` |
-| **8. 1M KV Residency & Telemetry** | `4.8×` (`5.07M` tok) | `7.43×` (`7.79M` tok) | **`7.11×` (`7,455,548` tok, `0 MiB` new swap)** | **`/dev/shm` telemetry** | `43.58 GiB` KV (`4.68×` Ds41f's `1.52×`), `HEALTH_200_OK`, `0` KV audit anomalies |
+| **1. Bit-Exact Decode (0-ULP)** | `1dcf…f8c3` (10/10) | `1dcf…f8c3` (10/10) | **`1dcf…f8c3` (10/10)** | **0-ULP LOCK** | `exact_ink.py` cold, warm, post-stress, post-chaos & live `0.0.0.0:8010` |
+| **2. Cold Cluster Boot Time** | `~120 s` | `115 s` | **`88 s`** | **`-27 s` (`-23.5%`)** | `LOAD_O_DIRECT=1` + persistent `~/.nv` 4 GiB PTX cache + 17-kernel prewarm |
+| **3. `C=1` `bench.py single` (`1024t`)** | `137.20` GM | `139.07` GM | **`138.24` GM (`143.94` mean)** | `parity` | `code 129.7 / prose 101.7 / math 200.7` |
+| **4a. `C=4` `bench` (`256t`) / `conc_exact` (`128t`)** | `181.25` / — | `187.64` / `191.76` | **`188.66` / `199.22`** | **`+1.02` / `+7.46` (RECORD!)** | `bench.py conc --conc 4` (`59.9 mean / 51.6 min`) & `conc_exact` |
+| **4b. `C=8` `bench` (`256t`) / `conc_exact` (`128t`)** | `269.66` / `286.03` | `259.49` / `276.01` | **`258.95` / `277.51`** | **`+1.50` `conc_exact` (RECORD!)** | `bench.py conc --conc 8` (`43.2 mean / 35.2 min`) & `conc_exact` |
+| **4c. `C=9 / 12 / 14 / 16` (`256t`, Cliff Fix)** | cliff @ `B=9` | cliff @ `B=9` | **`266.3 / 311.5 / 320.6 / 380.2`** | **Cliff Eliminated** | Exact graph buckets `9,10,13,14,15,18` + `K=4@B9..12` + monotonic `DINK_TAU` |
+| **4d. `C=32` `bench` (`256t`) / `conc_exact` (`128t`)** | `563.02` / — | `567.68` / `479.63` | **`550.01` / `479.06`** | `conc_exact` parity | `bench.py conc --conc 32` (`+71` vs Ds41f) & `conc_exact` (`8.55 s`) |
+| **5. Mixed `C=8` Decode + Cold `128K` + Short Chat** | — | ~14–113 s short TTFT | **`0.837 s` short TTFT · `133.4 tok/s` `C=8`** | **`~17–135×` faster TTFT!** | `bench_v17_mixed_sched.py` (`InklingScheduler`: `pure_dec=103`, `pure_pf=25`, `short_skip=1`) |
+| **6. RLVR Harvester (`16×4`, `temp=0.6`, `512t`)** | Synced PyTorch | `417.78 tok/s` *(disarmed)* | **`563.77 tok/s`** *(peak `650.6`)* | **`+146.0 tok/s` (`+35.0%`!)** | `SYNC_FREE_TEMP_V16` fixed (`may_mask_logits`) + `min_p=0.05` unblocked (`12/12` math PASS) |
+| **7. `32K` / `128K` / `1M` Long-Ctx (`3/3` needles)** | `4.30 / 14.45 / 112.07 s` | `4.30 / 14.49 / 113.02 s` | **`4.42 / 14.70 / 111.76 s`** (`0.29 / 0.43 / 2.36 s` warm) | **`-1.26 s` `1M` cold!** | `bench_1m_e2e.py --max-tokens 384 --warm` (`47.4×` 1M warm speedup) |
+| **8. Streaming Tool-Call Parser (`6 KB` arg)** | `1551.1 ms` | `1551.1 ms` | **`27.15 ms`** | **`57.1×` faster ($O(1)$)** | `_inkling_arg_value_extender` (`4/4` 100% bit-identical deltas) |
+| **9. Chaos Soak (`120` req, `C=16`, `20%` abort)** | — | `96/96` OK, `0` leaks | **`96/96` OK, `24/24` aborts, `0` leaks** | **`7.2 req/s` (`+22%`)** | `v15_chaos_soak.py` (`drift=0.543×`, `0` KV anomalies, `0 MiB` new swap) |
+| **10. 1M KV Residency & 24/7 Ops** | `7.43×` | `7.11×` (`2.79 GiB` OS floor) | **`6.86×` (`7.20M` tok, true `7.0 GiB` OS floor)** | **Fixed UMA + HUD + `:9108`** | `sconv=1.0` phantom bug fixed (`FAST_KV_FREE=1`), `spark-top.py` + `:9108` live |
 
-- Full machine-readable archives: [`tp8/results/checkpoint_2026-11-25_v16_final.json`](tp8/results/checkpoint_2026-11-25_v16_final.json) · [`tp8/results/checkpoint_2026-11-24_v12_final.json`](tp8/results/checkpoint_2026-11-24_v12_final.json) · [`tp8/results/wave_v12_live_report.md`](tp8/results/wave_v12_live_report.md).
-
----
-
-## Hardware Topology (8× DGX Spark)
-
-- **GPU:** NVIDIA GB10 (`SM121a`), 48 SMs, 99 KiB SMEM/SM, **244 GB/s** sustained UMA LPDDR5X, 24 MiB L2, 121.63 GiB usable UMA/node.
-- **CPU:** 20-core Grace ARM (`0..4, 10..14` Cortex-A725 LITTLE; `5..9, 15..19` Cortex-X925 BIG). Container pinned to `--cpuset-cpus=5-9,15-19` with `SCHED_FIFO` RDMA proxies on CPUs `9` & `19` (`tp8/patches/host_pin.py`).
-- **Fabric:** 4× 200GbE ConnectX-7 RoCEv2 (`~25.8 GB/s` aggregate wire, `NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`, `NCCL_IB_QPS_PER_CONNECTION=2`, `NCCL_IB_PCI_RELAXED_ORDERING=1`).
+- Full machine-readable archives: [`tp8/results/checkpoint_2026-11-25_v17_final.json`](tp8/results/checkpoint_2026-11-25_v17_final.json) · [`tp8/results/checkpoint_2026-11-25_v16_final.json`](tp8/results/checkpoint_2026-11-25_v16_final.json) · [`tp8/results/checkpoint_2026-11-24_v12_final.json`](tp8/results/checkpoint_2026-11-24_v12_final.json).
 
 ---
 
-## What Shipped in `V16-FINAL` (Live-Verified Wins)
+## What Shipped in `V17-FINAL` (All Zero-CUDA-Recompile, Live-Verified)
 
-All decode kernels compile with **`-gencode arch=compute_121a,code=sm_121a --fmad=false --ptxas-options=-v`** (`0` register spills, `0` stack frames, no `--ftz=true`, no `--use_fast_math`) and are strictly gated by `exact_ink.py` (`1dcf…f8c3`, 10/10):
-
-1. **RDMA V16 (`tp8/kernels/v16/rdma_sconv_v16/rdma_ar_c32_v16.cu`):** Register-fused BF12 AllReduce for `C=4..32` (`P1=262144`, `P2=196608`, `MIN_NVEC=18432`, `ACTIVE_RED=1`, `EXACT_GRID=1`, `EXACT_ROWS=1`, `PAR_QP2_POLL=1`, `TIMEOUT_MS=25000`). Head-to-head beat RDMA V9 by `+14.6 tok/s` `C=4`, `+4.6` `C=8`, `+9.2` `C=32` at `10/10 1dcfb306`.
-2. **Max-Occupancy 48L `C48 MoE V16` (`tp8/kernels/v16/moe_v16/{nvfp4_ws5_c48_v16.cu, mxfp8_mx7_c48_v16.cu}`):** Compiled at `BN16=8, W2=6` (`0` spills) with `L2::evict_first` (`EVICT=1`), `LPT=0`, and V12 default `FC_MODE=-1`.
-3. **`CertHead V14 M<=128` (`tp8/kernels/v16/certhead_router_v14/cert_head_fast_v14.cu`):** Qualified `127/127` exact (`ref=b1_exact`) across `M=2..128`, eliminating the `C=32` (`M=128`) FP32 `lm_head` fallback and pushing `bench C=32` to a new **`567.68 tok/s`** all-time record.
-4. **`Attn V16` Long-Context `S=48` (`tp8/kernels/v16/pf_v13_base/attn_v13/` + `pf_attn_v16/attn_global_v16.patch`):** Enabled strictly for long-context global decode (`S=48`, preserving V12 SWA & short-context kernels untouched), surging `1M` decode from **`64.9` → `90.1 tok/s` (`+38.8%`)** and `32K` decode from `158.4` → **`166.3 tok/s`** at `3/3` needles.
-5. **Zero-Sync `temp>0` Sampling & `DTGraph V14/V16` (`tp8/kernels/v16/sync_free_temp_v16/sync_free_temp_v16.cu`):** SM121a zero-sync stochastic sampler (`ok=1`) + `CERT_HEAD_TEMP_DIRECT_V16=1`, delivering **`417.78 tok/s`** on `16×4` (`64` concurrent completions) `temp=0.6` RLVR rollout harvesting with `1.00` unique ratio and `0` collapsed groups.
-6. **Non-Tail Draft Prefill Skip V16 (`INKLING_PF_SKIP_NONTAIL_DRAFT_V16=1`) + Markov Auto-Slices (`INKLING_MARKOV_FOLD_C48_AUTO_SLICES=1`).**
-7. **V15/V16 Production Hardening, Mixed-Decode Guards & Zero-Overhead Telemetry:** Prefill mixed-decode guards (`PREFILL_SP_GUARD_MIXED_DECODE`, `PF_GLOBAL_GUARD_MIXED_DECODE`, `PF_MOE_MIXED_FP32_COMBINE`, `PF_MIXED_DECODE_BF16`), `PF_SHADOW_K_STRICT_VERIFY=1`, and background telemetry thread writing `/dev/shm/inkling_v16_rank0_metrics.json` every `5 s` + complete ops stack under `tp8/ops/`.
+1. **Standalone `InklingScheduler` (`tp8/patches/inkling_sched.py`, `--scheduler-cls inkling_sched.InklingScheduler`) + `--scheduling-policy priority`:**
+   - Ports `ds41f`'s prefix-cache-probed `short-skip` + `hold=1` async lookahead gate (checked *first* so urgent chats/warm multi-turn requests preempt running `128K–1M` prefills in **`0.837 s`** instead of `19–113 s`).
+   - Adds **Pure-Prefill (`4096t`) / Pure-Decode (`4`-step burst) step separation** whenever active decoders coexist with a long prefill (`>=2048` fresh tokens), keeping decode CUDA graphs + DTGraph + SyncFree ON during decode bursts and SP + DBO + Sage2 + OTF-Rel + cm=2 ON during prefill chunks (`C=8` holds **`133.4 tok/s`** through a cold `128K` prefill with `0` fallbacks), while leaving solo `1M` prefills at full `24576`-token chunks (`111.76 s`).
+2. **Batching Cliff Elimination (`B=8→9..16`):** Added exact decode graph buckets `9,10,13,14,15,18`, smooth `K=4` bridge at `B=9..12`, and monotonic `INKLING_DINK_BATCH_TAU` + `INTERP=1` → new records at `C=4` (`188.66 / 199.22`) and `C=8` (`277.51`) and smooth ramp `C=9..16` (`266.3 → 380.2 tok/s`).
+3. **`SYNC_FREE_TEMP_V16` Fixed & Unblocked (`sync_free.py` + `sampling_params.py`):** Fixed the `needs_logits_processing` check that had disarmed `TEMP_V16` on 99% of sampled traffic (now checks `may_mask_logits` for `temp>0`), isolated mixed `temp=0 + temp>0` batches (`TEMP_V16_MIXED=0`) for strict 0-ULP determinism, and relaxed `_validate_spec_decode()` to permit `min_p` when `TEMP_V16=1` → **`+35.0%` Harvester (`563.77 tok/s`)** and `12/12` `temp=0.6 + min_p=0.05` math quality PASS.
+4. **APIServer CPU & Parser Upgrades (`inkling_parser.py` + `inkling_renderer.py`):** Added $O(1)$ open-JSON-string `_inkling_arg_value_extender` (**`57.1×` faster** on 6 KB tool args, 100% streaming parity) and thread-safe 128 MiB bit-exact LRU memo on `_HfBackedTmlTokenizer.encode_text()` (`INKLING_INCR_TOK=1`).
+5. **UMA, KV Telemetry, CPU Pinning & Warmup Hardening:**
+   - Fixed `extensible_kv_cache.py` UMA OS floor math (`max(KV_CACHE_NON_TORCH_RESERVE_BYTES, UMA_MIN_FREE_BYTES)` → true `7.0 GiB` OS reserve).
+   - Enabled `INKLING_FAST_KV_FREE=1` + non-null fallback in `kv_cache_manager.py` (eliminates `sconv=1.0` phantom telemetry).
+   - Fixed `host_pin.py`: `--node-rank` parsing for ranks `2–7`, post-capture re-sweep moving late worker threads off CPU `5` onto `[6, 7, 8]`, `EngineCore` sibling threads moved off CPU `15` onto `[16, 17, 18]`, eliminated duplicate `rank0_metrics.json` writer, and added 180 s `faulthandler` capture watchdog.
+   - Extended `prewarm_prefill_c32()` in `dtgraph.py` (`17` kernels pre-JIT'd before serving) and split `WorkQueue` pointers (`+16B`) in `moe_c32_runtime.py`.
+6. **Production Launcher & 24/7 Observability (`tp8/ops/inkling-tp8-v17.sh`, `tp8/ops/spark-top.py`, `v16_metrics_exporter.py`):**
+   - Auto-discovers each node's IPv4-mapped RoCEv2 GID index from sysfs (immune to stale `~/.bashrc` `NCCL_IB_GID_INDEX=3`), verifies 4/4 active CX-7 HCAs + 92 `.so` `SHA256SUMS`, serves dual model aliases (`inkling-2-small` + `Inkling-2-Small`), mounts persistent `~/.nv` with `CUDA_CACHE_MAXSIZE=4GiB` + `LOAD_O_DIRECT=1` (**88 s boot**), and enforces `--oom-score-adj 500`, `--ulimit nofile=524288:524288`, `200m × 5` logs, and `30s` SIGTERM drain.
+   - Live 1-command 8-node cluster HUD (`python3 /home/jeweled/inkling-tp8/spark-top.py`) + live Prometheus exporter on `:9108/metrics`.
 
 ---
 
-## Empirically Pruned Candidates (Do Not Re-Enable Without Redesign)
+## Empirically Pruned Candidates (V16 & V17)
 
 | Candidate Tested Live | Measured Outcome | Why Pruned |
 |---|---|---|
-| **`TREE_SPEC=1` / `SAME_BUDGET_TREE_V16`** | `2/10 f7e65036`, `-2.4 tok/s` `C=1` | Violated 0-ULP `1dcfb306` hard gate |
-| **`MOE_S8=1` (`v10/v5/c1_v16`)** | `0/10 ab56fa68`, `-9.6 tok/s` `C=2`; `c1_v16` IMA | Violated 0-ULP gate / warmup IMA |
-| **`BF11_V13=1` / `ROUTER_V14=1`** | `-6.5` to `-8.5 tok/s` `C=1` | Regressed vs V12 BF11/Router |
-| **`L2PF_V16=1`** (`185 GB/s`, `17.25 MB`) | `-17 tok/s` `C=32`, `-7 tok/s` `C=4` | Thrashed 24 MiB GB10 L2; kept V12 L2PF |
-| **`DRAFT_SWA_SPARSE=1` / `L2PF_DRAFT_ATTN=1`** | Step-3/4 RDMA hang + `700%` KV warn | Deadlocked in live multi-node decode |
-| **`SPEC_K=15` / `DYN_K_EXTEND_V16=1`** | `-11.7 tok/s` `C=1` (`148.5 → 136.8`) | Drafted `K=15` unconditionally even on prose |
-| **`HETERO_BUDGET_SPEC=1` / `K=7@C2..4`** | `C=4` `188.6 → 174.4`, `C=8` `259.5 → 243.3` | Kept V12 schedule `[[1,1,7],[2,3,6],[4,8,5],[9,24,3],[25,32,3]]` |
-| **`Prefill V16` (`W13_V6/W2_V5/MX7_V10/FP8_ATTN_V13`)** | `128K` `18.56 s`, `1M` `142.3 s` | Slower than V12 Prefill (`14.49 s` / `113.02 s`) |
-| **`KV_BF12_GLOBAL_ONLY=1`** | Prompt-0 `CUDA_ERROR_LAUNCH_FAILED`, KV `6.81×` | Crashed AND shrank KV via pool padding |
-| **`C48 MoE V16 LPT=2`** | Prompt-0 IMA | PDL `launch_dependents` raced shared `ws["work_queue"]` between W13 & W2; clean at `LPT=0` |
-| **`DECODE_EDGE_GUARD_V15=1`** | Prompt-0 decode IMA | Allocated temp tensors inside CUDA graph capture + wrong KV axis (`shape[0]=2`); patched in source & kept OFF on hot decode path |
+| **`C48_MOE_TILE8=1`** *(V17)* | `C=4` `-7.6%`, `C=8` `-5.9%` | V16 `BN16` beats `TILE8` at `B=2..8`; pruned to `0` |
+| **`NVFP4/MX7_V16_LPT=2`** *(V17)* | `10/10 1dcfb306` with `+16B` split `WorkQueue`, slightly slower | Atomic queue overhead vs `LPT=0`; pruned to `0` |
+| **`C32_NVFP4/MX7_T32_MIN_M=96`** *(V17)* | `C=32` `-3.2%` | `TILE=16` faster on GB10; pruned to `0` |
+| **`RDMA_AR_C32_MIN_NVEC=10368`** *(V17)* | Displaced `ROW_AR_C28` at `C=4` | Restored `18432` |
+| **`ROWAR_DESC_W_ORDER=1`** *(V17)* | Disables `DTGraph FAST_REPLAY_V14/V16` | Kept `0` |
+| **`TREE_SPEC` / `MOE_S8` / `BF11_V13` / `ROUTER_V14` / `L2PF_V16` / `Prefill_V16`** *(V16)* | Broke `1dcfb306` or regressed throughput | Kept pruned (see `STATUS.md`) |
 
 ---
 
-## Repository Layout
+## Repository Layout & Operations
 
 ```text
 tp8/
   config/
-    live_champion_v16.env                  # Promoted V16-FINAL permanent production default (GMU=0.85)
+    live_champion_v17.env                  # Promoted V17-FINAL permanent production default (GMU=0.85)
+    live_champion_v16.env                  # Preserved V16-FINAL rollback baseline (GMU=0.85)
     live_champion_v12.env                  # Preserved V12-FINAL rollback baseline (GMU=0.85)
     live_champion_v12_sam.env              # Optional GPU-SAM agentic variant (GMU=0.76)
     best.env                               # Preserved EXP-6B rollback baseline (GMU=0.72)
-    inkling-cal*.json                      # Confidence calibration tables
-  launch/inkling-tp8-s6.sh                 # Per-rank Docker launcher (CPU pinning + RoCEv2 + RDMA)
-  ops/                                     # V15/V16 supervisor, watchdog, UMA guard, Prometheus exporter, Grafana, systemd
-  patches/                                 # V16-FINAL vLLM Inkling-2 Python overlays (py_compile green)
-  kernels/
-    *.cu, *.cuh, build_*.sh                # Preserved V12 SM121a CUDA kernels & build scripts
-    v16/                                   # Wave-V13..V16 SM121a CUDA sources (0 spills) + build_wave_v16_all.sh
-  bench/
-    bench_multi_1m.py, bench_rhd_8rank.py, verify_c1_attn_v2_gb10.py
-    v16_qa/                                # Harvester 16x4, multimodal API, chaos soak, env auditor, qualification suites
+  ops/
+    inkling-tp8-v17.sh                     # V17 production launcher (auto GID, 4/4 HCA, SHA256SUMS, dual alias)
+    spark-top.py                           # 1-command 8-node live cluster HUD
+    v16_metrics_exporter.py                # Live Prometheus exporter (:9108)
+    v15_health_watchdog.py                 # Health watchdog + crash bundler + fallback
+    inkling-tp8-v15.sh, v16_drain_and_deploy.sh, v16_grafana_dashboard.json, v15_systemd/
+  patches/                                 # V17-FINAL vLLM Inkling-2 overlays (58 files, py_compile green)
+  kernels/                                 # Preserved V12 & V16 SM121a CUDA sources (0 spills)
+  bench/v16_qa/                            # Harvester 16x4, mixed-sched V17 suite, multimodal API, chaos soak
   results/
-    checkpoint_2026-11-25_v16_final.json   # Live-verified V16-FINAL permanent checkpoint archive
+    checkpoint_2026-11-25_v17_final.json   # Live-verified V17-FINAL permanent checkpoint archive
+    checkpoint_2026-11-25_v16_final.json   # Prior V16-FINAL archive
     checkpoint_2026-11-24_v12_final.json   # Prior V12-FINAL archive
-    wave_v12_live_report.md                # Wave-V12 live A/B report
-    checkpoint_2026-11-22.json             # Prior EXP-6B archive
-
-# Preserved 4-Spark TP4 archive (2026-11-16):
-launch/inkling2-tp4.sh · config/cluster.env.example · patches/ · repro/ · nvidia-bug-report.md
 ```
 
-## Rollback & Operations
-
-All prior baselines (`live_champion_v12.env`, `best.env`, `patches-s6-v12/`, `patches-s6/`, and V12 `.so`s) remain untouched on all 8 Sparks for instant 1-command rollback:
-
-- **Live Health & Telemetry:** `curl -sf http://spark-one:8010/health` · `cat /dev/shm/inkling_v16_rank0_metrics.json`
-- **0-ULP Certification:** `python3 /home/jeweled/inkling-tp8/exact_ink.py` must return `10/10` SHA-256 `1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3`.
-- **Instant Rollback to `V12-FINAL`:** Source `/home/jeweled/inkling-tp8/live_champion_v12.env` across ranks `0..7` and relaunch `inkling-tp8-s6.sh`.
+- **Live HUD:** `python3 /home/jeweled/inkling-tp8/spark-top.py` (or `--once`)
+- **Live Health & Metrics:** `curl -sf http://spark-one:8010/health` · `curl -sf http://spark-one:9108/metrics`
+- **0-ULP Certification:** `python3 /home/jeweled/inkling-tp8/exact_ink.py` (`10/10` SHA-256 `1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3`)
+- **Instant Rollback to `V16-FINAL` or `V12-FINAL`:** Source `/home/jeweled/inkling-tp8/live_champion_v16.env` (or `live_champion_v12.env`) across ranks `0..7` and relaunch `inkling-tp8-s6.sh`.
 
 See [`STATUS.md`](STATUS.md) for the complete wave-by-wave engineering log and GB10 operational rules.

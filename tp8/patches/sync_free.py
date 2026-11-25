@@ -1588,22 +1588,27 @@ def step_armed(runner, input_batch, grammar_output) -> tuple[bool, bool]:
         n_idx = len(idx)
         t_np = ss.temperature.np
         nlp_arr = sp.needs_logits_processing
+        # V17 fix: Sampler.add_request sets needs_logits_processing=True whenever temp>0
+        # (for temperature/top_p/top_k/min_p), which previously disarmed TEMP_V16 on 99% of
+        # sampled batches! `may_mask_logits` already folds penalties, logit_bias, bad_words,
+        # allowed_token_ids, min_tokens, thinking_budget, and custom logits_processors.
+        mml_arr = getattr(sp, "may_mask_logits", nlp_arr)
         has_zero = False
         has_pos = False
         if n_idx <= 8 or TEMP_V16:
             for _i in range(n_idx):
                 _s = int(idx[_i])
-                if nlp_arr[_s]:
-                    return False, False
                 _tv = float(t_np[_s])
                 if not np.isfinite(_tv) or _tv < 0.0:
                     return False, False
                 if _tv == 0.0:
+                    if nlp_arr[_s]:
+                        return False, False
                     has_zero = True
                 else:
-                    has_pos = True
-                    if not TEMP_V16:
+                    if not TEMP_V16 or mml_arr[_s]:
                         return False, False
+                    has_pos = True
         elif FAST_V11 and n_idx == 1:
             i0 = int(idx[0])
             if t_np[i0] != 0.0 or nlp_arr[i0]:
@@ -1616,7 +1621,7 @@ def step_armed(runner, input_batch, grammar_output) -> tuple[bool, bool]:
                 return False, False
             has_zero = True
 
-        # Defensive penalties check in addition to needs_logits_processing
+        # Defensive penalties check (penalties_state is also folded into may_mask_logits)
         pen_st = getattr(sp, "penalties_state", None)
         if pen_st is not None:
             _hp_fn = getattr(pen_st, "has_penalties", None)
@@ -1640,6 +1645,11 @@ def step_armed(runner, input_batch, grammar_output) -> tuple[bool, bool]:
 
         if has_pos:
             if not TEMP_V16 or MODE != "argmax":
+                return False, False
+            # V17 0-ULP isolation: when temp==0 and temp>0 share a mixed batch, default to
+            # stock path so temp==0 rows remain 100.000% 0-ULP bit-exact (opt-in via
+            # INKLING_SYNC_FREE_TEMP_V16_MIXED=1). Pure temp>0 batches stay 100% on TEMP_V16!
+            if has_zero and os.environ.get("INKLING_SYNC_FREE_TEMP_V16_MIXED", "0").strip().lower() not in ("1", "on", "true", "yes"):
                 return False, False
             if not _validate_temp_v16_sampling_states(ss, idx):
                 return False, False

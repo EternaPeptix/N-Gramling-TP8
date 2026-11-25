@@ -1,0 +1,155 @@
+{
+  "date": "2026-11-25",
+  "cluster": "8x NVIDIA DGX Spark (GB10 SM121a, 48 SMs, 244 GB/s UMA LPDDR5X, 24 MiB L2, 121.63 GiB UMA/node, 4x 200GbE ConnectX-7 RoCEv2)",
+  "model": "thinkingmachines/Inkling-2-Small (594B total / 17B active MoE, TP8, 40 NVFP4 local SWA W=1024 + 8 MXFP8 global, 1M context, 5-layer DSpark drafter K=7)",
+  "promoted_config": {
+    "name": "V17-FINAL (Empirically Qualified & Pruned Permanent Production Champion)",
+    "path": "tp8/config/live_champion_v17.env",
+    "sha256": "d49f98882104d9780020d2236945da740aea0342b0dfe8300254696adb5ae5a2",
+    "launcher": "tp8/ops/inkling-tp8-v17.sh",
+    "hud": "tp8/ops/spark-top.py",
+    "served_model_names": ["inkling-2-small", "Inkling-2-Small"],
+    "scheduling_policy": "priority",
+    "scheduler_cls": "inkling_sched.InklingScheduler",
+    "bind": "0.0.0.0:8010",
+    "prometheus_exporter": "0.0.0.0:9108",
+    "cold_boot_s": 88,
+    "gmu": 0.85,
+    "max_num_batched_tokens": 24576,
+    "kv_cache_tokens": 7196613,
+    "kv_cache_1m_residency_x": 6.86,
+    "available_kv_gib": 37.88,
+    "uma_os_reserve_gib": 7.0,
+    "telemetry_paths": [
+      "/dev/shm/inkling_v16_rank0_metrics.json",
+      "/dev/shm/inkling_v16_rank0_kv_metrics.json",
+      "/dev/shm/inkling_v17_sched_stats.json"
+    ]
+  },
+  "preserved_rollback_baselines": {
+    "v16_final": {
+      "path": "tp8/config/live_champion_v16.env",
+      "sha256": "413f1ae7275d7d9992e4823793f285d6798c5e12e607a90d78b4a94eb6f2acfa"
+    },
+    "v12_final": {
+      "path": "tp8/config/live_champion_v12.env",
+      "sha256": "f028df17b5507f0b678214de1f8cd9048f95b44e57676b3698e8c7223d698d81"
+    },
+    "v12_sam": {
+      "path": "tp8/config/live_champion_v12_sam.env",
+      "sha256": "8f2e30861c168a2347385016f59280f32cb80bdebb7e8e1f02e2b5f7f8853d28"
+    },
+    "exp6b": {
+      "path": "tp8/config/best.env",
+      "sha256": "a4a8aa6235d000b0a6fa4eb38e4b3d34f7acc8a3413b0496ed80788ee7692cb5"
+    }
+  },
+  "live_verification": {
+    "gates": {
+      "bit_exact_decode": {
+        "status": "PASS",
+        "tool": "exact_ink.py (10 prompts, temp=0, 384 tok, serial)",
+        "matches": "10/10 cold, warm, post-stress, post-chaos, and post-production-deploy",
+        "sha256": "1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3"
+      },
+      "c1_decode": {
+        "bench_single_1024t_gm_tok_s": 138.24,
+        "bench_single_1024t_mean_tok_s": 143.94,
+        "bench_single_breakdown_tok_s": {
+          "code": 129.65,
+          "prose": 101.66,
+          "math": 200.66
+        }
+      },
+      "batching_curve_c2_to_c32": {
+        "bench_c2_256t": {"agg_tok_s": 131.33, "mean_tok_s": 78.59, "min_tok_s": 70.74, "al": 2.329},
+        "bench_c4_256t": {"agg_tok_s": 188.66, "mean_tok_s": 59.92, "min_tok_s": 51.58, "al": 2.791, "note": "ALL-TIME RECORD (+1.02 vs V16)"},
+        "conc_exact_c4_128t": {"agg_tok_s": 199.22, "wall_s": 2.57, "note": "ALL-TIME RECORD (+7.46 vs V16)"},
+        "bench_c8_256t": {"agg_tok_s": 258.95, "mean_tok_s": 43.20, "min_tok_s": 35.22, "al": 2.601},
+        "conc_exact_c8_128t": {"agg_tok_s": 277.51, "wall_s": 3.69, "note": "ALL-TIME RECORD (+1.50 vs V16)"},
+        "bench_c9_256t": {"agg_tok_s": 266.33, "mean_tok_s": 39.44, "min_tok_s": 31.43, "al": 2.566, "note": "B=8->9 cliff eliminated"},
+        "bench_c12_256t": {"agg_tok_s": 311.52, "mean_tok_s": 34.19, "min_tok_s": 27.78, "al": 2.483},
+        "bench_c14_256t": {"agg_tok_s": 320.64, "mean_tok_s": 30.74, "min_tok_s": 25.97, "al": 2.345},
+        "bench_c16_256t": {"agg_tok_s": 380.23, "mean_tok_s": 30.29, "min_tok_s": 25.47, "al": 2.455},
+        "bench_c32_256t": {"agg_tok_s": 550.01, "mean_tok_s": 22.68, "min_tok_s": 18.56, "al": 2.391},
+        "conc_exact_c32_128t": {"agg_tok_s": 479.06, "wall_s": 8.55}
+      },
+      "mixed_prefill_decode_scheduler": {
+        "tool": "bench_v17_mixed_sched.py (C=8 active decode + cold 128K prefill + urgent short chat)",
+        "c8_agg_decode_tok_s": 133.41,
+        "c8_mean_decode_tok_s": 16.68,
+        "c8_min_decode_tok_s": 14.50,
+        "urgent_short_ttft_s": 0.837,
+        "urgent_short_elapsed_s": 2.67,
+        "cold_128k_prompt_tokens": 126966,
+        "cold_128k_wall_s": 27.12,
+        "sched_counters": {"pure_decode": 103, "pure_prefill": 25, "short_skip": 1, "hold": 262, "probe": 5, "pure_fallback": 0}
+      },
+      "non_greedy_temp_v16_armed": {
+        "harvester_16x4_temp06_512t": {
+          "completed_completions": "64/64",
+          "dropped_requests": 0,
+          "aggregate_tok_s": 563.77,
+          "v16_baseline_tok_s": 417.78,
+          "delta_pct": 34.9,
+          "unique_ratio": 1.0,
+          "mean_pairwise_jaccard_dist": 0.6605,
+          "collapsed_groups": 0,
+          "prefix_hit_ratio": 0.2484
+        },
+        "min_p_005_under_spec_decode": {"http_status": 200, "decode_tok_s": 74.44},
+        "temp06_minp005_math_quality_gate": "12/12 PASS",
+        "temp06_c8_agg_tok_s": 198.01,
+        "temp06_c16_agg_tok_s": 316.11
+      },
+      "long_context_prefill_and_decode": {
+        "32k": {"cold_ttft_s": 4.42, "warm_ttft_s": 0.29, "speedup_x": 15.3, "prefill_tok_s": 7407.4, "decode_tok_s": 134.2, "needles": "3/3"},
+        "128k": {"cold_ttft_s": 14.70, "warm_ttft_s": 0.43, "speedup_x": 34.2, "prefill_tok_s": 8913.0, "decode_tok_s": 124.8, "needles": "3/3"},
+        "1m": {"cold_ttft_s": 111.76, "warm_ttft_s": 2.36, "speedup_x": 47.4, "prefill_tok_s": 9378.8, "decode_tok_s": 75.7, "needles": "3/3", "v16_cold_ttft_s": 113.02}
+      },
+      "parser_and_renderer_cpu_upgrades": {
+        "inkling_arg_value_extender_6kb_streaming": {"stock_ms": 1551.10, "v17_ms": 27.15, "speedup_x": 57.1, "parity": "4/4 100% identical"},
+        "inkling_renderer_lru_128mb": {"parity": "100% 0-ULP bit-exact, mutation-safe"}
+      },
+      "production_qa_and_stress": {
+        "multimodal_api_suite": "8/8 supported checks PASS (including 4_sampling_matrix with min_p=0.05 & dual model aliases; test 8 wid==2 hits 64-tok thinking cap on reasoning-on default)",
+        "chaos_soak_120req_c16_20pct_abort": {
+          "normal_ok": "96/96",
+          "aborts_clean": "24/24",
+          "req_per_s": 7.2,
+          "drift_ratio": 0.543,
+          "leak_ok": true,
+          "kv_audit_anomalies": 0
+        },
+        "uma_and_swap": {
+          "new_swap_mib": 0,
+          "spark_one_mem_avail_gib": 10.49,
+          "headless_mem_avail_gib_range": "6.24-6.70",
+          "ib_hcas_active": "32/32 (4/4 per node)",
+          "ib_errors": 0,
+          "idle_gpu_power_w": "7.3-10.0",
+          "health": "LOCAL_200 + LAN_200"
+        }
+      }
+    }
+  },
+  "promoted_v17_upgrades": [
+    "Standalone InklingScheduler (tp8/patches/inkling_sched.py, --scheduler-cls inkling_sched.InklingScheduler) + --scheduling-policy priority: prefix-cache-probed short-skip + hold=1 (urgent short TTFT during 128K prefill 19s -> 0.837s) + pure-prefill(4096t)/pure-decode(4-step) interleaving (C=8 decode holds 133.4 tok/s during 128K cold prefill)",
+    "Eliminated B=8->9..16 batching cliff: exact CUDA graph buckets [9,10,13,14,15,18] + smooth K=4@B9..12 schedule + monotonic DINK_BATCH_TAU + INTERP=1 (C=4 record 188.7/199.2, C=8 record 277.5, smooth C=9..16 266..380 tok/s)",
+    "Fixed SYNC_FREE_TEMP_V16 99%-disarmed bug in sync_free.py (use may_mask_logits instead of needs_logits_processing for temp>0) + mixed temp=0/temp>0 0-ULP isolation + relaxed min_p spec-decode validator in sampling_params.py -> Harvester 16x4 surged 417.8 -> 563.8 tok/s (+35.0%) with 12/12 math quality PASS",
+    "57.1x faster O(1) open-JSON-string streaming arg_value_extender in inkling_parser.py + 128 MiB thread-safe bit-exact LRU memo in inkling_renderer.py (INKLING_INCR_TOK=1)",
+    "Fixed VLLM_UMA_MIN_FREE_GIB=7.0 reserve subtraction bug in extensible_kv_cache.py + enabled INKLING_FAST_KV_FREE=1 with non-null fallback in kv_cache_manager.py (eliminated sconv=1.0 phantom telemetry)",
+    "Fixed host_pin.py (--node-rank parsing, post-capture CPU 5 late-thread re-sweep onto [6,7,8], EngineCore sibling pinning onto [16,17,18], removed duplicate rank0_metrics.json writer, 180s faulthandler capture watchdog)",
+    "Extended prewarm_prefill_c32 in dtgraph.py (17 kernels pre-JIT'd before serving) + split W13/W2 WorkQueue pointers (+16B) in moe_c32_runtime.py",
+    "Production launcher inkling-tp8-v17.sh (auto IPv4 RoCEv2 GID discovery immune to stale ~/.bashrc GID=3, dual aliases inkling-2-small + Inkling-2-Small, persistent ~/.nv 4 GiB PTX cache + LOAD_O_DIRECT=1 cutting boot 115s -> 88s, --oom-score-adj 500, --ulimit nofile=524288) + 8-node spark-top.py HUD + live :9108 Prometheus exporter"
+  ],
+  "pruned_v17_candidates_empirically_rejected": [
+    {"name": "INKLING_C48_MOE_TILE8=1", "verdict": "Regressed C=4 (-7.6%, 188.7 -> 173.4) and C=8 (-5.9%, 259.0 -> 244.1) vs V16 BN16; pruned to 0"},
+    {"name": "INKLING_NVFP4_V16_LPT=2 / INKLING_MX7_V16_LPT=2", "verdict": "Split WorkQueue (+16B) eliminated the IMA crash (10/10 1dcfb306), but persistent WorkQueue atomics added overhead vs LPT=0; pruned to 0"},
+    {"name": "INKLING_C32_NVFP4_T32_MIN_M=96 / INKLING_C32_MX7_T32_MIN_M=96", "verdict": "Regressed C=32 (-3.2%) vs TILE=16; pruned to 0"},
+    {"name": "RDMA_AR_C32_MIN_NVEC=10368", "verdict": "Displaced faster ROW_AR_C28 at C=4; restored 18432"},
+    {"name": "INKLING_ROWAR_DESC_W_ORDER=1", "verdict": "Code inspection confirmed it disarms DTGraph FAST_REPLAY_V14 & FAST_REPLAY_V16; kept 0"},
+    {"name": "INKLING_SYNC_FREE_TEMP_V16_MIXED=1", "verdict": "Kept OFF by default so mixed temp=0 + temp>0 batches isolate temp=0 rows on the exact stock/0-ULP path while pure temp>0 batches get full +35% TEMP_V16 speedup"},
+    {"name": "INKLING_MARKOV_EARLY_STOP_BATCH_MAX_B>8", "verdict": "Native libdspark_markov_v10.so batch early-stop kernel is compiled for MAX_B=8; kept 8"}
+  ]
+}

@@ -1589,13 +1589,22 @@ class KVCacheManager:
                 active_reqs = len(req_map)
             rmap_all = getattr(mgr, "_sparse_real_blocks", None)
             nhl_map = getattr(mgr, "_null_head_idx", {}) or {}
+            null_blk = getattr(mgr, "_null_block", None)
             grp_active = 0
             for req_id, blks in req_map.items():
                 if rmap_all is not None and req_id in rmap_all:
                     grp_active += len(rmap_all[req_id])
-                else:
+                elif req_id in nhl_map:
                     nhl = int(nhl_map.get(req_id, 0))
                     grp_active += max(0, len(blks) - nhl)
+                elif null_blk is not None:
+                    grp_active += sum(
+                        1
+                        for b in blks
+                        if b is not null_blk and not getattr(b, "is_discard", False)
+                    )
+                else:
+                    grp_active += len(blks)
             role_blocks[role] = role_blocks.get(role, 0) + grp_active
 
         hybrid_util = {

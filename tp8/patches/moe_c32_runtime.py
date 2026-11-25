@@ -2540,6 +2540,9 @@ def forward_experts_c32(
     tile_ready_ptr = ws["tile_ready"].data_ptr()
     overlap_meta_ptr = ws["overlap_meta"].data_ptr()
     work_queue_ptr = ws["work_queue"].data_ptr()
+    # V17 fix: disjoint 16B-aligned WorkQueue[4..5] slice for W2 so C32_PDL=2 never races
+    # with W13's WorkQueue[0..1] atomic counter under LPT=2 persistent scheduling!
+    work_queue_w2_ptr = work_queue_ptr + 16
 
     if experts.nvfp4:
         lib = get_nvfp4_lib()
@@ -2768,7 +2771,7 @@ def forward_experts_c32(
                     bk_w2, w2_as_rm, w2_as_stride, down_row_stride,
                     fq_mode, fc_flag,
                     pdl_w2_wait, trig, MOE_V9_QUANT_FMA,
-                    NVFP4_V16_EVICT, NVFP4_V16_LPT, work_queue_ptr, st,
+                    NVFP4_V16_EVICT, NVFP4_V16_LPT, work_queue_w2_ptr, st,
                 )
             if use_nv_v9:
                 fq_mode = 2 if use_v9_qdeq else (1 if use_fuse_situ else 0)
@@ -3365,7 +3368,7 @@ def forward_experts_c32(
                     pdl_w2_wait, trig,
                     tile_ready_ptr if mx_overlap_flag else 0,
                     overlap_meta_ptr if mx_overlap_flag else 0,
-                    mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_ptr, st,
+                    mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_w2_ptr, st,
                 )
             if use_mx_v14 and hasattr(lib, "mx7_w2_c48_v14_panel_fwd"):
                 return lib.mx7_w2_c48_v14_panel_fwd(
@@ -3424,7 +3427,7 @@ def forward_experts_c32(
                     pdl_w2_wait, trig,
                     tile_ready_ptr if mx_overlap_flag else 0,
                     overlap_meta_ptr if mx_overlap_flag else 0,
-                    mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_ptr, st,
+                    mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_w2_ptr, st,
                 )
             if use_mx_v14 and hasattr(lib, "mx7_w2_c48_v14_compat_fwd"):
                 return lib.mx7_w2_c48_v14_compat_fwd(
@@ -3482,7 +3485,7 @@ def forward_experts_c32(
                 pdl_w2_wait, trig,
                 tile_ready_ptr if mx_overlap_flag else 0,
                 overlap_meta_ptr if mx_overlap_flag else 0,
-                mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_ptr, st,
+                mx_overlap_flag, hot_l2_flag, MX7_V14_EVICT, MX7_V16_LPT, work_queue_w2_ptr, st,
             )
         if use_mx_v14:
             return lib.mx7_w2_c48_v14_fwd(

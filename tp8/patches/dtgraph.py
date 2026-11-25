@@ -2803,21 +2803,110 @@ def prewarm_prefill_c32(runner) -> dict[str, int | float]:
     except Exception:  # noqa: BLE001
         pass
 
-    # 3. Pre-JIT multi-req sconv_seq_metadata (skipped at B=1 by INKLING_SCONV_META_DEDUP=1!)
+    # 3. Pre-JIT multi-req sconv_seq_metadata (both aligned & unaligned %16 shapes!)
     try:
         from vllm.models.inkling.nvidia.ops.sconv import sconv_seq_metadata  # noqa: PLC0415
 
-        qsl = torch.arange(0, 33, dtype=torch.int32, device=device) * 8
-        seq = torch.zeros(256, dtype=torch.int32, device=device)
-        qs = torch.zeros(256, dtype=torch.int32, device=device)
-        sconv_seq_metadata(qsl, 32, 256, seq, qs, 256)
-        summary["jits"] += 1
+        for n_req_w, tot_w in ((32, 256), (1, 257), (2, 1031)):
+            qsl = torch.linspace(0, tot_w, n_req_w + 1, dtype=torch.int32, device=device)
+            qsl[-1] = tot_w
+            seq = torch.zeros(tot_w, dtype=torch.int32, device=device)
+            qs = torch.zeros(tot_w, dtype=torch.int32, device=device)
+            sconv_seq_metadata(qsl, n_req_w, tot_w, seq, qs, tot_w)
+            summary["jits"] += 1
     except Exception:  # noqa: BLE001
         pass
 
     # 3b. Pre-JIT fused B=2..32 prepare_inputs kernels using REAL runner buffer dtypes
     # (fixes live r0 inference-time Triton JIT miss on _get_fused_dt_prep_bn_inline_kernel!)
     summary["jits"] += _prewarm_fused_dt_prep_kernels(runner)
+
+    # 3c. V17 extended pre-JIT: eliminate post-boot Triton JIT stalls seen in V16 prod
+    # (_topk_log_softmax_kernel, _quant_fp8_rowwise_ht_kernel, _record_shadow_k_slots_kernel,
+    #  _route_tokens_kernel, _gumbel_sample_kernel / _resample_kernel).
+    try:
+        from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores  # noqa: PLC0415
+
+        _lp_logits = torch.zeros((2, 4096), dtype=torch.bfloat16, device=device)
+        _lp_toks = torch.zeros((2,), dtype=torch.int64, device=device)
+        compute_topk_scores(_lp_logits, 5, _lp_toks)
+        summary["jits"] += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        from vllm.models.inkling2.ops import linear as _lin_pw  # noqa: PLC0415
+
+        _q_ht = getattr(_lin_pw, "_quant_fp8_rowwise_ht_kernel", None)
+        if _q_ht is not None:
+            for _k_dim in (4608, 1024, 512):
+                _head = 1 << (_k_dim.bit_length() - 1)
+                _tail = _k_dim - _head
+                _warps = 8 if _k_dim >= 2048 else 4
+                _x = torch.zeros((16, _k_dim), dtype=torch.bfloat16, device=device)
+                _xf = torch.empty((16, _k_dim), dtype=torch.float8_e4m3fn, device=device)
+                _xs = torch.empty((16,), dtype=torch.float32, device=device)
+                _q_ht[(16,)](
+                    _x, _xf, _xs, 16, _x.stride(0), _xf.stride(0),
+                    HEAD=_head, TAIL=_tail, num_warps=_warps,
+                )
+                summary["jits"] += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        from vllm.models.inkling2.ops import global_attn_1m as _ga_pw  # noqa: PLC0415
+
+        _rec_k = getattr(_ga_pw, "_record_shadow_k_slots_kernel", None)
+        if _rec_k is not None:
+            _k_in = torch.zeros((2, 256, 2, 128), dtype=torch.bfloat16, device=device)
+            _bids = torch.arange(2, dtype=torch.int32, device=device)
+            _pblk = torch.full((4,), -1, dtype=torch.int32, device=device)
+            _psig = torch.zeros((4, 2), dtype=torch.int64, device=device)
+            for _has_ids in (True, False):
+                for _comp_out in (True, False):
+                    for _skip_m in (True, False):
+                        _rec_k[(2, 2)](
+                            _k_in, _bids, _pblk, _psig,
+                            _k_in.stride(0), _k_in.stride(1), _k_in.stride(2),
+                            _psig.stride(0),
+                            2, 0, 1,
+                            HAS_IDS=_has_ids, COMPACT_OUT=_comp_out,
+                            SKIP_MATCHING=_skip_m, BS=256, D=128,
+                        )
+                        summary["jits"] += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample  # noqa: PLC0415
+
+        _g_logits = torch.zeros((2, 4096), dtype=torch.bfloat16, device=device)
+        _g_idx = torch.arange(2, dtype=torch.int32, device=device)
+        _g_temp = torch.full((2,), 0.7, dtype=torch.float32, device=device)
+        _g_seed = torch.zeros((2,), dtype=torch.int64, device=device)
+        _g_pos = torch.ones((2,), dtype=torch.int64, device=device)
+        gumbel_sample(_g_logits, _g_idx, _g_temp, _g_seed, _g_pos, apply_temperature=True)
+        summary["jits"] += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        from vllm.v1.worker.gpu.spec_decode.rejection_sampler import rejection_sample  # noqa: PLC0415
+
+        _rs_draft = torch.zeros((2,), dtype=torch.int32, device=device)
+        _rs_cu = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+        _rs_logits = torch.zeros((4, 4096), dtype=torch.bfloat16, device=device)
+        _rs_idx = torch.arange(2, dtype=torch.int32, device=device)
+        _rs_temp = torch.full((2,), 0.7, dtype=torch.float32, device=device)
+        _rs_seed = torch.zeros((2,), dtype=torch.int64, device=device)
+        _rs_pos = torch.ones((2,), dtype=torch.int64, device=device)
+        rejection_sample(
+            _rs_draft, _rs_cu, 1, _rs_logits, _rs_idx, _rs_temp, _rs_seed, _rs_pos
+        )
+        summary["jits"] += 1
+    except Exception:  # noqa: BLE001
+        pass
 
     # 4. Sync warmup work cleanly before serving traffic
     try:
@@ -7881,7 +7970,17 @@ def install() -> bool:
                         and isinstance(getattr(rs, "draft_tokens", None), torch.Tensor)
                     ):
                         spec.set_req_drafts_buffer(rs.draft_tokens)
-                res = _orig(self, *args, **kwargs)
+                try:
+                    from . import host_pin as _hp_wd
+
+                    _hp_wd.arm_capture_watchdog(logger=_logger())
+                except Exception:  # noqa: BLE001
+                    _hp_wd = None
+                try:
+                    res = _orig(self, *args, **kwargs)
+                finally:
+                    if _hp_wd is not None:
+                        _hp_wd.cancel_capture_watchdog()
                 if PREFILL_PREWARM:
                     prewarm_prefill_c32(self)
                 elif FUSED_DT_PREP_PREWARM:

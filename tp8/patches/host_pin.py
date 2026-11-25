@@ -95,17 +95,24 @@ def detect_node_rank(rank: int | None = None) -> int:
                 return int(raw)
             except ValueError:
                 pass
-    try:
-        if "--headless" in sys.argv:
-            return 1
-    except Exception:
-        pass
-    try:
-        raw_cmd = open("/proc/self/cmdline", "rb").read()
-        if b"--headless" in raw_cmd:
-            return 1
-    except Exception:
-        pass
+    # V17 fix: parse --node-rank <N> / --node-rank=<N> before falling back to --headless -> 1
+    # so ranks 2..7 never misreport as rank 1 in telemetry or affinity planning.
+    for argv_src in (None, "/proc/self/cmdline"):
+        try:
+            if argv_src is None:
+                tokens = list(sys.argv)
+            else:
+                raw_cmd = open(argv_src, "rb").read()
+                tokens = [t.decode("utf-8", errors="ignore") for t in raw_cmd.split(b"\x00") if t]
+            for i, tok in enumerate(tokens):
+                if tok == "--node-rank" and i + 1 < len(tokens):
+                    return int(tokens[i + 1])
+                if tok.startswith("--node-rank="):
+                    return int(tok.split("=", 1)[1])
+            if "--headless" in tokens:
+                return 1
+        except Exception:
+            pass
     return 0
 
 
@@ -232,6 +239,9 @@ def pin_worker(logger=None) -> bool:
                 except Exception:
                     pass
         # Pin the worker main thread last to its dedicated BIG core
+        # V17: remember original full helper_cores before restricting main pid affinity!
+        global _SAVED_WORKER_PLAN
+        _SAVED_WORKER_PLAN = (main_core, set(helper_cores))
         os.sched_setaffinity(pid, {main_core})
         nice_val = int(os.environ.get("INKLING_WORKER_NICE", "-10"))
         if nice_val < 0:
@@ -376,6 +386,90 @@ def release_all_prefill_scratch(
     return freed
 
 
+def arm_capture_watchdog(timeout_s: float | None = None, logger=None) -> bool:
+    """V17: Arm faulthandler traceback watchdog around CUDA graph capture so a hung
+    NCCL/RDMA/graph capture fails fast with full Python stack dumps instead of hanging 2h."""
+    try:
+        import faulthandler
+
+        if timeout_s is None:
+            timeout_s = float(os.environ.get("INKLING_CAPTURE_WATCHDOG_S", "90") or "90")
+        if timeout_s <= 0.0:
+            return False
+        faulthandler.dump_traceback_later(timeout_s, repeat=False, exit=True)
+        if logger is not None:
+            logger.info("INKLING_CAPTURE_WATCHDOG: armed %.1fs timeout around graph capture", timeout_s)
+        return True
+    except Exception:
+        return False
+
+
+def cancel_capture_watchdog() -> None:
+    """Cancel an armed capture watchdog once graph capture finishes cleanly."""
+    try:
+        import faulthandler
+
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+
+
+_SAVED_WORKER_PLAN: tuple[int, set[int]] | None = None
+
+
+def resweep_worker_helpers(logger=None) -> int:
+    """V17: Re-sweep /proc/{pid}/task/* after graph capture to move late-spawned worker/CUDA/NCCL
+    threads off exclusive CPU 5 onto helper_cores, leaving only main pid on CPU 5."""
+    if os.environ.get("INKLING_HOST_PIN", "0").strip().lower() not in ("1", "on", "true", "yes"):
+        return 0
+    try:
+        if _SAVED_WORKER_PLAN is not None:
+            main_core, helper_cores = _SAVED_WORKER_PLAN
+        else:
+            main_core, helper_cores = compute_worker_pin_plan()
+        if main_core is None or not helper_cores or helper_cores == {main_core}:
+            return 0
+        pid = os.getpid()
+        p1 = int(os.environ.get("RDMA_AR_PROXY_CORE", "-1"))
+        p2 = int(os.environ.get("RDMA_AR_PROXY_CORE2", "-1"))
+        proxy_cores = {c for c in (p1, p2) if c >= 0}
+        moved = 0
+        task_dir = f"/proc/{pid}/task"
+        if os.path.isdir(task_dir):
+            for entry in os.listdir(task_dir):
+                try:
+                    tid = int(entry)
+                except ValueError:
+                    continue
+                if tid == pid:
+                    continue
+                try:
+                    cur = os.sched_getaffinity(tid)
+                    if len(cur) == 1 and next(iter(cur)) in proxy_cores:
+                        continue
+                    if os.sched_getscheduler(tid) in (os.SCHED_FIFO, os.SCHED_RR):
+                        continue
+                    if main_core in cur:
+                        os.sched_setaffinity(tid, helper_cores)
+                        try:
+                            os.setpriority(os.PRIO_PROCESS, tid, 0)
+                        except Exception:
+                            pass
+                        moved += 1
+                except Exception:
+                    pass
+        if moved > 0 and logger is not None:
+            logger.info(
+                "INKLING_HOST_PIN: post-capture re-sweep moved %d late threads off cpu=%d -> cpus=%s",
+                moved,
+                main_core,
+                sorted(helper_cores),
+            )
+        return moved
+    except Exception:
+        return 0
+
+
 def freeze_worker_gc(logger=None) -> bool:
     """Freeze long-lived model/graph objects out of Gen-2 GC after capture completes."""
     global _FROZEN
@@ -386,6 +480,7 @@ def freeze_worker_gc(logger=None) -> bool:
     if os.environ.get("INKLING_WORKER_GC_FREEZE", "1").strip().lower() in ("0", "off", "false", "no"):
         return False
     _FROZEN = True
+    resweep_worker_helpers(logger=logger)
     reclaim_host_uma(empty_cuda=False, logger=logger, tag="pre_gc_freeze")
     gc.collect()
     gc.freeze()
@@ -509,7 +604,34 @@ def pin_engine_and_api(logger=None) -> bool:
             return False
 
         pid = os.getpid()
-        n_eng = _pin_process_tree(pid, {eng_core}, proxy_cores)
+        # V17 fix: pin EngineCore sibling threads (ZMQ/gRPC/GC) onto api_cores (16-18, nice 0)
+        # and keep ONLY EngineCore main pid exclusively on eng_core (15, nice -5)!
+        sib_cpus = api_cores if api_cores else {eng_core}
+        n_eng_sibs = 0
+        task_dir = f"/proc/{pid}/task"
+        if os.path.isdir(task_dir):
+            for entry in os.listdir(task_dir):
+                try:
+                    tid = int(entry)
+                except ValueError:
+                    continue
+                if tid == pid:
+                    continue
+                try:
+                    cur = os.sched_getaffinity(tid)
+                    if len(cur) == 1 and next(iter(cur)) in proxy_cores:
+                        continue
+                    if os.sched_getscheduler(tid) in (os.SCHED_FIFO, os.SCHED_RR):
+                        continue
+                    os.sched_setaffinity(tid, sib_cpus)
+                    try:
+                        os.setpriority(os.PRIO_PROCESS, tid, 0)
+                    except Exception:
+                        pass
+                    n_eng_sibs += 1
+                except Exception:
+                    pass
+        os.sched_setaffinity(pid, {eng_core})
         nice_val = int(os.environ.get("INKLING_ENGINECORE_NICE", "-5"))
         if nice_val < 0:
             try:
@@ -524,12 +646,13 @@ def pin_engine_and_api(logger=None) -> bool:
 
         if logger is not None:
             logger.info(
-                "INKLING_PIN_ENGINE_API: EngineCore pid=%d (%d tids)->cpu=%d (nice=%d), "
-                "APIServer ppid=%d (%d tids)->cpus=%s (excluded proxies=%s)",
+                "INKLING_PIN_ENGINE_API: EngineCore main pid=%d->cpu=%d (nice=%d), "
+                "%d siblings->cpus=%s, APIServer ppid=%d (%d tids)->cpus=%s (excluded proxies=%s)",
                 pid,
-                n_eng,
                 eng_core,
                 nice_val,
+                n_eng_sibs,
+                sorted(sib_cpus),
                 ppid,
                 n_api,
                 sorted(api_cores) if n_api else [],
@@ -537,9 +660,8 @@ def pin_engine_and_api(logger=None) -> bool:
             )
         if _env_truthy("INKLING_HOST_SHUTDOWN_HOOKS", "0"):
             install_shutdown_handlers(logger=logger)
-        if telemetry_v16_enabled():
-            maybe_write_metrics_snapshot(tag="pin_engine_api")
-            start_telemetry_v16_thread(logger=logger)
+        # V17 fix: do NOT start a second rank0_metrics.json telemetry writer inside EngineCore;
+        # Worker_TP0 owns rank0_metrics.json while EngineCore writes kv_metrics.json via kv_cache_manager.
         return True
     except Exception as e:  # noqa: BLE001
         if logger is not None:

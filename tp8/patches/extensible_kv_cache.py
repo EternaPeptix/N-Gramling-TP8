@@ -690,15 +690,15 @@ def measure_kv_cache_blocks(
     normal_margin = max(
         KV_CACHE_MARGIN_FLOOR_BYTES, int(transient_peak * KV_CACHE_MARGIN_FRACTION)
     )
-    # Keep the OS/host UMA reserve strictly outside PyTorch's caching allocator ceiling
-    # so serving spikes cannot eat into the Linux MemAvailable floor.
-    uma_os_reserve = max(0, UMA_MIN_FREE_BYTES - normal_margin)
+    # Keep the full OS/host UMA reserve strictly outside PyTorch's caching allocator ceiling
+    # so serving spikes cannot eat into the Linux MemAvailable floor (V17 fix: do not subtract
+    # normal_margin, which previously shrunk the 7.0 GiB reserve down to ~2.79 GiB).
+    os_non_torch_reserve = max(KV_CACHE_NON_TORCH_RESERVE_BYTES, UMA_MIN_FREE_BYTES)
     left_free = (
         free_memory
         - (kv_cache.physical_bytes_for(num_blocks) - kv_cache.physical_bytes)
         - (available - kv_cache_bytes)
-        - KV_CACHE_NON_TORCH_RESERVE_BYTES
-        - uma_os_reserve
+        - os_non_torch_reserve
     )
     torch_memory_limit = torch.accelerator.memory_reserved(device) + max(left_free, 0)
     kv_cache.set_torch_memory_limit(torch_memory_limit)

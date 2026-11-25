@@ -90,6 +90,7 @@ TEMP_V16 = os.environ.get("INKLING_SYNC_FREE_TEMP_V16", "0").strip().lower() not
 TEMP_V16_LIB_PATH = os.environ.get("INKLING_SYNC_FREE_TEMP_V16_LIB", "/rdma/libsync_free_temp_v16.so")
 TEMP_V16_PDL = os.environ.get("INKLING_SYNC_FREE_TEMP_V16_PDL", "1").strip().lower() not in _OFF
 TEMP_V16_MAX_M = max(1, int(os.environ.get("INKLING_SYNC_FREE_TEMP_V16_MAX_M", str(MAX_M)) or MAX_M))
+TEMP_V16_MIN_B = max(1, int(os.environ.get("INKLING_SYNC_FREE_TEMP_V16_MIN_B", "1") or 1))
 _SF_TEMP_V16_LIB = None
 _SF_TEMP_V16_TRIED = False
 _SF_TEMP_V16_QUAL: dict[int, bool] = {}
@@ -1644,7 +1645,7 @@ def step_armed(runner, input_batch, grammar_output) -> tuple[bool, bool]:
             return False, False
 
         if has_pos:
-            if not TEMP_V16 or MODE != "argmax":
+            if not TEMP_V16 or MODE != "argmax" or n_idx < TEMP_V16_MIN_B:
                 return False, False
             # V17 0-ULP isolation: when temp==0 and temp>0 share a mixed batch, default to
             # stock path so temp==0 rows remain 100.000% 0-ULP bit-exact (opt-in via

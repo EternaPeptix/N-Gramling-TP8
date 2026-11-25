@@ -18,7 +18,8 @@ All `V17-FINAL` numbers were measured on **one unified live 8-Spark server** (`G
 |---|---:|---:|---:|---:|---|
 | **1. Bit-Exact Decode (0-ULP)** | `1dcf…f8c3` (10/10) | `1dcf…f8c3` (10/10) | **`1dcf…f8c3` (10/10)** | **0-ULP LOCK** | `exact_ink.py` cold, warm, post-stress, post-chaos & live `0.0.0.0:8010` |
 | **2. Cold Cluster Boot Time** | `~120 s` | `115 s` | **`88 s`** | **`-27 s` (`-23.5%`)** | `LOAD_O_DIRECT=1` + persistent `~/.nv` 4 GiB PTX cache + 17-kernel prewarm |
-| **3. `C=1` `bench.py single` (`1024t`)** | `137.20` GM | `139.07` GM | **`138.24` GM (`143.94` mean)** | `parity` | `code 129.7 / prose 101.7 / math 200.7` |
+| **3. `C=1` `bench.py single` (`1024t`, `t=0`)** | `137.20` GM | `139.07` GM | **`138.24` GM (`143.94` mean)** | `parity` | `code 129.7 / prose 101.7 / math 200.7` |
+| **3b. `C=1` `temp > 0` (`V17.1`, `512t`)** | — | — | **`code 126–129` · `prose 90–92` · `math 170–181`** | **`+25%` to `+66%` vs V17.0!** | `INKLING_SYNC_FREE_TEMP_V16_MIN_B=64` + `INKLING_VERIFY_W_TEMP=1` (`-9..-15 ms/step`, 100% unbiased) |
 | **4a. `C=4` `bench` (`256t`) / `conc_exact` (`128t`)** | `181.25` / — | `187.64` / `191.76` | **`188.66` / `199.22`** | **`+1.02` / `+7.46` (RECORD!)** | `bench.py conc --conc 4` (`59.9 mean / 51.6 min`) & `conc_exact` |
 | **4b. `C=8` `bench` (`256t`) / `conc_exact` (`128t`)** | `269.66` / `286.03` | `259.49` / `276.01` | **`258.95` / `277.51`** | **`+1.50` `conc_exact` (RECORD!)** | `bench.py conc --conc 8` (`43.2 mean / 35.2 min`) & `conc_exact` |
 | **4c. `C=9 / 12 / 14 / 16` (`256t`, Cliff Fix)** | cliff @ `B=9` | cliff @ `B=9` | **`266.3 / 311.5 / 320.6 / 380.2`** | **Cliff Eliminated** | Exact graph buckets `9,10,13,14,15,18` + `K=4@B9..12` + monotonic `DINK_TAU` |

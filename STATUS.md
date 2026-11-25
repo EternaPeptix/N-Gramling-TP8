@@ -1,7 +1,7 @@
 # Status & Engineering Log — Inkling-2-Small on DGX Spark
 
-**Current Status (2026-11-25): PERMANENT LIVE PRODUCTION CHECKPOINT (`V17-FINAL`) on 8× DGX Spark (TP8, `0.0.0.0:8010`)**  
-**Promoted Production Config:** `tp8/config/live_champion_v17.env` (`V17-FINAL`, sha256 `d49f98882104d9780020d2236945da740aea0342b0dfe8300254696adb5ae5a2`)  
+**Current Status (2026-11-25): PERMANENT LIVE PRODUCTION CHECKPOINT (`V17.1`, upgraded from `V17-FINAL`) on 8× DGX Spark (TP8, `0.0.0.0:8010`)**  
+**Promoted Production Config:** `tp8/config/live_champion_v17.env` (`V17.1`, `INKLING_SYNC_FREE_TEMP_V16_MIN_B=64`, `INKLING_VERIFY_W_TEMP=1`)  
 **Launcher & Live Ops:** `tp8/ops/inkling-tp8-v17.sh` · `tp8/ops/spark-top.py` · `v16_metrics_exporter.py (:9108)`  
 **Preserved Rollback Baselines:**
 - `V16-FINAL`: `tp8/config/live_champion_v16.env` (sha256 `413f1ae7275d7d9992e4823793f285d6798c5e12e607a90d78b4a94eb6f2acfa`)
@@ -18,7 +18,11 @@ Measured on live 8-node GB10 silicon (`GMU=0.85`, `MAX_BATCHED=24576`, `0 MiB` n
 - **Bit-exact decode (`exact_ink.py`, 10 prompts, `temp=0`, 384 tok, serial):**
   `1dcfb30680d0252c9c259e5cb2bd02d402b2f6123261f904a0074d3b5b46f8c3` (**10/10 PASS** cold, warm, post-stress, post-chaos, and post-production-deploy).
 - **Batching & Decode Curve (`C=1..32`):**
-  - `C=1` `bench.py single` (`1024t`): **`138.24` GM / `143.94` mean** (`code 129.65`, `prose 101.66`, `math 200.66`).
+  - `C=1` `bench.py single` (`1024t`, `temp=0.0`): **`138.24` GM / `143.94` mean** (`code 129.65`, `prose 101.66`, `math 200.66`).
+  - `C=1` `temp > 0` streaming (`V17.1` fix: `INKLING_SYNC_FREE_TEMP_V16_MIN_B=64` + `INKLING_VERIFY_W_TEMP=1`, 512t):
+    - `code`: `t=0.6 p=0.95` **`126.0` (`129.1` dec, `21.90 ms/step`)** *(was `100.9`, `+25.2%`)* | `t=0.6 p=0.95 min_p=0.05` **`129.3` (`132.9` dec)** | `t=0.6 p=1.0` **`127.9` (`131.8` dec)** *(was `77.9`, `+66.2%`)* | `t=1.0 p=1.0` **`122.2` (`125.1` dec)** *(was `74.6`, `+63.8%`)*.
+    - `prose`: `t=0.6 p=0.95` **`92.1` (`17.79 ms/step`)** *(was `65.1`, `+41.5%`)* | `t=1.0 p=1.0` **`90.3`** *(was `58.2`, `+55.2%`)*.
+    - `math`: `t=0.6 p=0.95` **`181.2` dec** *(was `175.1`)* | `t=0.6 p=1.0` **`176.2` dec** *(was `136.9`, `+28.7%`)* | `t=1.0 p=1.0` **`170.3` dec** *(was `126.1`, `+35.1%`)*.
   - `C=2` `bench.py` (`256t`): **`131.33 agg`** (`78.59 mean / 70.74 min`).
   - `C=4` `bench.py` (`256t`) / `conc_exact` (`128t`): **`188.66 agg`** (`59.92 mean / 51.58 min`) / **`199.22` `conc_exact`** (**ALL-TIME RECORDS**).
   - `C=8` `bench.py` (`256t`) / `conc_exact` (`128t`): **`258.95 agg`** (`43.20 mean / 35.22 min`) / **`277.51` `conc_exact`** (**ALL-TIME `conc_exact` RECORD**).

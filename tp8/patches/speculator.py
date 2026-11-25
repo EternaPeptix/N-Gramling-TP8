@@ -4316,6 +4316,14 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
         self._vw_step = torch.tensor(step_tbl, dtype=torch.float32, device=device)
         self._row_is_decode = torch.ones((max(n, _WF_MAX_B),), dtype=torch.int32, device=device)
         self._es_fail_closed_temp = torch.ones((max(n, 1),), dtype=torch.float32, device=device)
+        # V17.1 opt-in: allow Dinkelbach verify-W + Markov early-stop on temp > 0 requests when
+        # draft_logits is None (vLLM rejection_sampler_utils resamples -1 masked drafts directly
+        # from exact target_logits, 100% unbiased; static zero buffer preserves CUDA graph stability
+        # and keeps temp == 0.0 bit-identical!).
+        self._vw_allow_temp = (
+            os.environ.get("INKLING_VERIFY_W_TEMP", "0").strip().lower() in ("1", "on", "true", "yes")
+        )
+        self._vw_zero_temp = torch.zeros((max(n, 1),), dtype=torch.float32, device=device)
         self._es_batch_dummy_idx = torch.zeros((self._es_batch_max_b,), dtype=torch.int64, device=device)
         if self._hetero_budget_on or self._ctx_adaptive_tau_on:
             _kv_bf12_on = os.environ.get("INKLING_KV_BF12", "0").strip().lower() not in (
@@ -4578,6 +4586,21 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
             STATS=self._vw_stats_on,
             FUSE_ES=do_fuse,
         )
+
+    def _vw_temp_for(self, temp: torch.Tensor | None) -> torch.Tensor | None:
+        if (
+            self._vw_allow_temp
+            and temp is not None
+            and temp is not self._es_fail_closed_temp
+            and getattr(self, "draft_logits", None) is None
+            and not self._tree_spec_on
+            and self._vw_zero_temp is not None
+            and temp.dim() == 1
+            and int(temp.shape[0]) <= int(self._vw_zero_temp.shape[0])
+            and temp.device == self._vw_zero_temp.device
+        ):
+            return self._vw_zero_temp
+        return temp
 
     def _vw_launch_mask(
         self,
@@ -6043,6 +6066,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
         if self._cl_on:
             # pair last step's confidences with this step's verification; before the EMA moves
             self._cl_record(input_batch, num_sampled, num_rejected, temp)
+        temp_vw = self._vw_temp_for(temp)
         self._es_fused_step_idx_ptr = 0
         if self._vw_is_dink:
             fuse_es_now = (
@@ -6064,7 +6088,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                 and not self._cl_on
                 and self._dops is not None
                 and hasattr(self._dops, "v10_epilogue_prep_ready")
-                and self._dops.v10_epilogue_prep_ready(temp.device)
+                and self._dops.v10_epilogue_prep_ready(temp_vw.device)
                 # Preserve strict ordering: when Batch-ES is active at B>=2, es_init_batch reads _vw_db BEFORE _fused_prep!
                 and not (self._es_batch_on and 2 <= num_reqs <= self._es_batch_max_b)
             )
@@ -6073,7 +6097,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                     input_batch.idx_mapping[:num_reqs],
                     num_sampled[:num_reqs],
                     num_rejected[:num_reqs],
-                    temp,
+                    temp_vw,
                     fuse_es_now,
                     int(input_batch.idx_mapping.data_ptr()),
                     int(num_reqs),
@@ -6083,7 +6107,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                     input_batch.idx_mapping[:num_reqs],
                     num_sampled[:num_reqs],
                     num_rejected[:num_reqs],
-                    temp,
+                    temp_vw,
                     fuse_es_now,
                     int(input_batch.idx_mapping.data_ptr()),
                     int(num_reqs),
@@ -6093,7 +6117,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                     input_batch.idx_mapping[:num_reqs],
                     num_sampled[:num_reqs],
                     num_rejected[:num_reqs],
-                    temp,
+                    temp_vw,
                     fuse_es=fuse_es_now,
                 )
             if fuse_es_now:
@@ -6108,7 +6132,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                 input_batch.idx_mapping[:num_reqs],
                 num_sampled[:num_reqs],
                 num_rejected[:num_reqs],
-                temp,
+                temp_vw,
             )
         if self._vw_stats_on:
             self._vw_calls += 1
@@ -6270,6 +6294,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                 temp = kwargs.get("temperature")
                 if temp is None:
                     temp = args[8] if len(args) > 8 else self._es_fail_closed_temp
+                temp = self._vw_temp_for(temp)
                 if self._vw_is_dink:
                     self._dops.es_init_dink(
                         input_batch.idx_mapping[:1], temp, self._vw_step, self._vw_cal,
@@ -6299,6 +6324,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                 _temp_eb = kwargs.get("temperature")
                 if _temp_eb is None:
                     _temp_eb = args[8] if len(args) > 8 else self._es_fail_closed_temp
+                _temp_eb = self._vw_temp_for(_temp_eb)
                 self._dops.es_init_batch(
                     input_batch.idx_mapping[:_sam_nr], _temp_eb, self._vw_db,
                     self._es_batch_bufs, _sam_nr, dummy=False,
@@ -6399,6 +6425,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                 num_reqs = int(drafts.shape[0])
                 if num_reqs <= 0 or temp is None:
                     return drafts
+                temp = self._vw_temp_for(temp)
                 w_cap = self._effective_w_cap(num_reqs, num_spec_arg)
                 tau_ov = self._effective_tau_override(num_reqs)
                 armed = self._conf_sink_on and self._conf_armed
@@ -7057,7 +7084,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                     "idx": self.sample_idx_mapping,
                     "idx_stride": int(n_spec),
                     "conf_buf": self._conf_buf,
-                    "temp": self.temperature,
+                    "temp": self._vw_temp_for(self.temperature),
                     "w": self._vw_w,
                     "c": self._vw_c,
                     "cal": self._vw_cal,
@@ -7211,7 +7238,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
             if use_wf_g:
                 self._vw_launch_hetero_waterfill(
                     self.sample_idx_mapping,
-                    self.temperature,
+                    self._vw_temp_for(self.temperature),
                     self.draft_tokens,
                     w_cap=min(w_cap_dspark_g, dspark_k),
                     req_drafts=req_d,
@@ -7224,7 +7251,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
             else:
                 self._vw_launch_conf(
                     self.sample_idx_mapping,
-                    self.temperature,
+                    self._vw_temp_for(self.temperature),
                     self.draft_tokens,
                     w_cap=min(w_cap_dspark_g, dspark_k),
                     tau_override=tau_ov_g,

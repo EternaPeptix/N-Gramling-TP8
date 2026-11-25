@@ -29,7 +29,7 @@ All `V17-FINAL` numbers were measured on **one unified live 8-Spark server** (`G
 | **7. `32K` / `128K` / `1M` Long-Ctx (`3/3` needles)** | `4.30 / 14.45 / 112.07 s` | `4.30 / 14.49 / 113.02 s` | **`4.42 / 14.70 / 111.76 s`** (`0.29 / 0.43 / 2.36 s` warm) | **`-1.26 s` `1M` cold!** | `bench_1m_e2e.py --max-tokens 384 --warm` (`47.4×` 1M warm speedup) |
 | **8. Streaming Tool-Call Parser (`6 KB` arg)** | `1551.1 ms` | `1551.1 ms` | **`27.15 ms`** | **`57.1×` faster ($O(1)$)** | `_inkling_arg_value_extender` (`4/4` 100% bit-identical deltas) |
 | **9. Chaos Soak (`120` req, `C=16`, `20%` abort)** | — | `96/96` OK, `0` leaks | **`96/96` OK, `24/24` aborts, `0` leaks** | **`7.2 req/s` (`+22%`)** | `v15_chaos_soak.py` (`drift=0.543×`, `0` KV anomalies, `0 MiB` new swap) |
-| **10. 1M KV Residency & 24/7 Ops** | `7.43×` | `7.11×` (`2.79 GiB` OS floor) | **`6.86×` (`7.20M` tok, true `7.0 GiB` OS floor)** | **Fixed UMA + HUD + `:9108`** | `sconv=1.0` phantom bug fixed (`FAST_KV_FREE=1`), `spark-top.py` + `:9108` live |
+| **10. 1M KV Residency, Idle CPU & 24/7 Ops** | `7.43×` | `7.11×` (`2.79 GiB` OS floor) | **`6.86×` (`7.20M` tok, `7.0 GiB` OS floor, `0.33%` idle RT CPU)** | **`130×` lower idle CPU + HUD** | `rdma_ar_ext_c32_v17.so` (`43.2% → 0.33%` idle, `99.4%` sys idle), `FAST_KV_FREE=1`, `spark-top.py` + `:9108` live |
 
 - Full machine-readable archives: [`tp8/results/checkpoint_2026-11-25_v17_final.json`](tp8/results/checkpoint_2026-11-25_v17_final.json) · [`tp8/results/checkpoint_2026-11-25_v16_final.json`](tp8/results/checkpoint_2026-11-25_v16_final.json) · [`tp8/results/checkpoint_2026-11-24_v12_final.json`](tp8/results/checkpoint_2026-11-24_v12_final.json).
 

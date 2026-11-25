@@ -1,7 +1,7 @@
 # Status & Engineering Log — Inkling-2-Small on DGX Spark
 
-**Current Status (2026-11-25): PERMANENT LIVE PRODUCTION CHECKPOINT (`V17.1`, upgraded from `V17-FINAL`) on 8× DGX Spark (TP8, `0.0.0.0:8010`)**  
-**Promoted Production Config:** `tp8/config/live_champion_v17.env` (`V17.1`, `INKLING_SYNC_FREE_TEMP_V16_MIN_B=64`, `INKLING_VERIFY_W_TEMP=1`)  
+**Current Status (2026-11-25): PERMANENT LIVE PRODUCTION CHECKPOINT (`V17.2`, upgraded from `V17-FINAL`) on 8× DGX Spark (TP8, `0.0.0.0:8010`)**  
+**Promoted Production Config:** `tp8/config/live_champion_v17.env` (`V17.2`: `INKLING_SYNC_FREE_TEMP_V16_MIN_B=64`, `INKLING_VERIFY_W_TEMP=1`, `RDMA_AR_EXT=/rdma/rdma_ar_ext_c32_v17.so` idle-CPU fix)  
 **Launcher & Live Ops:** `tp8/ops/inkling-tp8-v17.sh` · `tp8/ops/spark-top.py` · `v16_metrics_exporter.py (:9108)`  
 **Preserved Rollback Baselines:**
 - `V16-FINAL`: `tp8/config/live_champion_v16.env` (sha256 `413f1ae7275d7d9992e4823793f285d6798c5e12e607a90d78b4a94eb6f2acfa`)
